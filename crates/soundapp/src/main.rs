@@ -3,6 +3,7 @@
 
 mod audio;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use audio::{Audio, Source};
+use audio::TrackMetadata;
 use nui::{
     BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Length, Rect, Renderer,
     Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_CLOSE, ICON_DARK_MODE,
@@ -79,6 +81,14 @@ struct App {
     mixer_mutes: [bool; 4],
     /// Deterministic 96-bar synthetic waveform for the transport seekbar.
     wave_peaks: Vec<f32>,
+
+    // Phase 2.1/2.2 — real playlist + FFmpeg metadata shown in the Left Card.
+    /// Real `.m4a` tracks discovered on disk (the first slice of the 10k playlist).
+    real_tracks: Vec<PathBuf>,
+    /// Metadata of the currently-loaded file (from FFmpeg).
+    track_meta: Option<TrackMetadata>,
+    /// True while the waveform seekbar is being dragged (seek on release).
+    scrub_active: bool,
 }
 
 const DEVICES: &[&str] = &[
@@ -256,17 +266,32 @@ fn track_meta(idx: usize) -> String {
     format!("48 kHz · 24-bit · -{lufs:.1} LUFS · {mm:02}:{ss:02}")
 }
 
-/// Deterministic synthetic audio waveform peaks (stable across frames so the
-/// interactive seekbar does not jitter while scrubbing).
-fn synth_wave_peaks(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let x = i as f32 / (n - 1).max(1) as f32;
-            let envelope = (x * std::f32::consts::PI).sin();
-            let detail = (x * 37.0).sin() * 0.35 + (x * 91.0).cos() * 0.22;
-            (envelope * (0.55 + detail)).abs().clamp(0.05, 1.0)
-        })
-        .collect()
+/// The real `.m4a` tracks in SoundApp's mixer media folder, if present on disk.
+/// These form the head of the virtual playlist; everything past them is synthetic.
+fn default_playlist() -> Vec<PathBuf> {
+    let dir = PathBuf::from(r"D:\Work\_GIT\SoundApp\_Material\mixer_media\Again");
+    let mut tracks: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("m4a"))
+                == Some(true)
+            {
+                tracks.push(path);
+            }
+        }
+    }
+    tracks.sort();
+    tracks
+}
+
+/// Short label for the transport row: `mm:ss`, or `--:--` when unknown.
+fn fmt_meta_duration(secs: f64) -> String {
+    if secs > 0.0 {
+        fmt_time(secs)
+    } else {
+        "--:--".to_string()
+    }
 }
 
 /// Caption lines for the Typography A/B cards, keyed by the CSS px size being shown.
@@ -339,10 +364,13 @@ impl App {
             radio_interp: 1,
             click_counter: 0,
             scrub_frac: 0.35,
-            selected_track: 2,
+            selected_track: 0,
             mixer_gains: [0.8, 0.7, 0.75, 0.6],
             mixer_mutes: [false; 4],
-            wave_peaks: synth_wave_peaks(96),
+            wave_peaks: audio::synth_wave_peaks(96),
+            real_tracks: default_playlist(),
+            track_meta: None,
+            scrub_active: false,
         }
     }
 
@@ -388,17 +416,34 @@ impl App {
             .as_ref()
             .map(|r| r.active)
             .unwrap_or(self.prefer_backend);
-        let playing = self
-            .audio
-            .as_ref()
-            .map(|a| a.started.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(false);
+        // Pull real metadata + waveform peaks from the decoder thread (it
+        // publishes them when a file is loaded) — dark-mode Left Card + seekbar.
+        let (peaks, meta) = match &self.audio {
+            Some(a) => (a.peaks(), a.metadata()),
+            None => (Vec::new(), None),
+        };
+        if !peaks.is_empty() && peaks != self.wave_peaks {
+            self.wave_peaks = peaks;
+        }
+        if meta != self.track_meta {
+            self.track_meta = meta;
+        }
+
+        let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
 
         let mut toggle_backend_req = false;
         let mut toggle_font_req = false;
         let mut toggle_theme_req = false;
         let mut zoom_delta: f32 = 0.0;
         let mut close_req = false;
+        // Phase 2.1/2.2 transport intents, applied after the render borrow ends.
+        let mut toggle_play_req = false;
+        let mut prev_req = false;
+        let mut next_req = false;
+        let mut seek_to: Option<f64> = None;
+        let mut load_path: Option<PathBuf> = None;
+        let mut vol_changed = false;
+        let mut params_changed = false;
 
         {
             let mut ui = Ui::new(
@@ -566,6 +611,38 @@ impl App {
                 let scale_dpi = format!("{:.0}% ({:.2}x)", self.ui_zoom * 100.0, scale);
                 ui.kv_row("Scale / DPI:", &scale_dpi, Length::rem(6.4));
 
+                // Real FFmpeg metadata of the loaded file (Phase 2.2).
+                let (file_lbl, codec_lbl, fmt_lbl) = match &self.track_meta {
+                    Some(m) => (
+                        self.audio
+                            .as_ref()
+                            .and_then(|a| a.current_file())
+                            .and_then(|p| {
+                                p.file_name().map(|n| n.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or_else(|| "(loaded)".to_string()),
+                        if m.codec.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            m.codec.clone()
+                        },
+                        format!(
+                            "{} Hz · {} kbps · {}",
+                            m.sample_rate,
+                            m.bitrate / 1000,
+                            fmt_meta_duration(m.duration)
+                        ),
+                    ),
+                    None => (
+                        "(no file loaded)".to_string(),
+                        "—".to_string(),
+                        "—".to_string(),
+                    ),
+                };
+                ui.kv_row("File:", &file_lbl, Length::rem(6.4));
+                ui.kv_row("Codec:", &codec_lbl, Length::rem(6.4));
+                ui.kv_row("Format:", &fmt_lbl, Length::rem(6.4));
+
                 // Phase 1.5: compact secondary-window toggle row — the open window's
                 // button renders `Primary`, closed ones `Outline` (click = pop/hide).
                 let win_h = Length::rem(1.7);
@@ -593,7 +670,7 @@ impl App {
 
                 let vol_str = format!("{:.0}%", self.master_vol * 100.0);
                 let slider_r = ui.take(Length::rem(2.85));
-                ui.slider(
+                if ui.slider(
                     101,
                     slider_r,
                     "Master Gain",
@@ -602,7 +679,9 @@ impl App {
                     1.0,
                     0.78,
                     &vol_str,
-                );
+                ) {
+                    vol_changed = true;
+                }
 
                 // Remaining height: one spacious 18-band realtime spectrum analyzer
                 // (the 10k-track virtual list lives on its own 4th tab).
@@ -707,12 +786,14 @@ impl App {
 
                         // 2. Segmented button container
                         let seg = ui.input_group("nui-button-container [variant=segmented]");
-                        ui.segmented(
+                        if ui.segmented(
                             310,
                             seg,
                             &["Tape Speed", "Pitch / Time", "MIDI Synth"],
                             &mut self.seg_pipeline,
-                        );
+                        ) {
+                            params_changed = true;
+                        }
 
                         // 3. Button variants (0.5rem gaps)
                         let blabel =
@@ -742,7 +823,9 @@ impl App {
                             [Length::fill(), Length::fill()],
                         );
                         ui.checkbox(330, chk_r, "Preserve Formants", &mut self.chk_formant);
-                        ui.switch(331, sw_r, "HQ Oversampling", &mut self.sw_hq_mode);
+                        if ui.switch(331, sw_r, "HQ Oversampling", &mut self.sw_hq_mode) {
+                            params_changed = true;
+                        }
                     });
 
                     // ---- Right column: `nui-select`, `nui-slider`, `nui-radio` ----
@@ -751,7 +834,7 @@ impl App {
 
                         let pitch_lbl = format!("{:+.1} st", self.pitch_semitones);
                         let pr = ui.take(Length::rem(2.9));
-                        ui.slider(
+                        if ui.slider(
                             340,
                             pr,
                             "Pitch Shift (dbl-click reset)",
@@ -760,11 +843,13 @@ impl App {
                             12.0,
                             0.0,
                             &pitch_lbl,
-                        );
+                        ) {
+                            params_changed = true;
+                        }
 
                         let tempo_lbl = format!("{:.2}x", self.tempo_ratio);
                         let tr = ui.take(Length::rem(2.9));
-                        ui.slider(
+                        if ui.slider(
                             341,
                             tr,
                             "Tempo / Speed (wheel fine-tune)",
@@ -773,7 +858,9 @@ impl App {
                             2.0,
                             1.0,
                             &tempo_lbl,
-                        );
+                        ) {
+                            params_changed = true;
+                        }
 
                         let rr =
                             ui.form_field("Interpolation Filter (nui-radio)", Length::rem(2.0));
@@ -984,6 +1071,9 @@ impl App {
                         let active = ui.state.active_id == Some(row_id);
                         if hovered && ui.state.mouse_released && active {
                             self.selected_track = idx;
+                            if idx < self.real_tracks.len() {
+                                load_path = Some(self.real_tracks[idx].clone());
+                            }
                         }
                         let selected = idx == self.selected_track;
 
@@ -1009,7 +1099,30 @@ impl App {
                         let idx_x = rr.x + rem * 0.75;
                         let title_x = rr.x + rem * 5.0;
                         let credit_x = rr.x + rr.w * 0.42;
-                        let meta = track_meta(idx);
+                        // Real files head the playlist; everything past them is synthetic.
+                        let (title, credit, meta) = if idx < self.real_tracks.len() {
+                            let name = self.real_tracks[idx]
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| format!("track {}", idx + 1));
+                            let meta = if idx == self.selected_track {
+                                match &self.track_meta {
+                                    Some(m) => format!(
+                                        "{} · {} Hz · {} kbps · {}",
+                                        m.codec,
+                                        m.sample_rate,
+                                        m.bitrate / 1000,
+                                        fmt_meta_duration(m.duration)
+                                    ),
+                                    None => "FFmpeg · probing…".to_string(),
+                                }
+                            } else {
+                                "FFmpeg · m4a".to_string()
+                            };
+                            (name, "Local File".to_string(), meta)
+                        } else {
+                            (track_name(idx), track_credit(idx), track_meta(idx))
+                        };
                         let mw = ui
                             .text_sys
                             .measure(FontFace::Regular, ui.font_engine, &meta, fs2);
@@ -1029,7 +1142,7 @@ impl App {
                         ui.text_clipped(
                             face,
                             ui.font_engine,
-                            &track_name(idx),
+                            &title,
                             title_x.round(),
                             baseline,
                             fs,
@@ -1039,7 +1152,7 @@ impl App {
                         ui.text_clipped(
                             FontFace::Regular,
                             ui.font_engine,
-                            &track_credit(idx),
+                            &credit,
                             credit_x.round(),
                             baseline,
                             fs2,
@@ -1087,7 +1200,17 @@ impl App {
                         }
                     }
                     let wave = ui.take(Length::Rem(1.85));
-                    let _ = ui.waveform(500, wave, &self.wave_peaks, &mut self.scrub_frac);
+                    let scrubbed =
+                        ui.waveform(500, wave, &self.wave_peaks, &mut self.scrub_frac);
+                    if scrubbed {
+                        self.scrub_active = true;
+                    } else if self.scrub_active {
+                        // Released: commit the scrub as a seek.
+                        self.scrub_active = false;
+                        if is_finite {
+                            seek_to = Some(self.scrub_frac as f64 * dur);
+                        }
+                    }
 
                     // Transport row: elapsed | Prev · Play/Pause · Next | remaining.
                     let ctrl = ui.take_rest();
@@ -1108,13 +1231,15 @@ impl App {
                     let tbtn_h = (rem * 1.85).round();
                     let tbtn_y = (ctrl_cy - tbtn_h * 0.5).round();
                     let cx = ctrl.x + ctrl.w * 0.5;
-                    let _ = ui.button(
+                    if ui.button(
                         501,
                         Rect::new(cx - tbtn_w * 1.6, tbtn_y, tbtn_w, tbtn_h),
                         "",
                         ICON_PREV,
                         ButtonVariant::Ghost,
-                    );
+                    ) {
+                        prev_req = true;
+                    }
                     if ui.button(
                         502,
                         Rect::new(cx - tbtn_w * 0.5, tbtn_y, tbtn_w, tbtn_h),
@@ -1122,15 +1247,17 @@ impl App {
                         if playing { ICON_PAUSE } else { ICON_PLAY },
                         ButtonVariant::Primary,
                     ) {
-                        self.animate = !self.animate;
+                        toggle_play_req = true;
                     }
-                    let _ = ui.button(
+                    if ui.button(
                         503,
                         Rect::new(cx + tbtn_w * 0.6, tbtn_y, tbtn_w, tbtn_h),
                         "",
                         ICON_NEXT,
                         ButtonVariant::Ghost,
-                    );
+                    ) {
+                        next_req = true;
+                    }
 
                     let remain = if is_finite {
                         fmt_time((dur - pos).max(0.0))
@@ -1177,11 +1304,48 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                load_path = Some(path);
             }
 
             // Append any open dropdown popups onto the top of the draw list!
             ui.scene.finish_frame();
             ui.state.end_frame();
+        }
+
+        // --- Phase 2.1/2.2 transport intents, applied outside the render borrow -
+        if let Some(a) = &self.audio {
+            if toggle_play_req {
+                self.animate = a.toggle_play();
+            }
+            if prev_req || next_req {
+                if !self.real_tracks.is_empty() {
+                    let cur = self.selected_track.min(self.real_tracks.len() - 1);
+                    let idx = if prev_req {
+                        cur.saturating_sub(1)
+                    } else {
+                        (cur + 1).min(self.real_tracks.len() - 1)
+                    };
+                    self.selected_track = idx;
+                    a.load_file(self.real_tracks[idx].clone());
+                }
+            }
+            if let Some(secs) = seek_to {
+                a.seek(secs);
+            }
+            if let Some(path) = load_path.take() {
+                a.load_file(path);
+            }
+            if vol_changed {
+                a.set_volume(self.master_vol);
+            }
+            if params_changed {
+                a.set_params(
+                    self.seg_pipeline == 0,
+                    self.pitch_semitones,
+                    self.tempo_ratio,
+                    self.sw_hq_mode,
+                );
+            }
         }
 
         if toggle_backend_req {
@@ -1456,7 +1620,7 @@ impl App {
             let playing = self
                 .audio
                 .as_ref()
-                .map(|a| a.started.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|a| a.is_playing())
                 .unwrap_or(false);
 
             let close_clicked;
@@ -1834,7 +1998,7 @@ impl ApplicationHandler for App {
                 let playing = self
                     .audio
                     .as_ref()
-                    .map(|a| a.started.load(std::sync::atomic::Ordering::Relaxed))
+                    .map(|a| a.is_playing())
                     .unwrap_or(false);
                 if !(playing && self.animate) || self.ui_state.mouse_down {
                     if let Some(w) = &self.window {
@@ -1925,10 +2089,23 @@ impl ApplicationHandler for App {
                             self.ui_state.key_cmds.push(KeyCmd::Delete);
                         }
                         Key::Named(NamedKey::ArrowLeft) => {
-                            self.ui_state.key_cmds.push(KeyCmd::Left);
+                            if focused_text {
+                                self.ui_state.key_cmds.push(KeyCmd::Left);
+                            } else if let Some(a) = &self.audio {
+                                a.seek((a.position_secs() - 5.0).max(0.0));
+                            }
                         }
                         Key::Named(NamedKey::ArrowRight) => {
-                            self.ui_state.key_cmds.push(KeyCmd::Right);
+                            if focused_text {
+                                self.ui_state.key_cmds.push(KeyCmd::Right);
+                            } else if let Some(a) = &self.audio {
+                                a.seek(a.position_secs() + 5.0);
+                            }
+                        }
+                        Key::Named(NamedKey::Space) if !focused_text => {
+                            if let Some(a) = &self.audio {
+                                self.animate = a.toggle_play();
+                            }
                         }
                         Key::Named(NamedKey::Home) => {
                             self.ui_state.key_cmds.push(KeyCmd::Home);
@@ -2039,7 +2216,7 @@ impl ApplicationHandler for App {
         let playing = self
             .audio
             .as_ref()
-            .map(|a| a.started.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|a| a.is_playing())
             .unwrap_or(false);
         let animating = playing && self.animate;
 
@@ -2124,23 +2301,30 @@ fn main() {
         }
     }
     let source = if tone {
-        Some(Source::Tone { hz: 440.0 })
+        Source::Tone { hz: 440.0 }
     } else if silence {
-        Some(Source::Silence)
+        Source::Silence
+    } else if let Some(p) = file {
+        Source::File(PathBuf::from(p))
     } else {
-        file.map(|p| Source::File(std::path::PathBuf::from(p)))
+        // No file given: start the engine on silence so the UI can still load
+        // tracks from the playlist / dropzone and drive the transport.
+        Source::Silence
     };
 
-    let audio = match source {
-        None => None,
-        Some(src) => match audio::start(src) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                eprintln!("[poc] audio init failed: {e}");
-                None
-            }
-        },
+    let audio = match audio::start(source) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("[poc] audio init failed: {e}");
+            None
+        }
     };
+
+    // Push the initial UI state into the engine (gain + pitch/tempo/HQ params).
+    if let Some(a) = &audio {
+        a.set_volume(0.78);
+        a.set_params(false, 3.0, 1.18, true);
+    }
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);

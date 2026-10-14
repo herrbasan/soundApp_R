@@ -97,11 +97,11 @@ Goal: Make building complex multi-window UIs in `crates/nui` declarative and com
 
 Goal: Full parity with the Electron app's 3 playback engines and audio parameters, testable headless or from the UI.
 
-- [ ] **2.1 Transport, Seeking & Fade State Machine:**
+- [x] **2.1 Transport, Seeking & Fade State Machine:**
   - Commands: `Load(PathBuf)`, `Play`, `Pause`, `Seek(f64)`, `SetVolume(f32)`, `SetParams(...)`.
   - Built-in click-free cosine/linear fade ramps in the audio callback (`12 ms` fade-out on pause/stop/seek, `15 ms` fade-in on play), matching the SAB player's anti-crackle behavior.
   - Playlist manager: next/prev/shuffle/loop, track-ended auto-advance, and fast background waveform peak extraction.
-- [ ] **2.2 Universal FFmpeg Decoding & HQ Resampling:**
+- [x] **2.2 Universal FFmpeg Decoding & HQ Resampling:**
   - Wire `ffmpeg-next` (or direct `libavformat`/`libavcodec`/`libswresample` FFI against `D:\Work\_GIT\SoundApp\bin\win_bin`) for universal format support + metadata extraction (`getMetadata`), keeping `symphonia` as an optional pure-Rust fast path.
   - Wire `rubato` for SIMD sample-rate conversion (`HQ Mode` + output device selection via `cpal`).
 - [ ] **2.3 Real-Time Pitch / Tempo / Formant (Rubber Band FFI):**
