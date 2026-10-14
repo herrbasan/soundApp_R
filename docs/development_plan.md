@@ -84,9 +84,12 @@ Goal: Make building complex multi-window UIs in `crates/nui` declarative and com
   - `Tab` / `Shift+Tab` traversal over the per-frame `focus_order`; `:focus-visible` `2px` `highlight` ring via `Ui::draw_focus_ring()` on button/checkbox/switch/slider/text-input/select; the ring hides on mouse press.
   - `WindowEvent::HoveredFile` / `HoveredFileCancelled` / `DroppedFile` wired to `ui.dropzone_overlay()` (full-window dim + dashed target + icon/title/path); dropped files load into the search field. `--drop-preview` / `--focus-preview` CLI flags for screenshot verification.
   - Verified: overlay darkens the frame on both backends (meanLuma `127.3` → `102.0` GPU / `104.6` CPU).
-- [ ] **1.5 Multi-Window Manager inside `crates/nui`:**
+- [x] **1.5 Multi-Window Manager inside `crates/nui`:**
   - Support multiple native `winit` windows (`Player`, `Parameters`, `Monitoring`, `Mixer`, `Settings`, `Help`) in a single process (`HashMap<WindowId, WindowEntry>`), sharing the `TextSystem` glyph cache.
   - Implement `hide()` / `show()` fast toggling (matching SoundApp's `P`, `N`, `M`, `S`, `H` window behavior).
+  - Landed as `crates/nui/src/window.rs`: `WindowSpec` / `ManagedWindow` / `WindowManager` (windows keyed by `key: &'static str`, `find_by_id_mut` for event routing) with fast `show` / `hide` / `toggle` (hide keeps window + GL context alive) and `Ui::secondary_window_header()` for the shared `3rem` undecorated-window chrome.
+  - Multi-window atlas sync: `TextSystem::atlas_gen` (bumped on every atlas clear / glyph alloc) vs each `GpuState::uploaded_atlas_gen` re-uploads the R8 atlas per window; every `render_gpu` and GPU `present_nopaint` rebinds its own GL context first (`make_current`) since all windows render on one UI thread.
+  - `soundapp` wiring: `P` / `N` / `M` / `S` / `H` keyboard shortcuts + a Primary/Outline toggle button row in the main window's left card, `Esc` / close-button hides secondary windows, and `--open-window <key>` (`--screenshot` captures that window).
 
 ---
 

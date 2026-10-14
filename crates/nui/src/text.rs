@@ -184,6 +184,11 @@ pub struct TextSystem {
     cursor_y: u16,
     row_h: u16,
     pub atlas_dirty: bool,
+    /// Generation counter bumped on every atlas mutation (full clear or new glyph
+    /// allocation). Each window's `GpuState` keeps the generation it last uploaded
+    /// (`uploaded_atlas_gen`) and re-uploads whenever it drifts, so N windows each
+    /// owning a private atlas texture stay synchronized with this shared system.
+    pub atlas_gen: u64,
     pub gamma: GammaLut,
 }
 
@@ -203,6 +208,7 @@ impl TextSystem {
             cursor_y: 1,
             row_h: 0,
             atlas_dirty: true,
+            atlas_gen: 1,
             gamma: GammaLut::new(),
         }
     }
@@ -217,6 +223,7 @@ impl TextSystem {
             self.cursor_y = 1;
             self.row_h = 0;
             self.atlas_dirty = true;
+            self.atlas_gen = self.atlas_gen.wrapping_add(1);
             return true;
         }
         false
@@ -248,6 +255,7 @@ impl TextSystem {
                 .copy_from_slice(&bitmap[src_start..src_start + w as usize]);
         }
         self.atlas_dirty = true;
+        self.atlas_gen = self.atlas_gen.wrapping_add(1);
         (ux, uy)
     }
 

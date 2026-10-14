@@ -10,7 +10,8 @@ use std::sync::Arc;
 use glow::HasContext;
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
 use glutin::context::{
-    ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext, Version,
+    ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext,
+    PossiblyCurrentGlContext, Version,
 };
 use glutin::display::{GetGlDisplay, GlDisplay};
 use glutin::surface::{
@@ -378,6 +379,10 @@ struct GpuState {
     u_screen: glow::UniformLocation,
     vbo_capacity: usize,
     surface_size: (u32, u32),
+    /// `TextSystem::atlas_gen` this window's atlas texture was last uploaded from.
+    /// Every window owns a private GL atlas copy; a drift against the shared
+    /// `TextSystem` generation triggers a re-upload in `render_gpu`.
+    uploaded_atlas_gen: u64,
 }
 
 const VERT_SRC: &str = r#"#version 330 core
@@ -736,6 +741,7 @@ impl Renderer {
                     u_screen,
                     vbo_capacity,
                     surface_size: (w, h),
+                    uploaded_atlas_gen: 0,
                 },
             ))
         }
@@ -764,6 +770,9 @@ impl Renderer {
         match self.active {
             BackendKind::Gpu => {
                 if let Some(gpu) = &mut self.gpu {
+                    // Multi-window: rendering runs on one UI thread, so another window's
+                    // context may be current — bind THIS window's context before GL calls.
+                    let _ = gpu.gl_context.make_current(&gpu.gl_surface);
                     if gpu.surface_size != (w, h) {
                         gpu.gl_surface.resize(
                             &gpu.gl_context,
@@ -829,6 +838,9 @@ impl Renderer {
         screenshot_path: Option<&str>,
     ) {
         let Some(gpu) = &mut self.gpu else { return };
+        // Multi-window: rendering runs on one UI thread, so another window's context may
+        // be current — always bind THIS window's context + surface before any GL call.
+        let _ = gpu.gl_context.make_current(&gpu.gl_surface);
         if gpu.surface_size != (w, h) {
             gpu.gl_surface.resize(
                 &gpu.gl_context,
@@ -839,7 +851,7 @@ impl Renderer {
         }
 
         unsafe {
-            if text_sys.atlas_dirty {
+            if gpu.uploaded_atlas_gen != text_sys.atlas_gen {
                 gpu.gl.bind_texture(glow::TEXTURE_2D, Some(gpu.atlas_tex));
                 gpu.gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
@@ -852,6 +864,7 @@ impl Renderer {
                     glow::UNSIGNED_BYTE,
                     glow::PixelUnpackData::Slice(Some(&text_sys.atlas)),
                 );
+                gpu.uploaded_atlas_gen = text_sys.atlas_gen;
                 text_sys.atlas_dirty = false;
             }
 

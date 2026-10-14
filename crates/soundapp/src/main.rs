@@ -15,8 +15,9 @@ use winit::window::{Window, WindowId};
 use audio::{Audio, Source};
 use nui::{
     BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Length, Rect, Renderer,
-    Scene, TextSystem, Theme, Ui, UiState, ICON_CLOSE, ICON_DARK_MODE, ICON_EQ, ICON_LIGHT_MODE,
-    ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV, ICON_SEARCH, ICON_SETTINGS, ICON_TUNE,
+    Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_CLOSE, ICON_DARK_MODE,
+    ICON_EQ, ICON_LIGHT_MODE, ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV, ICON_SEARCH,
+    ICON_SETTINGS, ICON_TUNE, ICON_VOLUME,
 };
 
 struct App {
@@ -48,6 +49,12 @@ struct App {
     next_frame: Instant,
     quitting: bool,
 
+    // Phase 1.5 multi-window: secondary windows sharing `text_sys`, plus queued
+    // show/hide toggles executed in `window_event` where `event_loop` is available.
+    secondary_windows: WindowManager,
+    pending_window_toggles: Vec<&'static str>,
+    open_window_spec: Option<&'static WindowSpec>,
+
     // Interactive NUI component states
     active_tab: usize,
     seg_pipeline: usize,
@@ -68,6 +75,8 @@ struct App {
     click_counter: u32,
     scrub_frac: f32,
     selected_track: usize,
+    mixer_gains: [f32; 4],
+    mixer_mutes: [bool; 4],
     /// Deterministic 96-bar synthetic waveform for the transport seekbar.
     wave_peaks: Vec<f32>,
 }
@@ -91,6 +100,98 @@ const SOUNDFONTS: &[&str] = &[
     "CrisisGeneralMidi3.01.sf2",
     "Arachno_SoundFont_v1.0.sf2",
 ];
+
+/// Phase 1.5 secondary windows (SoundApp `P` / `N` / `M` / `S` / `H`), all undecorated
+/// like the primary window and managed by `nui::WindowManager`.
+const SPEC_PARAMETERS: WindowSpec = WindowSpec {
+    key: "parameters",
+    title: "SoundApp · Parameters [P]",
+    width: 680.0,
+    height: 440.0,
+    min_width: 520.0,
+    min_height: 340.0,
+    undecorated: true,
+};
+
+const SPEC_MONITORING: WindowSpec = WindowSpec {
+    key: "monitoring",
+    title: "SoundApp · Real-Time DSP Monitoring [N]",
+    width: 760.0,
+    height: 480.0,
+    min_width: 560.0,
+    min_height: 360.0,
+    undecorated: true,
+};
+
+const SPEC_MIXER: WindowSpec = WindowSpec {
+    key: "mixer",
+    title: "SoundApp · Multi-Track Stem Mixer [M]",
+    width: 820.0,
+    height: 480.0,
+    min_width: 600.0,
+    min_height: 360.0,
+    undecorated: true,
+};
+
+const SPEC_SETTINGS: WindowSpec = WindowSpec {
+    key: "settings",
+    title: "SoundApp · Settings [S]",
+    width: 620.0,
+    height: 420.0,
+    min_width: 480.0,
+    min_height: 320.0,
+    undecorated: true,
+};
+
+const SPEC_HELP: WindowSpec = WindowSpec {
+    key: "help",
+    title: "SoundApp · Keyboard Shortcuts & Help [H]",
+    width: 640.0,
+    height: 460.0,
+    min_width: 500.0,
+    min_height: 340.0,
+    undecorated: true,
+};
+
+fn window_spec_by_key(key: &str) -> Option<&'static WindowSpec> {
+    match key {
+        "parameters" => Some(&SPEC_PARAMETERS),
+        "monitoring" => Some(&SPEC_MONITORING),
+        "mixer" => Some(&SPEC_MIXER),
+        "settings" => Some(&SPEC_SETTINGS),
+        "help" => Some(&SPEC_HELP),
+        _ => None,
+    }
+}
+
+/// (key, button label) pairs for the main window's window-toggle button row.
+const WINDOW_TOGGLES: &[(&'static str, &'static str)] = &[
+    ("parameters", "[P] Params"),
+    ("monitoring", "[N] Monitor"),
+    ("mixer", "[M] Mixer"),
+    ("settings", "[S] Settings"),
+    ("help", "[H] Help"),
+];
+
+fn window_header_icon(key: &str) -> &'static str {
+    match key {
+        "parameters" => ICON_TUNE,
+        "monitoring" => ICON_VOLUME,
+        "mixer" => ICON_EQ,
+        "settings" => ICON_SETTINGS,
+        _ => ICON_SEARCH,
+    }
+}
+
+fn window_header_badge(key: &str) -> &'static str {
+    match key {
+        "parameters" => "LIVE PARAMS",
+        "monitoring" => "DSP TAP",
+        "mixer" => "STEMS",
+        "settings" => "CONFIG",
+        _ => "SHORTCUTS",
+    }
+}
 
 /// Synthetic library size for the virtualized playlist demos (Phase 1.2).
 const TRACK_COUNT: usize = 10_000;
@@ -216,6 +317,10 @@ impl App {
             next_frame: Instant::now(),
             quitting: false,
 
+            secondary_windows: WindowManager::new(),
+            pending_window_toggles: Vec::new(),
+            open_window_spec: None,
+
             active_tab: 0,
             seg_pipeline: 1,
             search_text: "OpenSans + Swash Subpixel".to_string(),
@@ -235,6 +340,8 @@ impl App {
             click_counter: 0,
             scrub_frac: 0.35,
             selected_track: 2,
+            mixer_gains: [0.8, 0.7, 0.75, 0.6],
+            mixer_mutes: [false; 4],
             wave_peaks: synth_wave_peaks(96),
         }
     }
@@ -458,6 +565,31 @@ impl App {
                 ui.kv_row("Pitch / Speed:", &pitch_speed, Length::rem(6.4));
                 let scale_dpi = format!("{:.0}% ({:.2}x)", self.ui_zoom * 100.0, scale);
                 ui.kv_row("Scale / DPI:", &scale_dpi, Length::rem(6.4));
+
+                // Phase 1.5: compact secondary-window toggle row — the open window's
+                // button renders `Primary`, closed ones `Outline` (click = pop/hide).
+                let win_h = Length::rem(1.7);
+                let row1 = ui.take(win_h);
+                let [b_p, b_n, b_m] = ui.cols(row1, Length::rem(0.5), [Length::fill(); 3]);
+                let row2 = ui.take(win_h);
+                let [b_s, b_h] = ui.cols(row2, Length::rem(0.5), [Length::fill(); 2]);
+                for (bid, br, wi) in [
+                    (911u32, b_p, 0usize),
+                    (912, b_n, 1),
+                    (913, b_m, 2),
+                    (914, b_s, 3),
+                    (915, b_h, 4),
+                ] {
+                    let (key, label) = WINDOW_TOGGLES[wi];
+                    let variant = if self.secondary_windows.is_visible(key) {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Outline
+                    };
+                    if ui.button(bid, br, label, "", variant) {
+                        self.pending_window_toggles.push(key);
+                    }
+                }
 
                 let vol_str = format!("{:.0}%", self.master_vol * 100.0);
                 let slider_r = ui.take(Length::rem(2.85));
@@ -816,13 +948,17 @@ impl App {
                     let badge_h = (rem * 1.45).round();
                     let bx = hdr_r.x;
                     let by = hdr_r.y + (hdr_r.h - badge_h) * 0.5;
-                    let info_x = ui.badge(
-                        bx,
-                        by,
-                        &format!("{} TRACKS", TRACK_COUNT),
-                        BadgeVariant::Primary,
-                        None,
-                    ) + theme.space();
+                    // `ui.badge` returns the badge's width, NOT `bx + w` — anchor the
+                    // description text at `bx + w + gap` so it never overlaps the badge.
+                    let info_x = bx
+                        + ui.badge(
+                            bx,
+                            by,
+                            &format!("{} TRACKS", TRACK_COUNT),
+                            BadgeVariant::Primary,
+                            None,
+                        )
+                        + theme.space();
                     let fs_info = theme.font_small();
                     ui.text_clipped(
                         FontFace::Regular,
@@ -1154,6 +1290,450 @@ impl App {
             }
         }
     }
+
+    /// Execute queued secondary-window show/hide toggles. Toggles are queued from the
+    /// keyboard shortcuts and the main window's toggle buttons (both handled during
+    /// scene build, where no `event_loop` exists) and executed here from the primary
+    /// window's `RedrawRequested` arm in `window_event`.
+    fn process_window_toggles(&mut self, event_loop: &ActiveEventLoop) {
+        if self.pending_window_toggles.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_window_toggles);
+        for key in pending {
+            let Some(spec) = window_spec_by_key(key) else {
+                continue;
+            };
+            self.secondary_windows
+                .toggle(event_loop, spec, self.prefer_backend);
+        }
+        // The toggle buttons' Primary/Outline variants follow visibility — refresh.
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Event handler for a managed secondary window: `Escape` / `CloseRequested` HIDE
+    /// it (the primary window owns the process lifetime), input updates that window's
+    /// private `UiState`, and `RedrawRequested` renders it against the shared
+    /// `TextSystem`.
+    fn secondary_window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        id: WindowId,
+        event: WindowEvent,
+    ) {
+        // `key` is `&'static str` (Copy) so resolving it first never holds a borrow.
+        let Some(key) = self
+            .secondary_windows
+            .windows
+            .iter()
+            .find(|w| w.window.id() == id)
+            .map(|w| w.key)
+        else {
+            return;
+        };
+
+        match event {
+            WindowEvent::CloseRequested => {
+                self.secondary_windows.hide(key);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::Resized(sz) => {
+                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                    w.size = (sz.width, sz.height);
+                    w.window.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                    w.ui_state.cursor = (position.x as f32, position.y as f32);
+                    w.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 40.0,
+                };
+                if dy.abs() > 0.01 {
+                    if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                        w.ui_state.wheel_y += dy;
+                        w.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                        match state {
+                            ElementState::Pressed => {
+                                // Drag by the empty header area (left of the close button),
+                                // exactly like the primary window's undecorated header.
+                                let rem = 16.0 * w.window.scale_factor() as f32;
+                                let hdr_h = (rem * 3.0).round();
+                                if w.ui_state.cursor.1 < hdr_h
+                                    && w.ui_state.cursor.0 < w.size.0 as f32 - rem * 2.9
+                                {
+                                    let _ = w.window.drag_window();
+                                } else {
+                                    w.ui_state.on_mouse_press();
+                                    w.window.request_redraw();
+                                }
+                            }
+                            ElementState::Released => {
+                                w.ui_state.on_mouse_release();
+                                w.window.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                        let popup_open = self
+                            .secondary_windows
+                            .find_by_key_mut(key)
+                            .map(|w| w.ui_state.open_popup_id.is_some())
+                            .unwrap_or(false);
+                        if popup_open {
+                            if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                                w.ui_state.open_popup_id = None;
+                                w.ui_state.popup_rect = None;
+                                w.window.request_redraw();
+                            }
+                        } else {
+                            self.secondary_windows.hide(key);
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                self.render_secondary_window(key);
+            }
+            _ => {}
+        }
+    }
+
+    /// Render one secondary window's frame: shared `TextSystem`, per-window
+    /// `Scene` + `UiState` + `Renderer`, with a clean, spacious `nui_wc2` layout
+    /// driven by the same app state as the main window.
+    fn render_secondary_window(&mut self, key: &'static str) {
+        let Some(spec) = window_spec_by_key(key) else {
+            return;
+        };
+
+        // Phase 1 — build the scene (borrows: mw.scene/ui_state + self.text_sys).
+        let (w, h, close_clicked, shot) = {
+            let Some(mw) = self.secondary_windows.find_by_key_mut(key) else {
+                return;
+            };
+            let sz = mw.window.inner_size();
+            let (w, h) = (sz.width, sz.height);
+            mw.size = (w, h);
+            if w == 0 || h == 0 {
+                return;
+            }
+            let shot = mw.screenshot_once.take();
+            let scale = mw.window.scale_factor() as f32;
+            let rem = (16.0 * scale).round();
+            let theme = if self.dark_mode {
+                Theme::dark(rem)
+            } else {
+                Theme::light(rem)
+            };
+            let page_bg = if theme.dark {
+                (theme.shade1.0, theme.shade1.1, theme.shade1.2)
+            } else {
+                (theme.shade2.0, theme.shade2.1, theme.shade2.2)
+            };
+            let playing = self
+                .audio
+                .as_ref()
+                .map(|a| a.started.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+
+            let close_clicked;
+            {
+                let scene = &mut mw.scene;
+                let ui_state = &mut mw.ui_state;
+                scene.clear_all(page_bg);
+                ui_state.begin_frame();
+
+                let pw = w as f32;
+                let ph = h as f32;
+                let mut ui =
+                    Ui::new(ui_state, scene, &mut self.text_sys, self.font_engine, theme);
+
+                let (hdr_h, close) = ui.secondary_window_header(
+                    pw,
+                    spec.title,
+                    window_header_icon(key),
+                    window_header_badge(key),
+                );
+                close_clicked = close;
+                let m = Length::Rem(1.25).resolve(rem).round();
+                let body = Rect::new(
+                    m,
+                    hdr_h + m,
+                    (pw - m * 2.0).max(0.0),
+                    (ph - hdr_h - m * 2.0).max(80.0),
+                );
+                ui.nui_card(body, |ui| {
+                    match key {
+                        "parameters" => {
+                            ui.heading("Playback Parameters");
+                            let pitch_lbl = format!("{:+.1} st", self.pitch_semitones);
+                            let pr = ui.take(Length::rem(2.9));
+                            ui.slider(
+                                700,
+                                pr,
+                                "Pitch Shift (semitones)",
+                                &mut self.pitch_semitones,
+                                -12.0,
+                                12.0,
+                                0.0,
+                                &pitch_lbl,
+                            );
+                            let tempo_lbl = format!("{:.2}x", self.tempo_ratio);
+                            let tr = ui.take(Length::rem(2.9));
+                            ui.slider(
+                                701,
+                                tr,
+                                "Tempo / Speed",
+                                &mut self.tempo_ratio,
+                                0.5,
+                                2.0,
+                                1.0,
+                                &tempo_lbl,
+                            );
+                            let sep_lbl = format!("{:.0}%", self.stereo_sep);
+                            let sr = ui.take(Length::rem(2.9));
+                            ui.slider(
+                                702,
+                                sr,
+                                "Stereo Separation",
+                                &mut self.stereo_sep,
+                                0.0,
+                                200.0,
+                                100.0,
+                                &sep_lbl,
+                            );
+                            let [chk_r, sw_r] = ui.take_cols(
+                                Length::rem(2.0),
+                                Length::rem(1.0),
+                                [Length::fill(), Length::fill()],
+                            );
+                            ui.checkbox(703, chk_r, "Preserve Formants", &mut self.chk_formant);
+                            ui.switch(704, sw_r, "HQ Oversampling", &mut self.sw_hq_mode);
+                            let [reset_r, save_r] =
+                                ui.take_form_row(false, [Length::fill(), Length::fill()]);
+                            if ui.button(705, reset_r, "Reset Defaults", "", ButtonVariant::Outline)
+                            {
+                                self.pitch_semitones = 0.0;
+                                self.tempo_ratio = 1.0;
+                                self.stereo_sep = 100.0;
+                            }
+                            let _ =
+                                ui.button(706, save_r, "Save Preset", "", ButtonVariant::Primary);
+                        }
+                        "monitoring" => {
+                            ui.heading("Real-Time DSP Monitoring");
+                            ui.kv_row(
+                                "Tap:",
+                                "Post-Master · 48 kHz · 32-band spectrum",
+                                Length::rem(4.0),
+                            );
+                            let panel = ui.take_rest();
+                            ui.scene.rounded_rect(
+                                panel.x,
+                                panel.y,
+                                panel.w,
+                                panel.h,
+                                theme.radius2(),
+                                theme.base,
+                                theme.border2,
+                                1.0,
+                            );
+                            ui.scene.push_clip(
+                                panel.x + 1.0,
+                                panel.y + 1.0,
+                                (panel.w - 2.0).max(0.0),
+                                (panel.h - 2.0).max(0.0),
+                            );
+                            // Upper half: 32-band realtime spectrum.
+                            let bands = 32usize;
+                            let inset = (rem * 0.4).round();
+                            let g = (rem * 0.3).round().max(2.0);
+                            let spec_h = panel.h * 0.52;
+                            let bar_w = ((panel.w - inset * 2.0 - g * (bands as f32 - 1.0))
+                                / bands as f32)
+                                .floor()
+                                .max(2.0);
+                            for i in 0..bands {
+                                let phase = self.t * 5.8 + i as f32 * 0.42;
+                                let amp = if playing {
+                                    ((phase.sin() * 0.35
+                                        + (phase * 1.7).cos() * 0.25
+                                        + 0.45)
+                                        * self.master_vol)
+                                        .clamp(0.06, 0.94)
+                                } else {
+                                    (0.14 + 0.08 * (i as f32 * 0.5).sin()) * self.master_vol
+                                };
+                                let bh = ((spec_h - rem * 0.6) * amp).max(2.0);
+                                let bx = panel.x + inset + i as f32 * (bar_w + g);
+                                let by = panel.y + spec_h - rem * 0.4 - bh;
+                                ui.scene.rounded_rect(
+                                    bx,
+                                    by,
+                                    bar_w,
+                                    bh,
+                                    2.0,
+                                    theme.highlight,
+                                    (0, 0, 0, 0),
+                                    0.0,
+                                );
+                            }
+                            // Lower half: oscilloscope curve (`kind = 4` polyline).
+                            let scope = Rect::new(
+                                panel.x + inset,
+                                panel.y + spec_h,
+                                (panel.w - inset * 2.0).max(0.0),
+                                (panel.h - spec_h - inset).max(0.0),
+                            );
+                            let pts: Vec<(f32, f32)> = (0..=96)
+                                .map(|i| {
+                                    let nx = i as f32 / 96.0;
+                                    let phase = self.t * 6.0 + nx * std::f32::consts::TAU * 2.0;
+                                    let amp = 0.42 * phase.sin()
+                                        + 0.20 * (phase * 2.3).cos()
+                                        + 0.12 * (phase * 4.1).sin();
+                                    let ny =
+                                        (0.5 + amp * self.master_vol.max(0.2)).clamp(0.05, 0.95);
+                                    (nx, ny)
+                                })
+                                .collect();
+                            ui.polyline(scope, &pts, 2.0, theme.palette_mark);
+                            ui.scene.pop_clip();
+                        }
+                        "mixer" => {
+                            ui.heading("Multi-Track Stem Mixer");
+                            ui.kv_row(
+                                "Session:",
+                                "4 stems · 48 kHz · synchronized preview",
+                                Length::rem(4.0),
+                            );
+                            for i in 0..4usize {
+                                let stem = TRACK_ARTISTS[i % TRACK_ARTISTS.len()];
+                                let gain_lbl = format!("{:.0}%", self.mixer_gains[i] * 100.0);
+                                let [sld_r, mute_r] = ui.take_cols(
+                                    Length::rem(2.4),
+                                    Length::rem(1.0),
+                                    [Length::fill(), Length::rem(9.0)],
+                                );
+                                ui.slider(
+                                    720 + i as u32,
+                                    sld_r,
+                                    stem,
+                                    &mut self.mixer_gains[i],
+                                    0.0,
+                                    1.0,
+                                    0.8,
+                                    &gain_lbl,
+                                );
+                                ui.checkbox(
+                                    730 + i as u32,
+                                    mute_r,
+                                    "Mute",
+                                    &mut self.mixer_mutes[i],
+                                );
+                            }
+                            let [apply_r] = ui.take_form_row(false, [Length::fill()]);
+                            let _ = ui.button(
+                                740,
+                                apply_r,
+                                "Apply Mix Downstem",
+                                "",
+                                ButtonVariant::Primary,
+                            );
+                        }
+                        "settings" => {
+                            ui.heading("Settings");
+                            let sel_rate = ui.input_group("Default Sample Rate");
+                            ui.select(750, sel_rate, SAMPLE_RATES, &mut self.selected_rate);
+                            let sel_sf = ui.input_group("MIDI SoundFont (.sf2)");
+                            ui.select(751, sel_sf, SOUNDFONTS, &mut self.selected_soundfont);
+                            let [c1, c2] = ui.take_cols(
+                                Length::rem(2.0),
+                                Length::rem(1.0),
+                                [Length::fill(), Length::fill()],
+                            );
+                            ui.checkbox(
+                                752,
+                                c1,
+                                "Keep Running in System Tray",
+                                &mut self.sw_keep_tray,
+                            );
+                            ui.checkbox(753, c2, "HQ Oversampling", &mut self.sw_hq_mode);
+                            let [apply_r] = ui.take_form_row(false, [Length::fill()]);
+                            let _ =
+                                ui.button(754, apply_r, "Apply & Save", "", ButtonVariant::Primary);
+                        }
+                        _ => {
+                            ui.heading("Keyboard Shortcuts & Help");
+                            for (k, v) in [
+                                (
+                                    "P / N / M / S / H",
+                                    "Pop open or hide Parameters / Monitoring / Mixer / Settings / this window",
+                                ),
+                                (
+                                    "Drag header",
+                                    "Move this undecorated window; the red button (or Esc) hides it",
+                                ),
+                                ("Space", "Play / Pause transport"),
+                                (
+                                    "B / F / T",
+                                    "Toggle GPU-CPU backend / Swash-Fontdue engine / dark-light theme",
+                                ),
+                                ("Ctrl +  / - / 0", "UI zoom in / out / reset"),
+                                ("Esc (main window)", "Quit SoundApp"),
+                            ] {
+                                ui.kv_row(k, v, Length::rem(7.5));
+                            }
+                        }
+                    }
+                });
+
+                ui.scene.finish_frame();
+                ui.state.end_frame();
+            }
+            (w, h, close_clicked, shot)
+        };
+
+        if close_clicked {
+            // The header close button hides (never exits) a secondary window.
+            self.secondary_windows.hide(key);
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+
+        if let Some(mw) = self.secondary_windows.find_by_key_mut(key) {
+            mw.renderer
+                .render(w, h, &mw.scene, &mut self.text_sys, shot.as_deref());
+            if let Some(p) = shot {
+                println!("[poc] saved screenshot to {}", p);
+            }
+        }
+    }
 }
 
 fn fmt_time(secs: f64) -> String {
@@ -1187,9 +1767,28 @@ impl ApplicationHandler for App {
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
         window.request_redraw();
+
+        // Phase 1.5: `--open-window <key>` pops the requested secondary window at
+        // startup; a `--screenshot` alongside it captures THAT window, not the primary.
+        if let Some(spec) = self.open_window_spec {
+            self.secondary_windows.show(event_loop, spec, self.prefer_backend);
+            if let Some(path) = self.screenshot_path.take() {
+                if let Some(w) = self.secondary_windows.find_by_key_mut(spec.key) {
+                    w.screenshot_once = Some(path);
+                }
+            }
+        }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Phase 1.5 routing: the primary window owns the process lifetime; every other
+        // window is a managed secondary (Escape / CloseRequested hide, not exit).
+        if self.window.as_ref().map(|w| w.id()) != Some(id) {
+            if self.secondary_windows.find_by_id_mut(id).is_some() {
+                self.secondary_window_event(event_loop, id, event);
+            }
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(sz) => {
@@ -1382,6 +1981,24 @@ impl ApplicationHandler for App {
                         Key::Character(ch) if (!focused_text || self.modifiers.control_key()) && ch == "0" => {
                             self.set_zoom(1.0);
                         }
+                        Key::Character(ch)
+                            if !focused_text
+                                && matches!(
+                                    ch.as_str(),
+                                    "p" | "P" | "n" | "N" | "m" | "M" | "s" | "S" | "h" | "H"
+                                ) =>
+                        {
+                            // Queue the secondary-window toggle; executed right after this
+                            // frame in the RedrawRequested arm where `event_loop` lives.
+                            let key = match ch.as_str() {
+                                "p" | "P" => "parameters",
+                                "n" | "N" => "monitoring",
+                                "m" | "M" => "mixer",
+                                "s" | "S" => "settings",
+                                _ => "help",
+                            };
+                            self.pending_window_toggles.push(key);
+                        }
                         _ => {
                             if focused_text && !self.modifiers.control_key() {
                                 if let Some(txt) = &event.text {
@@ -1401,6 +2018,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.render();
+                // Execute queued P/N/M/S/H toggles now that `event_loop` is available.
+                self.process_window_toggles(event_loop);
             }
             _ => {}
         }
@@ -1431,6 +2050,8 @@ impl ApplicationHandler for App {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
+            // Keep visible secondary windows (Monitoring spectrum, Mixer meters) alive.
+            self.secondary_windows.request_redraw_all();
         }
 
         let mut next: Option<Instant> = if animating { Some(self.next_frame) } else { None };
@@ -1463,6 +2084,7 @@ fn main() {
     let mut initial_tab: usize = 0;
     let mut drop_preview = false;
     let mut focus_preview = false;
+    let mut open_window: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -1475,6 +2097,7 @@ fn main() {
             "--drop-preview" => drop_preview = true,
             "--focus-preview" => focus_preview = true,
             "--tab" => initial_tab = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--open-window" => open_window = args.next(),
             "--backend" => {
                 if let Some(b) = args.next() {
                     if b.eq_ignore_ascii_case("cpu") || b.eq_ignore_ascii_case("softbuffer") {
@@ -1530,6 +2153,14 @@ fn main() {
     app.extra_ops = extra_ops;
     app.screenshot_path = app_screenshot;
     app.active_tab = initial_tab.min(3);
+    // Phase 1.5: pop a secondary window at startup. With `--screenshot` alongside it,
+    // the capture is taken from THAT window (handled in `resumed`).
+    app.open_window_spec = open_window.as_deref().and_then(window_spec_by_key);
+    if let Some(k) = open_window.as_deref() {
+        if app.open_window_spec.is_none() {
+            eprintln!("[poc] --open-window: unknown key '{k}' (parameters|monitoring|mixer|settings|help)");
+        }
+    }
     if open_select_demo {
         app.ui_state.open_popup_id = Some(360);
     }
