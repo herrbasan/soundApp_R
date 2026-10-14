@@ -1,0 +1,17 @@
+[package]
+name = "nui"
+version = "0.1.0"
+edition = "2021"
+description = "NUI Rust — Dual-backend (GPU OpenGL 3.3 SDF + CPU Softbuffer) UI library with Swash browser-grade typography and nui_wc2 v3.0.0 slate tokens."
+publish = false
+
+[dependencies]
+winit.workspace = true
+raw-window-handle.workspace = true
+softbuffer.workspace = true
+glutin.workspace = true
+glutin-winit.workspace = true
+glow.workspace = true
+tiny-skia.workspace = true
+fontdue.workspace = true
+swash.workspace = true

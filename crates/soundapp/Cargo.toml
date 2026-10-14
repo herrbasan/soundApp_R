@@ -1,0 +1,17 @@
+[package]
+name = "soundapp"
+version = "0.1.0"
+edition = "2021"
+description = "soundApp_R — Native Rust Audio Player & Analyzer built on NUI Rust."
+publish = false
+
+[[bin]]
+name = "soundapp_r"
+path = "src/main.rs"
+
+[dependencies]
+nui = { path = "../nui" }
+winit.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+symphonia.workspace = true
