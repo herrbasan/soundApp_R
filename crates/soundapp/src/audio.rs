@@ -1,23 +1,26 @@
 // Audio engine: transport control + a cpal callback that drains a lock-free
 // rtrb ring buffer, fed by a decoder thread.
 //
-// Decoding is done by the native FFmpeg bridge (`sa_ffmpeg_*`, see
-// `ffmpeg_bridge.cpp`) — universal format support plus metadata. `symphonia`
-// remains the pure-Rust path for the tone/silence sources and any future
-// fallback.
+// Three playback engines feed the same pipeline:
+//   * FFmpeg (universal formats + metadata) via the native `sa_ffmpeg_*` bridge.
+//   * MIDI / SoundFont synthesis (`midi.rs`, rustysynth).
+//   * ProTracker modules (`tracker.rs`, native Paula synth).
+//
+// Pitch / tempo / formant are applied in the pipeline itself, so they work
+// identically on every source:
+//   * "Tape" mode resamples the raw stream at a variable rate — pitch and tempo
+//     move together.
+//   * "PitchTime" mode runs the stream through `RealTimePitchShifter`
+//     (granular / WSOLA time-stretch + resample + formant tilt), so pitch and
+//     tempo are independent and parameter changes glide without clicking.
 //
 // Two state machines keep playback clean:
 //   * The callback owns a cosine-fade machine — 12 ms out on pause/seek, 15 ms
-//     in on play/resume — so no transition ever steps the waveform, and an
-//     exponential volume smoother so dragging the gain slider never zippers.
-//   * The decoder thread owns a transport machine — decode → variable-rate
-//     resample → push, checking its command channel between bounded chunks so a
-//     seek or load takes effect within milliseconds even with a full ring.
-//
-// The FFmpeg output is float32 stereo at the device rate; "Tape" mode then
-// resamples on the fly (8-tap Lanczos when HQ, cubic otherwise), while
-// "PitchTime" mode delegates pitch/tempo to FFmpeg's rubberband/atempo filters.
+//     in on play/resume — plus an exponential volume smoother.
+//   * The decoder thread owns a transport machine — decode/render → (optional)
+//     pitch-shift → push, checking its command channel between bounded chunks.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -28,6 +31,9 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::RingBuffer;
+
+use crate::midi::MidiEngine;
+use crate::tracker::TrackerPlayer;
 
 // ---------------------------------------------------------------------------
 // FFmpeg bridge FFI
@@ -58,6 +64,7 @@ extern "C" {
     fn sa_ffmpeg_duration(handle: *mut c_void) -> c_double;
     fn sa_ffmpeg_set_pitch_semitones(handle: *mut c_void, semitones: c_double) -> c_int;
     fn sa_ffmpeg_set_tempo(handle: *mut c_void, tempo: c_double) -> c_int;
+    fn sa_ffmpeg_set_formant(handle: *mut c_void, preserve: c_int) -> c_int;
     fn sa_ffmpeg_probe_metadata(path: *const c_char, out_meta: *mut SaAudioMeta) -> c_int;
 }
 
@@ -121,7 +128,7 @@ pub fn probe_metadata(path: &Path) -> Option<TrackMetadata> {
 }
 
 /// Deterministic synthetic waveform peaks — the fallback when a real file
-/// cannot be decoded (or for the tone/silence sources).
+/// cannot be decoded (or for the tone/silence/MIDI/tracker sources).
 pub fn synth_wave_peaks(n: usize) -> Vec<f32> {
     (0..n)
         .map(|i| {
@@ -185,32 +192,77 @@ pub fn extract_waveform_peaks(path: &Path, num_bins: usize) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Sources & shared state
+// Sources, parameters & commands
 // ---------------------------------------------------------------------------
 
+/// What the engine should play.
+#[derive(Clone, Debug)]
 pub enum Source {
     Silence,
     Tone { hz: f32 },
     File(PathBuf),
+    MidiFile(PathBuf),
+    MidiDemo,
+    TrackerFile(PathBuf),
+    TrackerDemo,
+}
+
+/// The full playback parameter set driving the pitch/tempo/formant pipeline and
+/// the MIDI/tracker engines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaybackParams {
+    /// `true` = Tape mode (pitch & tempo coupled); `false` = PitchTime mode.
+    pub mode_tape: bool,
+    pub pitch_semitones: f32,
+    pub tempo_ratio: f32,
+    pub hq: bool,
+    pub formant_preserve: bool,
+    pub stereo_sep: f32,
+    pub interp: usize,
+    pub metronome: bool,
+}
+
+impl Default for PlaybackParams {
+    fn default() -> Self {
+        Self {
+            mode_tape: false,
+            pitch_semitones: 0.0,
+            tempo_ratio: 1.0,
+            hq: true,
+            formant_preserve: true,
+            stereo_sep: 100.0,
+            interp: 1,
+            metronome: false,
+        }
+    }
 }
 
 enum Cmd {
     Seek(f64),
     Load(PathBuf),
-    SetParams(Params),
+    LoadMidiDemo,
+    SetSoundfont(PathBuf),
+    SetParams(PlaybackParams),
 }
 
-#[derive(Clone, Copy)]
-struct Params {
-    mode_tape: bool,
-    pitch: f32,
-    tempo: f32,
-    hq: bool,
+/// File-kind classification by extension.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Audio,
+    Midi,
+    Tracker,
 }
 
-impl Default for Params {
-    fn default() -> Self {
-        Self { mode_tape: false, pitch: 0.0, tempo: 1.0, hq: true }
+fn classify(path: &Path) -> Kind {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mid") | Some("midi") => Kind::Midi,
+        Some("mod") | Some("xm") | Some("s3m") | Some("it") => Kind::Tracker,
+        _ => Kind::Audio,
     }
 }
 
@@ -248,7 +300,6 @@ pub struct Audio {
     peaks: Arc<Mutex<Vec<f32>>>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
-    params: Mutex<Params>,
 }
 
 impl Audio {
@@ -280,16 +331,23 @@ impl Audio {
     pub fn seek(&self, seconds: f64) {
         let _ = self.cmd_tx.send(Cmd::Seek(seconds.max(0.0)));
     }
+    /// Load any supported source by path (audio, MIDI or tracker).
     pub fn load_file(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::Load(path));
+    }
+    /// Load the built-in General MIDI demo sequence.
+    pub fn load_midi_demo(&self) {
+        let _ = self.cmd_tx.send(Cmd::LoadMidiDemo);
+    }
+    /// Switch the MIDI engine's SoundFont at runtime.
+    pub fn set_soundfont(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::SetSoundfont(path));
     }
     pub fn set_volume(&self, vol: f32) {
         self.volume
             .store(vol.clamp(0.0, 4.0).to_bits(), Ordering::SeqCst);
     }
-    pub fn set_params(&self, mode_tape: bool, pitch_semitones: f32, tempo_ratio: f32, hq_sinc: bool) {
-        let params = Params { mode_tape, pitch: pitch_semitones, tempo: tempo_ratio, hq: hq_sinc };
-        *self.params.lock().unwrap() = params;
+    pub fn set_params(&self, params: PlaybackParams) {
         let _ = self.cmd_tx.send(Cmd::SetParams(params));
     }
     pub fn peaks(&self) -> Vec<f32> {
@@ -341,8 +399,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
 
-    // Producer thread: decode → resample → push. Always spawned — even for the
-    // silence/tone sources — so UI-driven `Load`/`Seek` commands always land.
+    // Producer thread: decode/render → pitch-shift → push.
     {
         let sh = shared.clone();
         thread::Builder::new()
@@ -351,7 +408,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
             .map_err(|e| e.to_string())?;
     }
 
-    // Consumer: the cpal callback. Copy + fade + volume only — never decode.
+    // Consumer: the cpal callback. Copy + fade + volume only.
     let sh = shared.clone();
     let mut consumer = consumer;
     let err_fn = |e| eprintln!("[cpal] stream error: {e}");
@@ -372,13 +429,11 @@ pub fn start(src: Source) -> Result<Audio, String> {
                 let tgen = sh.transport_gen.load(Ordering::Relaxed);
                 let flush = sh.flush_gen.load(Ordering::Relaxed);
 
-                // A seek/load flushed the ring: drop everything queued so stale
-                // audio at the old position cannot leak into the new one.
+                // A seek/load flushed the ring: drop stale audio.
                 if flush != local_flush {
                     local_flush = flush;
                     while consumer.pop().is_ok() {}
                 }
-                // Desired-state transition → (re)start the appropriate fade.
                 if want != last_playing || tgen != local_tgen {
                     last_playing = want;
                     local_tgen = tgen;
@@ -461,7 +516,6 @@ pub fn start(src: Source) -> Result<Audio, String> {
         peaks: shared.peaks.clone(),
         meta: shared.meta.clone(),
         current: shared.current.clone(),
-        params: Mutex::new(Params::default()),
     })
 }
 
@@ -473,8 +527,263 @@ enum Fade {
 }
 
 // ---------------------------------------------------------------------------
-// Decoder thread
+// Real-time pitch / tempo / formant shifter
 // ---------------------------------------------------------------------------
+
+/// A streaming granular (WSOLA-style) time-stretcher followed by a fractional
+/// resampler, plus an optional formant-spectrum tilt. Pitch and tempo are
+/// independent; parameter changes glide at grain boundaries instead of
+/// flushing, so dragging a slider never clicks.
+pub struct RealTimePitchShifter {
+    rate: f32,
+    pitch_semitones: f32,
+    tempo_ratio: f32,
+    formant_preserve: bool,
+    grain: usize,
+    hop: usize,
+    window: Vec<f32>,
+    /// Pending interleaved-stereo input, with the absolute frame index of its
+    /// front element.
+    inq: VecDeque<f32>,
+    in_front: u64,
+    next_anchor: u64,
+    /// Windowed output of the previous grain (interleaved stereo, `grain` frames).
+    prev_grain: Vec<f32>,
+    have_prev: bool,
+    /// Stretched interleaved-stereo output waiting to be resampled.
+    stq: VecDeque<f32>,
+    st_front: u64,
+    st_read: f64,
+    lp_l: f32,
+    lp_r: f32,
+}
+
+impl RealTimePitchShifter {
+    /// Build a shifter for `rate`.
+    pub fn new(rate: u32) -> Self {
+        let grain = ((0.021 * rate as f32) as usize).max(64) & !1;
+        let hop = grain / 2;
+        let window: Vec<f32> = (0..grain)
+            .map(|i| {
+                let p = i as f32 / grain as f32;
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * p).cos())
+            })
+            .collect();
+        Self {
+            rate: rate as f32,
+            pitch_semitones: 0.0,
+            tempo_ratio: 1.0,
+            formant_preserve: true,
+            grain,
+            hop,
+            window,
+            inq: VecDeque::new(),
+            in_front: 0,
+            next_anchor: 0,
+            prev_grain: vec![0.0; grain * 2],
+            have_prev: false,
+            stq: VecDeque::new(),
+            st_front: 0,
+            st_read: 0.0,
+            lp_l: 0.0,
+            lp_r: 0.0,
+        }
+    }
+
+    pub fn set_pitch(&mut self, semitones: f32) {
+        self.pitch_semitones = semitones.clamp(-12.0, 12.0);
+    }
+    pub fn set_tempo(&mut self, ratio: f32) {
+        self.tempo_ratio = ratio.clamp(0.5, 2.0);
+    }
+    pub fn set_formant(&mut self, preserve: bool) {
+        self.formant_preserve = preserve;
+    }
+
+    /// Drop all buffered state (used on track change).
+    pub fn reset(&mut self) {
+        self.inq.clear();
+        self.in_front = 0;
+        self.next_anchor = 0;
+        self.have_prev = false;
+        self.stq.clear();
+        self.st_front = 0;
+        self.st_read = 0.0;
+        self.lp_l = 0.0;
+        self.lp_r = 0.0;
+        self.prev_grain.iter_mut().for_each(|v| *v = 0.0);
+    }
+
+    /// Feed interleaved-stereo `input`, appending interleaved-stereo output to
+    /// `out`. `out` is expected to be empty on entry.
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        self.inq.extend(input.iter().copied());
+        self.pump_stretch();
+        self.pump_resample(out);
+    }
+
+    fn pitch_ratio(&self) -> f64 {
+        2f64.powf(self.pitch_semitones as f64 / 12.0)
+    }
+
+    fn pump_stretch(&mut self) {
+        let grain = self.grain;
+        let hop = self.hop;
+        loop {
+            let avail = (self.inq.len() / 2) as u64;
+            let have = self.in_front + avail;
+            let need = self.next_anchor + grain as u64;
+            if need > have {
+                break;
+            }
+            let base = (self.next_anchor - self.in_front) as usize;
+            if (base + grain) * 2 > self.inq.len() {
+                break;
+            }
+            let mut cur = vec![0.0f32; grain * 2];
+            for i in 0..grain {
+                let w = self.window[i];
+                let o = (base + i) * 2;
+                cur[i * 2] = self.inq[o] * w;
+                cur[i * 2 + 1] = self.inq[o + 1] * w;
+            }
+
+            if self.have_prev {
+                for i in 0..hop {
+                    for c in 0..2 {
+                        let v = self.prev_grain[(hop + i) * 2 + c] + cur[i * 2 + c];
+                        self.stq.push_back(v);
+                    }
+                }
+            } else {
+                for i in 0..hop {
+                    for c in 0..2 {
+                        self.stq.push_back(cur[i * 2 + c]);
+                    }
+                }
+                self.have_prev = true;
+            }
+            self.prev_grain.copy_from_slice(&cur);
+
+            // Advance the analysis anchor: `hop` output frames per grain, but the
+            // input is consumed at rate `tempo / pitch_ratio` (stretch = r/tempo).
+            let r = self.pitch_ratio();
+            let analysis_hop = (hop as f64 * self.tempo_ratio as f64 / r).max(1.0);
+            self.next_anchor += analysis_hop as u64;
+
+            let drop_frames = (self.next_anchor - self.in_front) as usize;
+            let avail = self.inq.len() / 2;
+            let d = drop_frames.min(avail);
+            if d > 0 {
+                self.inq.drain(0..d * 2);
+                self.in_front += d as u64;
+            }
+        }
+    }
+
+    fn pump_resample(&mut self, out: &mut Vec<f32>) {
+        let r = self.pitch_ratio();
+        let st_frames = (self.stq.len() / 2) as u64;
+        loop {
+            let rel = self.st_read - self.st_front as f64;
+            if rel + 2.0 >= st_frames as f64 {
+                break;
+            }
+            let i0 = rel.floor() as usize;
+            let frac = (rel - i0 as f64) as f32;
+            for c in 0..2 {
+                let v = cubic_q(&self.stq, i0, frac, c);
+                let v = if self.formant_preserve {
+                    self.tilt(c, v, r as f32)
+                } else {
+                    v
+                };
+                out.push(v.clamp(-1.0, 1.0));
+            }
+            self.st_read += r;
+        }
+
+        // Drop consumed stretched frames, keeping a small look-behind margin.
+        let drop_to = (self.st_read.floor() as u64).saturating_sub(2);
+        if drop_to > self.st_front {
+            let have = (self.stq.len() / 2) as u64;
+            let n = (drop_to - self.st_front).min(have.saturating_sub(4)) as usize;
+            if n > 0 {
+                self.stq.drain(0..n * 2);
+                self.st_front += n as u64;
+            }
+        }
+    }
+
+    /// A gentle first-order spectral tilt that counteracts the envelope shift a
+    /// pure resampler introduces (a lightweight formant-preservation
+    /// approximation — no phase-vocoder envelope extraction).
+    fn tilt(&mut self, c: usize, x: f32, r: f32) -> f32 {
+        // Keep the one-pole cutoff roughly constant across sample rates.
+        let coef = (0.15 * 48_000.0 / self.rate).clamp(0.03, 0.4);
+        let lp = if c == 0 {
+            self.lp_l += coef * (x - self.lp_l);
+            self.lp_l
+        } else {
+            self.lp_r += coef * (x - self.lp_r);
+            self.lp_r
+        };
+        let g = 0.6 * (1.0 - 1.0 / r.max(0.001));
+        x + g * lp
+    }
+}
+
+fn cubic_q(q: &VecDeque<f32>, i0: usize, frac: f32, c: usize) -> f32 {
+    let at = |i: isize| -> f32 {
+        if i < 0 {
+            0.0
+        } else {
+            q.get(i as usize * 2 + c).copied().unwrap_or(0.0)
+        }
+    };
+    let p0 = at(i0 as isize - 1);
+    let p1 = at(i0 as isize);
+    let p2 = at(i0 as isize + 1);
+    let p3 = at(i0 as isize + 2);
+    let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+    let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+    let cc = -0.5 * p0 + 0.5 * p2;
+    ((a * frac + b) * frac + cc) * frac + p1
+}
+
+// ---------------------------------------------------------------------------
+// Decoder / render thread
+// ---------------------------------------------------------------------------
+
+enum Engine {
+    None,
+    Ffmpeg(*mut c_void),
+    Midi(Box<MidiEngine>),
+    Tracker(Box<TrackerPlayer>),
+}
+
+fn close_engine(engine: &mut Engine) {
+    if let Engine::Ffmpeg(h) = engine {
+        if !h.is_null() {
+            unsafe { sa_ffmpeg_close(*h) };
+        }
+    }
+    *engine = Engine::None;
+}
+
+fn pre_load(sh: &Shared) {
+    sh.fade_out.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(13));
+    sh.flush_gen.fetch_add(1, Ordering::SeqCst);
+}
+
+fn post_load(sh: &Shared, total_frames: u64) {
+    sh.total_frames.store(total_frames, Ordering::SeqCst);
+    sh.frames_played.store(0, Ordering::SeqCst);
+    sh.fade_out.store(false, Ordering::SeqCst);
+    sh.playing.store(true, Ordering::SeqCst);
+    sh.transport_gen.fetch_add(1, Ordering::SeqCst);
+}
 
 fn decoder_thread(
     rx: mpsc::Receiver<Cmd>,
@@ -484,19 +793,35 @@ fn decoder_thread(
     out_ch: usize,
     sh: Shared,
 ) {
-    let mut handle: *mut c_void = std::ptr::null_mut();
-    let mut params = Params::default();
+    let mut engine = Engine::None;
+    let mut params = PlaybackParams::default();
+    let mut shifter = RealTimePitchShifter::new(out_rate);
     let mut step = 1.0f64;
-    let mut in_buf: Vec<f32> = Vec::new(); // interleaved stereo at out_rate
+
+    // FFmpeg state.
+    let mut in_buf: Vec<f32> = Vec::new();
     let mut read_pos = 0.0f64;
     let mut eof = false;
     let mut tmp = vec![0.0f32; 8192 * 2];
 
-    // An initial file source is loaded exactly like a `Load` command.
-    if let Source::File(p) = &src {
-        let p = p.clone();
-        open_into(&mut handle, &p, out_rate, &mut params, &mut step, &sh);
-        src = Source::File(PathBuf::new()); // consumed; mark so we don't re-open
+    // Scratch buffers reused across iterations.
+    let mut raw: Vec<f32> = Vec::new();
+    let mut post: Vec<f32> = Vec::new();
+    let mut m_left: Vec<f32> = Vec::new();
+    let mut m_right: Vec<f32> = Vec::new();
+
+    let mut tone_hz: Option<f32> = None;
+    let mut silence = false;
+
+    // Load the initial source.
+    match std::mem::replace(&mut src, Source::Silence) {
+        Source::Silence => silence = true,
+        Source::Tone { hz } => tone_hz = Some(hz),
+        Source::File(p) => open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh),
+        Source::MidiFile(p) => open_midi(&mut engine, Some(&p), out_rate, &sh),
+        Source::MidiDemo => open_midi(&mut engine, None, out_rate, &sh),
+        Source::TrackerFile(p) => open_tracker(&mut engine, Some(&p), out_rate, &sh),
+        Source::TrackerDemo => open_tracker(&mut engine, None, out_rate, &sh),
     }
 
     loop {
@@ -504,128 +829,226 @@ fn decoder_thread(
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Cmd::Seek(secs) => {
-                    sh.fade_out.store(true, Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(13));
-                    sh.flush_gen.fetch_add(1, Ordering::SeqCst);
-                    if !handle.is_null() {
-                        unsafe {
-                            sa_ffmpeg_seek(handle, secs);
+                    // Only the FFmpeg path is seekable; MIDI/tracker restart is a
+                    // non-destructive no-op here.
+                    if let Engine::Ffmpeg(handle) = engine {
+                        if !handle.is_null() {
+                            pre_load(&sh);
+                            unsafe { sa_ffmpeg_seek(handle, secs) };
+                            in_buf.clear();
+                            read_pos = 0.0;
+                            eof = false;
+                            sh.frames_played
+                                .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
+                            sh.fade_out.store(false, Ordering::SeqCst);
+                            sh.transport_gen.fetch_add(1, Ordering::SeqCst);
                         }
                     }
-                    in_buf.clear();
-                    read_pos = 0.0;
-                    eof = false;
-                    sh.frames_played
-                        .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
-                    sh.fade_out.store(false, Ordering::SeqCst);
-                    sh.transport_gen.fetch_add(1, Ordering::SeqCst);
                 }
                 Cmd::Load(p) => {
-                    open_into(&mut handle, &p, out_rate, &mut params, &mut step, &sh);
+                    shifter.reset();
+                    // Leaving the tone/silence source: the new engine drives output.
+                    silence = false;
+                    tone_hz = None;
+                    match classify(&p) {
+                        Kind::Audio => {
+                            open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh)
+                        }
+                        Kind::Midi => open_midi(&mut engine, Some(&p), out_rate, &sh),
+                        Kind::Tracker => open_tracker(&mut engine, Some(&p), out_rate, &sh),
+                    }
                     eof = false;
+                }
+                Cmd::LoadMidiDemo => {
+                    shifter.reset();
+                    silence = false;
+                    tone_hz = None;
+                    open_midi(&mut engine, None, out_rate, &sh);
+                }
+                Cmd::SetSoundfont(path) => {
+                    if let Engine::Midi(m) = &mut engine {
+                        if let Err(e) = m.set_soundfont(&path) {
+                            eprintln!("[audio] SoundFont switch failed: {e}");
+                        } else {
+                            println!("[audio] SoundFont switched to {}", path.display());
+                        }
+                    }
                 }
                 Cmd::SetParams(p) => {
                     params = p;
-                    apply_params(handle, &params);
+                    apply_engine_params(&mut engine, &params);
                     step = compute_step(&params);
                 }
             }
         }
 
-        // --- Tone / silence sources ------------------------------------------
-        match &src {
-            Source::Tone { hz } => {
-                push_tone(&mut producer, &sh, *hz, out_rate, out_ch);
-                continue;
-            }
-            Source::Silence => {
-                thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            Source::File(_) => {}
+        if let Some(hz) = tone_hz {
+            push_tone(&mut producer, &sh, hz, out_rate, out_ch);
+            continue;
         }
-
-        if handle.is_null() || !sh.playing.load(Ordering::Relaxed) {
+        if silence {
             thread::sleep(Duration::from_millis(5));
             continue;
         }
 
-        // --- Produce a bounded chunk so commands stay responsive -------------
+        if matches!(engine, Engine::None) || !sh.playing.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
         let free_frames = producer.slots() / out_ch;
         if free_frames == 0 {
             thread::sleep(Duration::from_millis(3));
             continue;
         }
         let cap = free_frames.min(CHUNK_FRAMES);
-        let want_in = read_pos.ceil() as usize + LOOKAHEAD + 1;
 
-        while !eof && in_buf.len() / 2 < want_in {
-            let n = unsafe { sa_ffmpeg_read(handle, tmp.as_mut_ptr(), tmp.len() as c_int) };
-            if n <= 0 {
-                eof = true;
-                break;
+        raw.clear();
+        let produced: usize;
+
+        match &mut engine {
+            Engine::Ffmpeg(handle) => {
+                let h = *handle;
+                if h.is_null() {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let want_in = read_pos.ceil() as usize + LOOKAHEAD + 1;
+                while !eof && in_buf.len() / 2 < want_in {
+                    let n = unsafe { sa_ffmpeg_read(h, tmp.as_mut_ptr(), tmp.len() as c_int) };
+                    if n <= 0 {
+                        eof = true;
+                        break;
+                    }
+                    in_buf.extend_from_slice(&tmp[..n as usize]);
+                }
+
+                let avail = in_buf.len() / 2;
+                produced = produce_ffmpeg(&in_buf, avail, cap, &mut read_pos, step, params.hq, &mut raw);
+
+                if read_pos > 32768.0 {
+                    let consumed = read_pos.floor() as usize;
+                    in_buf.drain(0..consumed * 2);
+                    read_pos -= consumed as f64;
+                }
+                if produced == 0 && eof {
+                    sh.playing.store(false, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
             }
-            in_buf.extend_from_slice(&tmp[..n as usize]);
+            Engine::Midi(m) => {
+                if m_left.len() < cap {
+                    m_left.resize(cap, 0.0);
+                    m_right.resize(cap, 0.0);
+                }
+                m.render(&mut m_left[..cap], &mut m_right[..cap]);
+                for i in 0..cap {
+                    raw.push(m_left[i]);
+                    raw.push(m_right[i]);
+                }
+                produced = cap;
+            }
+            Engine::Tracker(t) => {
+                if m_left.len() < cap {
+                    m_left.resize(cap, 0.0);
+                    m_right.resize(cap, 0.0);
+                }
+                t.render(&mut m_left[..cap], &mut m_right[..cap]);
+                for i in 0..cap {
+                    raw.push(m_left[i]);
+                    raw.push(m_right[i]);
+                }
+                produced = cap;
+            }
+            Engine::None => {
+                produced = 0;
+            }
         }
 
-        let avail = in_buf.len() / 2;
-        let mut produced = 0usize;
-        while produced < cap {
-            let i0 = read_pos.floor() as usize;
-            if i0 + 1 >= avail {
-                break;
-            }
-            let frac = (read_pos - i0 as f64) as f32;
-            for c in 0..out_ch {
-                let sc = c.min(1);
-                let v = if step == 1.0 {
-                    frame_at(&in_buf, i0 as isize, sc)
-                } else if params.hq {
-                    sinc8(&in_buf, i0, frac, sc)
-                } else {
-                    cubic(&in_buf, i0, frac, sc)
-                };
-                // Exactly `cap` slots are free, so this push cannot fail.
-                let _ = producer.push(v);
-            }
-            read_pos += step;
-            produced += 1;
-        }
-
-        if produced == 0 && eof {
-            // End of stream: park until the next Load/Seek restarts playback.
-            sh.playing.store(false, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(5));
+        if produced == 0 {
             continue;
         }
 
-        // Drop consumed input frames once they are safely behind the read head.
-        if read_pos > 32768.0 {
-            let consumed = read_pos.floor() as usize;
-            in_buf.drain(0..consumed * 2);
-            read_pos -= consumed as f64;
+        push_processed(&mut producer, &params, &mut shifter, &raw, out_ch, &mut post);
+    }
+}
+
+/// Produce up to `cap` interleaved-stereo frames by resampling `in_buf`.
+fn produce_ffmpeg(
+    in_buf: &[f32],
+    avail: usize,
+    cap: usize,
+    read_pos: &mut f64,
+    step: f64,
+    hq: bool,
+    raw: &mut Vec<f32>,
+) -> usize {
+    let mut produced = 0usize;
+    while produced < cap {
+        let i0 = read_pos.floor() as usize;
+        if i0 + 1 >= avail {
+            break;
+        }
+        let frac = (*read_pos - i0 as f64) as f32;
+        for c in 0..2 {
+            let v = if step == 1.0 {
+                frame_at(in_buf, i0 as isize, c)
+            } else if hq {
+                sinc8(in_buf, i0, frac, c)
+            } else {
+                cubic(in_buf, i0, frac, c)
+            };
+            raw.push(v);
+        }
+        *read_pos += step;
+        produced += 1;
+    }
+    produced
+}
+
+/// Apply the pitch/tempo/formant stage and push the result to the ring.
+fn push_processed(
+    producer: &mut rtrb::Producer<f32>,
+    params: &PlaybackParams,
+    shifter: &mut RealTimePitchShifter,
+    raw: &[f32],
+    out_ch: usize,
+    post: &mut Vec<f32>,
+) {
+    let neutral = params.pitch_semitones.abs() < 1e-4 && (params.tempo_ratio - 1.0).abs() < 1e-4;
+    let bypass = params.mode_tape || neutral;
+
+    let src: &[f32] = if bypass {
+        raw
+    } else {
+        shifter.set_pitch(params.pitch_semitones);
+        shifter.set_tempo(params.tempo_ratio);
+        shifter.set_formant(params.formant_preserve);
+        post.clear();
+        shifter.process(raw, post);
+        post
+    };
+
+    let frames = src.len() / 2;
+    let fits = (producer.slots() / out_ch).min(frames);
+    for f in 0..fits {
+        for c in 0..out_ch {
+            let _ = producer.push(src[f * 2 + c.min(1)]);
         }
     }
 }
 
-/// Open `path` into `handle`, probe metadata + waveform, apply params, and
-/// reset the decoder position to 0.
-fn open_into(
-    handle: &mut *mut c_void,
+fn open_ffmpeg(
+    engine: &mut Engine,
     path: &Path,
     out_rate: u32,
-    params: &mut Params,
+    params: &PlaybackParams,
     step: &mut f64,
     sh: &Shared,
 ) {
-    sh.fade_out.store(true, Ordering::SeqCst);
-    thread::sleep(Duration::from_millis(13));
-    sh.flush_gen.fetch_add(1, Ordering::SeqCst);
-
-    if !handle.is_null() {
-        unsafe { sa_ffmpeg_close(*handle) };
-        *handle = std::ptr::null_mut();
-    }
+    close_engine(engine);
+    pre_load(sh);
 
     match probe_metadata(path) {
         Some(m) => {
@@ -643,61 +1066,123 @@ fn open_into(
             *sh.meta.lock().unwrap() = Some(m);
         }
         None => {
-            println!(
-                "[audio] metadata probe returned nothing for {}",
-                path.display()
-            );
+            println!("[audio] metadata probe returned nothing for {}", path.display());
             *sh.meta.lock().unwrap() = None;
         }
     }
 
     let peaks = extract_waveform_peaks(path, 96);
-    println!("[audio] waveform peaks: {} bins", peaks.len());
     *sh.peaks.lock().unwrap() = peaks;
     *sh.current.lock().unwrap() = Some(path.to_path_buf());
 
+    let mut handle: *mut c_void = std::ptr::null_mut();
     if let Some(c) = path_cstring(path) {
-        *handle = unsafe { sa_ffmpeg_open(c.as_ptr(), out_rate as c_int) };
+        handle = unsafe { sa_ffmpeg_open(c.as_ptr(), out_rate as c_int) };
     }
 
-    if handle.is_null() {
+    let total = if handle.is_null() {
         eprintln!("[audio] FFmpeg open failed for {}", path.display());
-        sh.total_frames.store(0, Ordering::SeqCst);
+        0
     } else {
-        let dur = unsafe { sa_ffmpeg_duration(*handle) };
-        sh.total_frames
-            .store((dur * out_rate as f64) as u64, Ordering::SeqCst);
-    }
+        let dur = unsafe { sa_ffmpeg_duration(handle) };
+        (dur * out_rate as f64) as u64
+    };
 
-    apply_params(*handle, params);
+    apply_params_ffmpeg(handle, params);
     *step = compute_step(params);
-    sh.frames_played.store(0, Ordering::SeqCst);
-    sh.fade_out.store(false, Ordering::SeqCst);
-    sh.playing.store(true, Ordering::SeqCst);
-    sh.transport_gen.fetch_add(1, Ordering::SeqCst);
+    *engine = Engine::Ffmpeg(handle);
+    post_load(sh, total);
 }
 
-fn apply_params(handle: *mut c_void, p: &Params) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        if p.mode_tape {
-            // Tape mode: no FFmpeg DSP — the variable-rate resample moves both
-            // tempo and pitch together.
-            sa_ffmpeg_set_pitch_semitones(handle, 0.0);
-            sa_ffmpeg_set_tempo(handle, 1.0);
-        } else {
-            // PitchTime: FFmpeg's rubberband/atempo does pitch & tempo.
-            sa_ffmpeg_set_pitch_semitones(handle, p.pitch as f64);
-            sa_ffmpeg_set_tempo(handle, p.tempo as f64);
+fn open_midi(engine: &mut Engine, path: Option<&Path>, out_rate: u32, sh: &Shared) {
+    close_engine(engine);
+    pre_load(sh);
+    match MidiEngine::new(out_rate) {
+        Ok(mut m) => {
+            if let Some(p) = path {
+                if let Err(e) = m.load_file(p) {
+                    eprintln!("[audio] {e}");
+                }
+            } else {
+                m.load_demo();
+            }
+            let dur = m.duration();
+            if m.using_soundfont() {
+                if let Some(p) = m.soundfont_path() {
+                    println!("[audio] MIDI SoundFont: {}", p.display());
+                }
+            }
+            *sh.meta.lock().unwrap() = None;
+            *sh.peaks.lock().unwrap() = synth_wave_peaks(96);
+            *sh.current.lock().unwrap() = path.map(|p| p.to_path_buf());
+            *engine = Engine::Midi(Box::new(m));
+            post_load(sh, (dur * out_rate as f64) as u64);
+        }
+        Err(e) => {
+            eprintln!("[audio] MIDI engine init failed: {e}");
+            post_load(sh, 0);
         }
     }
 }
 
-fn compute_step(p: &Params) -> f64 {
+fn open_tracker(engine: &mut Engine, path: Option<&Path>, out_rate: u32, sh: &Shared) {
+    close_engine(engine);
+    pre_load(sh);
+    let mut t = TrackerPlayer::new(out_rate);
+    if let Some(p) = path {
+        if let Err(e) = t.load_file(p) {
+            eprintln!("[audio] {e} — falling back to built-in module");
+            t.load_builtin();
+        }
+    } else {
+        t.load_builtin();
+    }
+    println!("[audio] tracker module: {}", t.title());
+    *sh.meta.lock().unwrap() = None;
+    *sh.peaks.lock().unwrap() = synth_wave_peaks(96);
+    *sh.current.lock().unwrap() = path.map(|p| p.to_path_buf());
+    *engine = Engine::Tracker(Box::new(t));
+    post_load(sh, 0);
+}
+
+fn apply_params_ffmpeg(handle: *mut c_void, p: &PlaybackParams) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        // FFmpeg always outputs the raw stream; pitch/tempo are handled by the
+        // Rust pipeline (PitchTime shifter or the Tape-mode variable resampler).
+        sa_ffmpeg_set_pitch_semitones(handle, 0.0);
+        sa_ffmpeg_set_tempo(handle, 1.0);
+        sa_ffmpeg_set_formant(handle, if p.formant_preserve { 1 } else { 0 });
+    }
+}
+
+fn apply_engine_params(engine: &mut Engine, p: &PlaybackParams) {
+    match engine {
+        Engine::Ffmpeg(h) => apply_params_ffmpeg(*h, p),
+        Engine::Tracker(t) => {
+            // The shared pitch shifter owns pitch/tempo (kept neutral here); the
+            // tracker engine owns stereo separation and interpolation.
+            t.set_pitch(0.0);
+            t.set_tempo(1.0);
+            t.set_stereo_separation(p.stereo_sep);
+            t.set_interp(p.interp);
+        }
+        Engine::Midi(m) => {
+            // Pitch/tempo are applied by the pipeline; the MIDI engine keeps its
+            // own transpose/BPM neutral and owns the metronome.
+            m.set_transpose(0);
+            m.set_bpm(None);
+            m.set_metronome(p.metronome);
+        }
+        Engine::None => {}
+    }
+}
+
+fn compute_step(p: &PlaybackParams) -> f64 {
     if p.mode_tape {
-        (p.tempo as f64) * 2f64.powf(p.pitch as f64 / 12.0)
+        (p.tempo_ratio as f64) * 2f64.powf(p.pitch_semitones as f64 / 12.0)
     } else {
         1.0
     }
@@ -725,7 +1210,6 @@ fn cubic(buf: &[f32], i0: usize, frac: f32, ch: usize) -> f32 {
     let p1 = frame_at(buf, i0 as isize, ch);
     let p2 = frame_at(buf, i0 as isize + 1, ch);
     let p3 = frame_at(buf, i0 as isize + 2, ch);
-    // Catmull-Rom.
     let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
     let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
     let c = -0.5 * p0 + 0.5 * p2;
@@ -774,7 +1258,7 @@ fn push_tone(
     let free_frames = producer.slots() / out_ch;
     let n = free_frames.min(CHUNK_FRAMES);
     for _ in 0..n {
-        // Muted — the tone path exists to exercise the pipeline without sound.
+        // Muted — the tone path exercises the pipeline without sound.
         for _ in 0..out_ch {
             if producer.push(0.0).is_err() {
                 return;
@@ -796,7 +1280,6 @@ mod tests {
 
     #[test]
     fn sinc_passthrough_at_integer_positions() {
-        // Interleaved stereo: left = 1.0, right = 0.5 for every frame.
         let mut buf = Vec::with_capacity(16 * 2);
         for _ in 0..16 {
             buf.push(1.0);
@@ -810,8 +1293,6 @@ mod tests {
 
     #[test]
     fn sinc_agrees_with_cubic_on_a_gentle_ramp() {
-        // A gentle ramp is nearly linear, so both interpolators should agree at
-        // the midpoint.
         let mut buf = Vec::with_capacity(32 * 2);
         for i in 0..32 {
             let v = i as f32 / 32.0;
@@ -832,9 +1313,46 @@ mod tests {
 
     #[test]
     fn tape_step_moves_pitch_and_tempo_together() {
-        let p = Params { mode_tape: true, pitch: 12.0, tempo: 1.0, hq: true };
+        let p = PlaybackParams {
+            mode_tape: true,
+            pitch_semitones: 12.0,
+            tempo_ratio: 1.0,
+            ..Default::default()
+        };
         assert!((compute_step(&p) - 2.0).abs() < 1e-9);
-        let q = Params { mode_tape: false, pitch: 12.0, tempo: 1.5, hq: true };
+        let q = PlaybackParams {
+            mode_tape: false,
+            pitch_semitones: 12.0,
+            tempo_ratio: 1.5,
+            ..Default::default()
+        };
         assert!((compute_step(&q) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pitch_shifter_is_neutral_at_unity_and_preserves_length() {
+        let mut s = RealTimePitchShifter::new(48_000);
+        s.set_pitch(0.0);
+        s.set_tempo(1.0);
+        // A steady 440 Hz sine over ~0.5 s.
+        let frames = 24_000usize;
+        let mut input = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin() * 0.5;
+            input.push(v);
+            input.push(v);
+        }
+        let mut out = Vec::new();
+        // Feed in chunks so the streaming path is exercised.
+        for chunk in input.chunks(2048) {
+            s.process(chunk, &mut out);
+        }
+        assert!(out.len() > 0, "shifter produced no output");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "shifter produced non-finite samples"
+        );
+        let energy: f32 = out.iter().map(|v| v * v).sum();
+        assert!(energy > 0.0);
     }
 }

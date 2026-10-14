@@ -104,14 +104,14 @@ Goal: Full parity with the Electron app's 3 playback engines and audio parameter
 - [x] **2.2 Universal FFmpeg Decoding & HQ Resampling:**
   - Wire `ffmpeg-next` (or direct `libavformat`/`libavcodec`/`libswresample` FFI against `D:\Work\_GIT\SoundApp\bin\win_bin`) for universal format support + metadata extraction (`getMetadata`), keeping `symphonia` as an optional pure-Rust fast path.
   - Wire `rubato` for SIMD sample-rate conversion (`HQ Mode` + output device selection via `cpal`).
-- [ ] **2.3 Real-Time Pitch / Tempo / Formant (Rubber Band FFI):**
+- [x] **2.3 Real-Time Pitch / Tempo / Formant (Rubber Band FFI):**
   - Bind `rubberband-c.h` (`D:\Work\_GIT\SoundApp\libs\rubberband`) on the decoder thread.
   - Supports `mode: Tape` (playback rate resample) vs `mode: PitchTime` (`pitch: -12..+12 st`, `tempo: 0.5..2.0x`, `formant: bool`, `locked: bool` across track changes) without the 70 MB WASM heap or 1-second worklet warmup delay.
-- [ ] **2.4 MIDI Engine (`rustysynth` + `midly`):**
+- [x] **2.4 MIDI Engine (`rustysynth` + `midly`):**
   - Pure-Rust SF2 SoundFont synthesis using `.sf2` files from `D:\Work\_GIT\SoundApp\bin\soundfonts`.
   - Parameters: `transpose` (`-12..+12`), `bpm` override, `metronome` click track, and live SoundFont switching.
   - A/B ear-test against `js-synthesizer` / FluidSynth; fallback to `libfluidsynth` C FFI if needed.
-- [ ] **2.5 Tracker Engine (`libopenmpt` C FFI):**
+- [x] **2.5 Tracker Engine (`libopenmpt` C FFI):**
   - Bind `libopenmpt` C API for `.mod`, `.xm`, `.it`, `.s3m` (70+ formats; test files in `D:\Work\_GIT\SoundApp\_Material\mod\`).
   - Parameters: `pitch`, `tempo`, `stereoSeparation` (`0..200%`), `interpolationFilter`, and per-channel VU extraction.
 

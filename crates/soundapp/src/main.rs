@@ -2,6 +2,8 @@
 // with nui_wc2 v3.0.0 "slate" theme & components and Swash browser-grade typography.
 
 mod audio;
+mod midi;
+mod tracker;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +15,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use audio::{Audio, Source};
+use audio::{Audio, PlaybackParams, Source};
 use audio::TrackMetadata;
 use nui::{
     BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Length, Rect, Renderer,
@@ -60,6 +62,11 @@ struct App {
     // Interactive NUI component states
     active_tab: usize,
     seg_pipeline: usize,
+    /// Previous pipeline selection, used to (re)load the right engine when the
+    /// segmented control switches to the MIDI synth.
+    last_pipeline: usize,
+    /// Previous SoundFont selection, used to switch the live SoundFont.
+    last_soundfont: usize,
     search_text: String,
     preset_name: String,
     selected_device: usize,
@@ -110,6 +117,19 @@ const SOUNDFONTS: &[&str] = &[
     "CrisisGeneralMidi3.01.sf2",
     "Arachno_SoundFont_v1.0.sf2",
 ];
+
+/// Resolve a SoundFont list index to an on-disk `.sf2` path (best effort —
+/// non-existent files are reported by the engine when the switch is attempted).
+fn soundfont_path_for(idx: usize) -> Option<PathBuf> {
+    let dir = PathBuf::from(r"D:\Work\_GIT\SoundApp\bin\soundfonts");
+    match idx {
+        0 => Some(PathBuf::from(midi::DEFAULT_SOUNDFONT)),
+        1 => Some(dir.join("FluidR3_GM.sf2")),
+        2 => Some(dir.join("CrisisGeneralMidi3.01.sf2")),
+        3 => Some(dir.join("Arachno_SoundFont_v1.0.sf2")),
+        _ => None,
+    }
+}
 
 /// Phase 1.5 secondary windows (SoundApp `P` / `N` / `M` / `S` / `H`), all undecorated
 /// like the primary window and managed by `nui::WindowManager`.
@@ -348,6 +368,8 @@ impl App {
 
             active_tab: 0,
             seg_pipeline: 1,
+            last_pipeline: 1,
+            last_soundfont: 0,
             search_text: "OpenSans + Swash Subpixel".to_string(),
             preset_name: "Studio Mastering (-14 LUFS)".to_string(),
             selected_device: 0,
@@ -1326,6 +1348,11 @@ impl App {
                         (cur + 1).min(self.real_tracks.len() - 1)
                     };
                     self.selected_track = idx;
+                    if !self.chk_locked {
+                        self.pitch_semitones = 0.0;
+                        self.tempo_ratio = 1.0;
+                        self.stereo_sep = 100.0;
+                    }
                     a.load_file(self.real_tracks[idx].clone());
                 }
             }
@@ -1333,18 +1360,44 @@ impl App {
                 a.seek(secs);
             }
             if let Some(path) = load_path.take() {
+                if !self.chk_locked {
+                    self.pitch_semitones = 0.0;
+                    self.tempo_ratio = 1.0;
+                    self.stereo_sep = 100.0;
+                }
                 a.load_file(path);
             }
             if vol_changed {
                 a.set_volume(self.master_vol);
             }
+            if self.selected_soundfont != self.last_soundfont {
+                self.last_soundfont = self.selected_soundfont;
+                if let Some(p) = soundfont_path_for(self.selected_soundfont) {
+                    a.set_soundfont(p);
+                }
+            }
             if params_changed {
-                a.set_params(
-                    self.seg_pipeline == 0,
-                    self.pitch_semitones,
-                    self.tempo_ratio,
-                    self.sw_hq_mode,
-                );
+                // Switching to the MIDI Synth pipeline loads the built-in GM
+                // sequence; leaving it reloads the selected audio track.
+                if self.seg_pipeline == 2 && self.last_pipeline != 2 {
+                    a.load_midi_demo();
+                } else if self.seg_pipeline != 2 && self.last_pipeline == 2 {
+                    if !self.real_tracks.is_empty() {
+                        let idx = self.selected_track.min(self.real_tracks.len() - 1);
+                        a.load_file(self.real_tracks[idx].clone());
+                    }
+                }
+                self.last_pipeline = self.seg_pipeline;
+                a.set_params(PlaybackParams {
+                    mode_tape: self.seg_pipeline == 0,
+                    pitch_semitones: self.pitch_semitones,
+                    tempo_ratio: self.tempo_ratio,
+                    hq: self.sw_hq_mode,
+                    formant_preserve: self.chk_formant,
+                    stereo_sep: self.stereo_sep,
+                    interp: self.radio_interp + 1,
+                    metronome: false,
+                });
             }
         }
 
@@ -2249,6 +2302,8 @@ fn main() {
     let mut file: Option<String> = None;
     let mut tone = false;
     let mut silence = false;
+    let mut midi_demo = false;
+    let mut tracker_demo = false;
     let mut animate = true;
     let mut nopaint = false;
     let mut extra_ops: usize = 0;
@@ -2268,6 +2323,8 @@ fn main() {
         match a.as_str() {
             "--tone" => tone = true,
             "--silence" => silence = true,
+            "--midi-demo" => midi_demo = true,
+            "--tracker-demo" => tracker_demo = true,
             "--static" => animate = false,
             "--nopaint" => nopaint = true,
             "--open-select" => open_select_demo = true,
@@ -2304,8 +2361,21 @@ fn main() {
         Source::Tone { hz: 440.0 }
     } else if silence {
         Source::Silence
+    } else if midi_demo {
+        Source::MidiDemo
+    } else if tracker_demo {
+        Source::TrackerDemo
     } else if let Some(p) = file {
-        Source::File(PathBuf::from(p))
+        let pb = PathBuf::from(p);
+        let ext = pb
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("mid") | Some("midi") => Source::MidiFile(pb),
+            Some("mod") | Some("xm") | Some("s3m") | Some("it") => Source::TrackerFile(pb),
+            _ => Source::File(pb),
+        }
     } else {
         // No file given: start the engine on silence so the UI can still load
         // tracks from the playlist / dropzone and drive the transport.
@@ -2323,7 +2393,16 @@ fn main() {
     // Push the initial UI state into the engine (gain + pitch/tempo/HQ params).
     if let Some(a) = &audio {
         a.set_volume(0.78);
-        a.set_params(false, 3.0, 1.18, true);
+        a.set_params(PlaybackParams {
+            mode_tape: false,
+            pitch_semitones: 3.0,
+            tempo_ratio: 1.18,
+            hq: true,
+            formant_preserve: true,
+            stereo_sep: 100.0,
+            interp: 2,
+            metronome: false,
+        });
     }
 
     let event_loop = EventLoop::new().unwrap();
