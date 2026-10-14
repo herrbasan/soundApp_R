@@ -69,11 +69,11 @@ We are building **two things simultaneously** inside a single Cargo workspace (`
 
 Goal: Make building complex multi-window UIs in `crates/nui` declarative and complete so zero manual `x, y` math is required in application code.
 
-- [ ] **1.1 Declarative Layout Engine (`crates/nui/src/layout.rs`):**
-  - Implement a lightweight stack/flex/grid layout cursor (`ui.column()`, `ui.row()`, `ui.grid(cols)`, `ui.form_row()`, `ui.card()`, `ui.spacer()`, `Length::Px` / `Length::Rem` / `Length::Fill(weight)`).
+- [x] **1.1 Declarative Layout Engine (`crates/nui/src/layout.rs`):**
+  - Implement a lightweight stack/flex/grid layout cursor (`ui.with_column()`, `ui.cols()`, `ui.rows()`, `ui.layout_grid(cols)`, `ui.take_form_row()`, `ui.input_group()`, `ui.nui_card()`, `ui.spacer()`, `Length::Px` / `Length::Rem` / `Length::Fill(weight)`), matching `nui_wc2` v3.0.0 (`16px` rem base, `2.5rem` form controls, `1rem` horizontal padding, responsive `1/2/3+` column breakpoints).
   - Refactor `crates/soundapp/src/main.rs` to use the layout builder instead of manual coordinate math.
-- [ ] **1.2 Scrollable & Virtualized List (`nui-list` / `ui.scroll_list()`):**
-  - Vertical scroll container with `push_clip`, mouse-wheel scrolling, inertial/smooth clamping, and a draggable scrollbar thumb (`--space-scrollbar-width: 0.5rem`).
+- [x] **1.2 Scrollable & Virtualized List (`nui-list` / `ui.scroll_area()` & `ui.virtual_list()`):**
+  - Vertical scroll container with `push_clip`, mouse-wheel scrolling, clamping, and a draggable scrollbar thumb (`--space-scrollbar-width: 0.5rem`).
   - Virtualized row callback `ui.virtual_list(id, rect, row_count, row_height, |ui, idx, row_rect| ...)` so a 10,000-track playlist only emits `QuadInstance`s for the ~15 visible rows.
 - [ ] **1.3 Anti-Aliased Vector Line & Waveform Primitive (`kind = 4` in `render.rs`):**
   - Add `kind = 4` (2D capsule line segment `(x0, y0) -> (x1, y1)` with thickness `w`) to `QuadInstance` in `FRAG_SRC` and `rasterize_slice`.

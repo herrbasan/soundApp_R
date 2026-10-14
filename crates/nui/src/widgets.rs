@@ -16,6 +16,7 @@
 
 #![allow(dead_code)]
 
+use crate::layout::LayoutCursor;
 use crate::render::Scene;
 use crate::text::{FontEngine, FontFace, TextSystem};
 
@@ -181,24 +182,96 @@ impl Theme {
         (self.rem * 0.25).round().max(3.0)
     }
 
+    /// `--nui-space: 1rem` — the base spacing unit all gaps/padding derive from.
+    #[inline]
+    pub fn space(&self) -> f32 {
+        self.rem.round()
+    }
+
+    /// `calc(var(--nui-space) * 0.125)`.
+    #[inline]
+    pub fn space_eighth(&self) -> f32 {
+        (self.rem * 0.125).round().max(1.0)
+    }
+
+    /// `--nui-space-quarter` = `calc(var(--nui-space) * 0.25)`.
+    #[inline]
+    pub fn space_quarter(&self) -> f32 {
+        (self.rem * 0.25).round().max(2.0)
+    }
+
+    /// `--nui-space-half` = `calc(var(--nui-space) * 0.5)`.
+    #[inline]
+    pub fn space_half(&self) -> f32 {
+        (self.rem * 0.5).round()
+    }
+
+    /// `calc(var(--nui-space) * 2)`.
+    #[inline]
+    pub fn space_double(&self) -> f32 {
+        (self.rem * 2.0).round()
+    }
+
+    /// `calc(var(--nui-space) * 3)`.
+    #[inline]
+    pub fn space_triple(&self) -> f32 {
+        (self.rem * 3.0).round()
+    }
+
+    /// `--nui-form-row-height: 2.5rem`.
+    #[inline]
+    pub fn form_row_height(&self) -> f32 {
+        (self.rem * 2.5).round()
+    }
+
+    /// `nui-form-row[size="small"]`: `2.0rem`.
+    #[inline]
+    pub fn form_row_small(&self) -> f32 {
+        (self.rem * 2.0).round()
+    }
+
+    /// `--space-page-maxwidth: 56rem`.
+    #[inline]
+    pub fn page_maxwidth(&self) -> f32 {
+        (self.rem * 56.0).round()
+    }
+
+    /// `--sidebar-width: 21rem`.
+    #[inline]
+    pub fn sidebar_width(&self) -> f32 {
+        (self.rem * 21.0).round()
+    }
+
+    /// App header strip height: `3.25rem`.
+    #[inline]
+    pub fn header_height(&self) -> f32 {
+        (self.rem * 3.25).round()
+    }
+
+    /// nui-theme.css type ramp (lines 20-26).
     #[inline]
     pub fn font_xsmall(&self) -> f32 {
-        self.rem * 0.78
+        (self.rem * 0.80).round()
     }
 
     #[inline]
     pub fn font_small(&self) -> f32 {
-        self.rem * 0.88
+        (self.rem * 0.90).round()
     }
 
     #[inline]
     pub fn font_base(&self) -> f32 {
-        self.rem * 0.96
+        self.rem.round()
     }
 
     #[inline]
     pub fn font_medium(&self) -> f32 {
-        self.rem * 1.15
+        (self.rem * 1.20).round()
+    }
+
+    #[inline]
+    pub fn font_large(&self) -> f32 {
+        (self.rem * 1.50).round()
     }
 }
 
@@ -276,6 +349,11 @@ pub struct UiState {
     pub text_sel_anchor: Option<usize>,
     pub text_scroll_x: f32,
 
+    // Scroll containers (Phase 1.2): persisted scroll offset per scroll-area id,
+    // and the grab offset while dragging a scrollbar thumb.
+    pub scroll_offsets: Vec<(u32, f32)>,
+    pub scroll_drag_grab: f32,
+
     last_click_time: std::time::Instant,
     last_click_pos: (f32, f32),
 }
@@ -300,6 +378,8 @@ impl UiState {
             text_cursor: 0,
             text_sel_anchor: None,
             text_scroll_x: 0.0,
+            scroll_offsets: Vec::new(),
+            scroll_drag_grab: 0.0,
             last_click_time: std::time::Instant::now(),
             last_click_pos: (-1000.0, -1000.0),
         }
@@ -365,6 +445,26 @@ impl UiState {
         }
         self.active_id.is_none() || self.active_id == Some(id)
     }
+
+    /// Persisted scroll offset for a scroll container (defaults to `0.0`).
+    #[inline]
+    pub fn scroll_offset(&self, id: u32) -> f32 {
+        self.scroll_offsets
+            .iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    }
+
+    /// Update (or create) the persisted scroll offset for a scroll container.
+    #[inline]
+    pub fn set_scroll_offset(&mut self, id: u32, v: f32) {
+        if let Some(entry) = self.scroll_offsets.iter_mut().find(|(k, _)| *k == id) {
+            entry.1 = v;
+        } else {
+            self.scroll_offsets.push((id, v));
+        }
+    }
 }
 
 pub struct Ui<'a> {
@@ -373,9 +473,28 @@ pub struct Ui<'a> {
     pub text_sys: &'a mut TextSystem,
     pub font_engine: FontEngine,
     pub theme: Theme,
+    /// Active declarative-layout column scopes (Phase 1.1). See `crate::layout`.
+    pub layout_stack: Vec<LayoutCursor>,
 }
 
 impl<'a> Ui<'a> {
+    pub fn new(
+        state: &'a mut UiState,
+        scene: &'a mut Scene,
+        text_sys: &'a mut TextSystem,
+        font_engine: FontEngine,
+        theme: Theme,
+    ) -> Self {
+        Self {
+            state,
+            scene,
+            text_sys,
+            font_engine,
+            theme,
+            layout_stack: Vec::new(),
+        }
+    }
+
     /// Draw an `nui-input-group` uppercase label above a control.
     pub fn input_label(&mut self, x: f32, y: f32, label: &str) {
         let fs = self.theme.font_xsmall();
@@ -401,10 +520,12 @@ impl<'a> Ui<'a> {
     ) -> bool {
         let mut changed = false;
         let t = self.theme;
-        let fs = t.font_small();
+        // `nui-tabs` (nui-theme.css line 4445): base-size label, `--nui-space` padding,
+        // `--nui-space-quarter` gap between tabs.
+        let fs = t.font_base();
         let icon_sz = (t.rem * 1.08).round();
-        let pad_x = (t.rem * 0.85).round();
-        let gap = (t.rem * 0.25).round();
+        let pad_x = t.space();
+        let gap = t.space_quarter();
 
         // Bottom border line across full tablist width
         self.scene.rect(r.x, r.y + r.h - 1.0, r.w, 1.0, t.border2);
@@ -1099,7 +1220,9 @@ impl<'a> Ui<'a> {
     ) -> bool {
         let t = self.theme;
         let fs = t.font_small();
-        let pad_x = (t.rem * 0.85).round();
+        // `padding: 0 var(--nui-space)` (nui-theme.css line 3284) — input text starts on the
+        // same vertical line as select/button text.
+        let pad_x = t.space();
         let clear_btn_sz = (t.rem * 1.4).round();
         let clear_rect = Rect::new(
             (r.x + r.w - clear_btn_sz - t.rem * 0.35).round(),
@@ -1427,7 +1550,8 @@ impl<'a> Ui<'a> {
     ) -> bool {
         let t = self.theme;
         let fs = t.font_small();
-        let pad_x = (t.rem * 0.85).round();
+        // `padding: 0 var(--nui-space)` (nui-theme.css line 3425) — same text origin as nui-input.
+        let pad_x = t.space();
         let is_open = self.state.open_popup_id == Some(id);
         let hovered = r.contains(self.state.cursor.0, self.state.cursor.1)
             && (self.state.active_id.is_none() || self.state.active_id == Some(id));
@@ -1518,7 +1642,8 @@ impl<'a> Ui<'a> {
 
         // Render top-layer popup in Scene's overlay pass so it paints above all page widgets
         if is_open {
-            let row_h = (t.rem * 2.0).round();
+            // Option rows: `padding: var(--nui-space-half) var(--nui-space)` -> 2.25rem.
+            let row_h = (t.rem * 2.25).round();
             let pop_h = row_h * options.len() as f32 + 2.0;
             let pop_r = Rect::new(r.x, r.y + r.h, r.w, pop_h);
             self.state.popup_rect = Some(pop_r);
@@ -1714,6 +1839,240 @@ impl<'a> Ui<'a> {
             t.text,
         );
         w
+    }
+
+    // ==================================================================
+    // Phase 1.2 — Scrollable & Virtualized List
+    // ==================================================================
+
+    /// A clipped, mouse-wheel-scrollable viewport with a draggable `--space-scrollbar-width`
+    /// (`0.5rem`) thumb. `f` receives the viewport rect and the current scroll offset and must
+    /// lay its content out in an unclipped coordinate space (it is clipped for you).
+    pub fn scroll_area<R>(
+        &mut self,
+        id: u32,
+        r: Rect,
+        content_h: f32,
+        draw_bg: bool,
+        f: impl FnOnce(&mut Self, Rect, f32) -> R,
+    ) -> R {
+        let t = self.theme;
+        if draw_bg {
+            self.scene
+                .rounded_rect(r.x, r.y, r.w, r.h, t.radius2(), t.base, t.border2, 1.0);
+        }
+
+        let inner_x = r.x + 1.0;
+        let inner_y = r.y + 1.0;
+        let inner_h = (r.h - 2.0).max(1.0);
+        let max_scroll = (content_h - inner_h).max(0.0);
+        let has_sb = max_scroll > 0.5;
+        let sb_w = (t.rem * 0.5).round().max(6.0);
+        let sb_pad = 3.0;
+        let viewport_w = if has_sb {
+            (r.w - 2.0 - sb_w - sb_pad * 2.0).max(10.0)
+        } else {
+            (r.w - 2.0).max(10.0)
+        };
+
+        let mut scroll_y = self.state.scroll_offset(id);
+
+        // Mouse-wheel scrolling (consume the wheel so it does not double-apply).
+        if self.state.can_hover(id, r) && self.state.wheel_y.abs() > 0.01 {
+            scroll_y = (scroll_y - self.state.wheel_y * (t.rem * 2.6)).clamp(0.0, max_scroll);
+            self.state.wheel_y = 0.0;
+        }
+
+        let sb_id = id.wrapping_add(0x4000_0000);
+        let track_rect = Rect::new(
+            r.x + r.w - 1.0 - sb_w - sb_pad,
+            inner_y + sb_pad,
+            sb_w,
+            (inner_h - sb_pad * 2.0).max(10.0),
+        );
+        let thumb_h = if has_sb {
+            ((inner_h / content_h.max(1.0)) * track_rect.h)
+                .round()
+                .clamp((t.rem * 1.4).round(), track_rect.h)
+        } else {
+            track_rect.h
+        };
+        let thumb_travel = (track_rect.h - thumb_h).max(1.0);
+
+        if has_sb {
+            let thumb_y = (track_rect.y + (scroll_y / max_scroll) * thumb_travel).round();
+            let thumb_rect = Rect::new(track_rect.x, thumb_y, sb_w, thumb_h);
+
+            let over_thumb = self.state.can_hover(sb_id, thumb_rect);
+            let over_track = self.state.can_hover(sb_id, track_rect);
+
+            if over_thumb && self.state.mouse_pressed {
+                self.state.active_id = Some(sb_id);
+                self.state.scroll_drag_grab = self.state.cursor.1 - thumb_rect.y;
+            }
+
+            if self.state.active_id == Some(sb_id) {
+                if self.state.mouse_down {
+                    let target = self.state.cursor.1 - self.state.scroll_drag_grab - track_rect.y;
+                    scroll_y = ((target / thumb_travel) * max_scroll).clamp(0.0, max_scroll);
+                }
+            } else if over_track && self.state.mouse_pressed {
+                // Click-to-jump: center the thumb under the cursor.
+                let target = self.state.cursor.1 - track_rect.y - thumb_h * 0.5;
+                scroll_y = ((target / thumb_travel) * max_scroll).clamp(0.0, max_scroll);
+            }
+        }
+
+        self.state.set_scroll_offset(id, scroll_y);
+
+        // Content (clipped to the viewport, excluding the scrollbar gutter).
+        self.scene.push_clip(inner_x, inner_y, viewport_w, inner_h);
+        let out = f(
+            self,
+            Rect::new(inner_x, inner_y, viewport_w, inner_h),
+            scroll_y,
+        );
+        self.scene.pop_clip();
+
+        // Scrollbar drawn on top of the content, outside the clip.
+        if has_sb {
+            let thumb_y = (track_rect.y + (scroll_y / max_scroll) * thumb_travel).round();
+            let thumb_rect = Rect::new(track_rect.x, thumb_y, sb_w, thumb_h);
+            let dragging = self.state.active_id == Some(sb_id);
+            let hovered = dragging || self.state.can_hover(sb_id, thumb_rect);
+
+            self.scene.rounded_rect(
+                track_rect.x,
+                track_rect.y,
+                track_rect.w,
+                track_rect.h,
+                sb_w * 0.5,
+                t.shade1,
+                (0, 0, 0, 0),
+                0.0,
+            );
+            let col = if dragging {
+                t.highlight
+            } else if hovered {
+                t.shade5
+            } else {
+                t.shade4
+            };
+            self.scene.rounded_rect(
+                thumb_rect.x,
+                thumb_rect.y,
+                thumb_rect.w,
+                thumb_rect.h,
+                sb_w * 0.5,
+                col,
+                (0, 0, 0, 0),
+                0.0,
+            );
+        }
+
+        out
+    }
+
+    /// A virtualized vertical list: only the rows intersecting the viewport are emitted.
+    /// Suitable for a 10,000-track playlist at negligible draw cost.
+    pub fn virtual_list(
+        &mut self,
+        id: u32,
+        r: Rect,
+        row_count: usize,
+        row_h: f32,
+        mut row_fn: impl FnMut(&mut Self, usize, Rect),
+    ) {
+        let content_h = row_count as f32 * row_h;
+        self.scroll_area(id, r, content_h, true, |ui, vp, scroll_y| {
+            let first = (scroll_y / row_h).floor().max(0.0) as usize;
+            let last = (((scroll_y + vp.h) / row_h).ceil() as usize + 1).min(row_count);
+            for idx in first..last {
+                let ry = (vp.y + idx as f32 * row_h - scroll_y).round();
+                row_fn(ui, idx, Rect::new(vp.x, ry, vp.w, row_h));
+            }
+        });
+    }
+
+    /// One interactive row for [`Ui::virtual_list`]. Returns `true` on click.
+    pub fn list_row(
+        &mut self,
+        id: u32,
+        r: Rect,
+        selected: bool,
+        index_str: &str,
+        title: &str,
+        right_meta: &str,
+    ) -> bool {
+        let t = self.theme;
+        let hovered = self.state.can_hover(id, r);
+        if hovered {
+            self.state.hovered_id = Some(id);
+            if self.state.mouse_pressed {
+                self.state.active_id = Some(id);
+            }
+        }
+        let active = self.state.active_id == Some(id);
+        let clicked = hovered && self.state.mouse_released && active;
+
+        if selected {
+            self.scene.rect(r.x, r.y, r.w, r.h, t.shade3);
+            self.scene.rect(r.x, r.y, 3.0, r.h, t.highlight);
+        } else if hovered {
+            self.scene.rect(r.x, r.y, r.w, r.h, t.shade2);
+        }
+        // Bottom hairline divider.
+        self.scene
+            .rect(r.x, r.y + r.h - 1.0, r.w, 1.0, t.border1);
+
+        let fs = t.font_small();
+        let baseline = (r.y + r.h * 0.5 + fs * 0.355).round();
+
+        self.scene.text(
+            self.text_sys,
+            FontFace::Regular,
+            self.font_engine,
+            index_str,
+            (r.x + t.rem * 0.6).round(),
+            baseline,
+            fs,
+            t.text_muted,
+        );
+
+        let title_x = r.x + t.rem * 3.4;
+        let face = if selected {
+            FontFace::SemiBold
+        } else {
+            FontFace::Regular
+        };
+        self.scene.text(
+            self.text_sys,
+            face,
+            self.font_engine,
+            title,
+            title_x.round(),
+            baseline,
+            fs,
+            t.text,
+        );
+
+        if !right_meta.is_empty() {
+            let mw = self
+                .text_sys
+                .measure(FontFace::Regular, self.font_engine, right_meta, fs);
+            self.scene.text(
+                self.text_sys,
+                FontFace::Regular,
+                self.font_engine,
+                right_meta,
+                (r.x + r.w - mw - t.rem * 0.6).round(),
+                baseline,
+                fs,
+                t.text_dim,
+            );
+        }
+
+        clicked
     }
 }
 

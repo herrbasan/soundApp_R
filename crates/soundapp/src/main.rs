@@ -14,8 +14,8 @@ use winit::window::{Window, WindowId};
 
 use audio::{Audio, Source};
 use nui::{
-    BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Rect, Renderer, Scene,
-    TextSystem, Theme, Ui, UiState, ICON_CLOSE, ICON_DARK_MODE, ICON_EQ, ICON_LIGHT_MODE,
+    BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Length, Rect, Renderer,
+    Scene, TextSystem, Theme, Ui, UiState, ICON_CLOSE, ICON_DARK_MODE, ICON_EQ, ICON_LIGHT_MODE,
     ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV, ICON_SEARCH, ICON_SETTINGS, ICON_TUNE,
 };
 
@@ -67,6 +67,7 @@ struct App {
     radio_interp: usize,
     click_counter: u32,
     scrub_frac: f32,
+    selected_track: usize,
 }
 
 const DEVICES: &[&str] = &[
@@ -88,6 +89,80 @@ const SOUNDFONTS: &[&str] = &[
     "CrisisGeneralMidi3.01.sf2",
     "Arachno_SoundFont_v1.0.sf2",
 ];
+
+/// Synthetic library size for the virtualized playlist demos (Phase 1.2).
+const TRACK_COUNT: usize = 10_000;
+
+const TRACK_ARTISTS: &[&str] = &[
+    "Aurora Field",
+    "Kraftwerk Delta",
+    "Nova Ensemble",
+    "Blue Static",
+    "Echo Division",
+    "Sunset Array",
+    "Magnetic North",
+    "Pale Horizon",
+    "Liquid Chrome",
+    "Cascade Theory",
+    "Midnight Cartography",
+    "Signal Bloom",
+];
+
+const TRACK_TITLES: &[&str] = &[
+    "Analog Sunrise",
+    "Chrome Cassette",
+    "Midnight Modulation",
+    "Vinyl Static",
+    "Pulse Width",
+    "Tape Hiss Serenade",
+    "Neon Riverbed",
+    "Slow Waveform",
+    "Crystal Oscillator",
+    "Deep Signal",
+    "Harmonic Drift",
+    "Sidechain Sunset",
+    "Quarter Note Sky",
+    "Ferric Dreams",
+    "Patch Bay Romance",
+    "Lowpass Meadow",
+];
+
+const TRACK_ALBUMS: &[&str] = &[
+    "Analog Drift",
+    "Neon Meridian",
+    "Deep Field",
+    "Rust & Glass",
+    "Slow Orbit",
+    "Static Bloom",
+];
+
+fn track_name(idx: usize) -> String {
+    TRACK_TITLES[idx % TRACK_TITLES.len()].to_string()
+}
+
+fn track_credit(idx: usize) -> String {
+    let artist = TRACK_ARTISTS[idx % TRACK_ARTISTS.len()];
+    let album = TRACK_ALBUMS[(idx / 7) % TRACK_ALBUMS.len()];
+    format!("{artist} — {album}")
+}
+
+fn track_meta(idx: usize) -> String {
+    let mm = 2 + (idx * 7) % 8;
+    let ss = (idx * 13) % 60;
+    let lufs = 10.0 + ((idx * 17) % 80) as f32 / 10.0;
+    format!("48 kHz · 24-bit · -{lufs:.1} LUFS · {mm:02}:{ss:02}")
+}
+
+/// Caption lines for the Typography A/B cards, keyed by the CSS px size being shown.
+fn typo_sample(css_px: f32) -> &'static str {
+    if css_px <= 12.0 {
+        "To AV We Yo · -14.2 LUFS · 48,000 Hz · Pack my box with five dozen liquor jugs"
+    } else if css_px <= 15.0 {
+        "Waveform & Spectrum Analyzer · 00:42 / 03:18 · Crisp Stems & Even Kerning"
+    } else {
+        "Hamburgefonstiv · QWERTY UIOP · Excellent Kerning & Hinting · 01:23 / 04:56"
+    }
+}
 
 impl App {
     fn new(
@@ -113,7 +188,7 @@ impl App {
             text_sys: TextSystem::new(),
             ui_state: UiState::new(),
             modifiers: ModifiersState::empty(),
-            size: (1260, 720),
+            size: (1120, 700),
             audio,
             audio_reported: false,
             t: 0.0,
@@ -144,6 +219,7 @@ impl App {
             radio_interp: 1,
             click_counter: 0,
             scrub_frac: 0.35,
+            selected_track: 2,
         }
     }
 
@@ -155,8 +231,8 @@ impl App {
         self.ui_zoom = clamped;
         if let Some(w) = &self.window {
             let _ = w.request_inner_size(winit::dpi::LogicalSize::new(
-                860.0 * self.ui_zoom as f64,
-                490.0 * self.ui_zoom as f64,
+                1120.0 * self.ui_zoom as f64,
+                700.0 * self.ui_zoom as f64,
             ));
             self.size = (w.inner_size().width, w.inner_size().height);
             w.request_redraw();
@@ -165,7 +241,8 @@ impl App {
 
     fn build_scene(&mut self, w: u32, h: u32, scale: f32) {
         let _ = self.text_sys.prepare_frame();
-        let rem = (14.5 * scale).round();
+        // `--nui-rem-base: 16px` (nui-theme.css)
+        let rem = (16.0 * scale).round();
         let theme = if self.dark_mode {
             Theme::dark(rem)
         } else {
@@ -201,18 +278,18 @@ impl App {
         let mut close_req = false;
 
         {
-            let mut ui = Ui {
-                state: &mut self.ui_state,
-                scene: &mut self.scene,
-                text_sys: &mut self.text_sys,
-                font_engine: self.font_engine,
+            let mut ui = Ui::new(
+                &mut self.ui_state,
+                &mut self.scene,
+                &mut self.text_sys,
+                self.font_engine,
                 theme,
-            };
+            );
 
             // ================================================================
-            // 1. NUI App Header (`nui-app-header`)
+            // 1. NUI App Header (`nui-app-header`, 3.25rem)
             // ================================================================
-            let hdr_h = (rem * 2.55).round();
+            let hdr_h = theme.header_height();
             ui.scene.rect(0.0, 0.0, pw, hdr_h, theme.shade2);
             ui.scene
                 .rect(0.0, hdr_h - 1.0, pw, 1.0, theme.border2);
@@ -335,617 +412,586 @@ impl App {
 
             // ================================================================
             // 2. Main Layout Grid (Left Player/Analyzer Card + Right NUI Tabs Card)
+            //    nui_wc2 proportions: 1.25rem window padding + inter-card gap.
             // ================================================================
-            let m = (rem * 0.85).round();
-            let pad = (rem * 0.95).round();
-            let bot_h = (rem * 4.35).round();
+            let m = Length::Rem(1.25).resolve(rem).round();
+            let bot_h = Length::Rem(4.8).resolve(rem).round();
             let top_y = hdr_h + m;
             let main_h = (ph - top_y - bot_h - m * 2.0).max(120.0);
-            let left_w = (rem * 16.5).round();
+            let left_w = Length::Rem(20.0).resolve(rem).round();
 
-            // Left Card (`shade2` surface with `border2` border)
-            ui.scene.rounded_rect(
-                m,
-                top_y,
-                left_w,
-                main_h,
-                theme.radius2(),
-                theme.shade2,
-                theme.border2,
-                1.0,
-            );
-
-            let lx = m + pad;
-            let lw = left_w - pad * 2.0;
-            let mut ly = top_y + pad + theme.font_base() * 0.8;
-            ui.scene.text(
-                ui.text_sys,
-                FontFace::SemiBold,
-                ui.font_engine,
-                "Realtime Audio & VU",
-                lx,
-                ly,
-                theme.font_base(),
-                theme.text,
-            );
-            ly += rem * 1.35;
-
-            for (k, v) in [
-                ("Pipeline:", if self.seg_pipeline == 0 { "Normal (Tape)" } else { "RubberBand" }),
-                ("Pitch / Speed:", &format!("{:+.1} st · {:.2}x", self.pitch_semitones, self.tempo_ratio)),
-                ("Scale / DPI:", &format!("{:.0}% ({:.2}x)", self.ui_zoom * 100.0, scale)),
-            ] {
-                ui.scene.text(
-                    ui.text_sys,
-                    FontFace::Regular,
-                    ui.font_engine,
-                    k,
-                    lx,
-                    ly,
-                    theme.font_small(),
-                    theme.text_dim,
-                );
-                ui.scene.text(
-                    ui.text_sys,
-                    FontFace::SemiBold,
-                    ui.font_engine,
-                    v,
-                    lx + rem * 6.4,
-                    ly,
-                    theme.font_small(),
-                    theme.text,
-                );
-                ly += rem * 1.28;
-            }
-
-            // Master Volume `nui-slider`
-            ly += rem * 0.25;
-            let vol_str = format!("{:.0}%", self.master_vol * 100.0);
-            ui.slider(
-                101,
-                Rect::new(lx, ly, lw, rem * 2.5),
-                "Master Gain",
-                &mut self.master_vol,
-                0.0,
-                1.0,
-                0.78,
-                &vol_str,
-            );
-            ly += rem * 2.85;
-
-            // Live 16-band spectrum analyzer canvas (`base` surface)
-            let spec_h = (top_y + main_h - pad - ly).max(rem * 3.0);
-            ui.scene.rounded_rect(
-                lx,
-                ly,
-                lw,
-                spec_h,
-                theme.radius2(),
-                theme.base,
-                theme.border2,
-                1.0,
-            );
-            let bands = 18usize;
-            let gap = (rem * 0.2).round().max(2.0);
-            let bar_w = (lw - gap * (bands as f32 + 1.0)) / bands as f32;
-            for i in 0..bands {
-                let phase = self.t * 5.8 + i as f32 * 0.42;
-                let amp = if playing {
-                    ((phase.sin() * 0.35 + (phase * 1.7).cos() * 0.25 + 0.45) * self.master_vol)
-                        .clamp(0.06, 0.94)
+            // Left Card — standard `nui-card` (elevation shadow, 1.25rem pad, 1rem gap):
+            // heading, status rows, master slider, then the spectrum filling the rest.
+            let left_rect = Rect::new(m, top_y, left_w, main_h);
+            ui.nui_card(left_rect, |ui| {
+                ui.heading("Realtime Audio & VU");
+                let pipeline = if self.seg_pipeline == 0 {
+                    "Normal (Tape)"
                 } else {
-                    (0.14 + 0.08 * (i as f32 * 0.5).sin()) * self.master_vol
+                    "RubberBand"
                 };
-                let bh = (spec_h - rem * 0.7) * amp;
-                let bx = lx + gap + i as f32 * (bar_w + gap);
-                let by = ly + spec_h - rem * 0.35 - bh;
-                ui.scene.rounded_rect(
-                    bx,
-                    by,
-                    bar_w,
-                    bh,
-                    2.0,
-                    theme.highlight,
-                    (0, 0, 0, 0),
+                ui.kv_row("Pipeline:", pipeline, Length::rem(6.4));
+                let pitch_speed =
+                    format!("{:+.1} st · {:.2}x", self.pitch_semitones, self.tempo_ratio);
+                ui.kv_row("Pitch / Speed:", &pitch_speed, Length::rem(6.4));
+                let scale_dpi = format!("{:.0}% ({:.2}x)", self.ui_zoom * 100.0, scale);
+                ui.kv_row("Scale / DPI:", &scale_dpi, Length::rem(6.4));
+
+                let vol_str = format!("{:.0}%", self.master_vol * 100.0);
+                let slider_r = ui.take(Length::rem(2.85));
+                ui.slider(
+                    101,
+                    slider_r,
+                    "Master Gain",
+                    &mut self.master_vol,
                     0.0,
+                    1.0,
+                    0.78,
+                    &vol_str,
                 );
-            }
+
+                // Remaining height: one spacious 18-band realtime spectrum analyzer
+                // (the 10k-track virtual list lives on its own 4th tab).
+                let spec_r = ui.take_rest();
+                ui.scene.rounded_rect(
+                    spec_r.x,
+                    spec_r.y,
+                    spec_r.w,
+                    spec_r.h,
+                    theme.radius2(),
+                    theme.base,
+                    theme.border2,
+                    1.0,
+                );
+                let bands = 18usize;
+                let inset = (rem * 0.4).round();
+                let g = (rem * 0.3).round().max(2.0);
+                let bar_w = ((spec_r.w - inset * 2.0 - g * (bands as f32 - 1.0)) / bands as f32)
+                    .floor()
+                    .max(2.0);
+                for i in 0..bands {
+                    let phase = self.t * 5.8 + i as f32 * 0.42;
+                    let amp = if playing {
+                        ((phase.sin() * 0.35 + (phase * 1.7).cos() * 0.25 + 0.45)
+                            * self.master_vol)
+                            .clamp(0.06, 0.94)
+                    } else {
+                        (0.14 + 0.08 * (i as f32 * 0.5).sin()) * self.master_vol
+                    };
+                    let bh = ((spec_r.h - rem * 1.0) * amp).max(2.0);
+                    let bx = spec_r.x + inset + i as f32 * (bar_w + g);
+                    let by = spec_r.y + spec_r.h - rem * 0.5 - bh;
+                    ui.scene
+                        .rounded_rect(bx, by, bar_w, bh, 2.0, theme.highlight, (0, 0, 0, 0), 0.0);
+                }
+            });
 
             // ================================================================
             // 3. Right Panel: NUI Component Gallery & SoundApp Parameters (`nui-tabs`)
+            //    Declarative: nui-card -> tabs row -> per-tab layout body.
             // ================================================================
             let right_x = m + left_w + m;
             let right_w = (pw - right_x - m).max(200.0);
-            ui.scene.rounded_rect(
-                right_x,
-                top_y,
-                right_w,
-                main_h,
-                theme.radius2(),
-                theme.shade2,
-                theme.border2,
-                1.0,
-            );
+            let right_rect = Rect::new(right_x, top_y, right_w, main_h);
 
-            let rx = right_x + pad;
-            let rw = right_w - pad * 2.0;
-            let tabs_h = (rem * 2.25).round();
-            ui.tabs(
-                200,
-                Rect::new(rx, top_y + rem * 0.3, rw, tabs_h),
-                &[
-                    (ICON_TUNE, "NUI Components"),
-                    (ICON_SETTINGS, "Audio Parameters"),
-                    (ICON_SEARCH, "Typography A/B"),
-                ],
-                &mut self.active_tab,
-            );
+            ui.nui_card(right_rect, |ui| {
+                let tabs_r = ui.take(Length::rem(2.6));
+                ui.tabs(
+                    200,
+                    tabs_r,
+                    &[
+                        (ICON_TUNE, "NUI Components"),
+                        (ICON_SETTINGS, "Audio Parameters"),
+                        (ICON_SEARCH, "Typography A/B"),
+                        (ICON_EQ, "Virtual List (10k)"),
+                    ],
+                    &mut self.active_tab,
+                );
+                ui.spacer(Length::rem(0.5));
 
-            let content_y = top_y + rem * 0.3 + tabs_h + rem * 0.85;
-            let col_gap = rem * 1.1;
-            let col_w = ((rw - col_gap) * 0.5).floor();
-            let col1_x = rx;
-            let col2_x = rx + col_w + col_gap;
-            let row_h = (rem * 2.15).round();
+                let body = ui.take_rest();
 
-            match self.active_tab {
+                match self.active_tab {
                 0 => {
-                    // ---- TAB 0: NUI Components (`nui-input`, `nui-select`, `nui-button`, `segmented`, `checkbox`, `switch`, `radio`) ----
-                    let mut y1 = content_y;
+                    // ---- TAB 0: NUI Components — spacious 2-column `nui-layout` grid ----
+                    let [col1, col2] =
+                        ui.cols(body, Length::rem(1.5), [Length::fill(), Length::fill()]);
+                    let mut sel1_r = Rect::new(0.0, 0.0, 0.0, 0.0);
 
-                    // 1. nui-input-group + nui-input (Editable text input with selection & clear button)
-                    ui.input_label(col1_x, y1, "nui-input (click to edit, drag to select)");
-                    y1 += rem * 1.15;
-                    ui.text_input(
-                        301,
-                        Rect::new(col1_x, y1, col_w, row_h),
-                        "Type filter or track title...",
-                        &mut self.search_text,
-                    );
-                    y1 += row_h + rem * 0.85;
+                    ui.with_column(col1, Length::rem(1.0), |ui| {
+                        // 1. nui-input-group + nui-input (standard 2.5rem control)
+                        let inp = ui.input_group("nui-input (click to edit, drag to select)");
+                        ui.text_input(
+                            301,
+                            inp,
+                            "Type filter or track title...",
+                            &mut self.search_text,
+                        );
 
-                    // 2. Segmented Button Container (`nui-button-container[variant="segmented"]`)
-                    ui.input_label(col1_x, y1, "nui-button-container [variant=segmented]");
-                    y1 += rem * 1.15;
-                    ui.segmented(
-                        310,
-                        Rect::new(col1_x, y1, col_w, row_h),
-                        &["Tape Speed", "Pitch / Time", "MIDI Synth"],
-                        &mut self.seg_pipeline,
-                    );
-                    y1 += row_h + rem * 0.85;
+                        // 2. Segmented button container
+                        let seg = ui.input_group("nui-button-container [variant=segmented]");
+                        ui.segmented(
+                            310,
+                            seg,
+                            &["Tape Speed", "Pitch / Time", "MIDI Synth"],
+                            &mut self.seg_pipeline,
+                        );
 
-                    // 3. Button Variants (`Primary`, `Outline`, `Ghost`, `Success`, `Danger`)
-                    ui.input_label(
-                        col1_x,
-                        y1,
-                        &format!("nui-button variants (clicked: {})", self.click_counter),
-                    );
-                    y1 += rem * 1.15;
-                    let b_gap = (rem * 0.4).round();
-                    let bw4 = ((col_w - b_gap * 3.0) / 4.0).floor();
-                    if ui.button(
-                        320,
-                        Rect::new(col1_x, y1, bw4, row_h),
-                        "Primary",
-                        "",
-                        ButtonVariant::Primary,
-                    ) {
-                        self.click_counter += 1;
-                    }
-                    if ui.button(
-                        321,
-                        Rect::new(col1_x + (bw4 + b_gap), y1, bw4, row_h),
-                        "Outline",
-                        "",
-                        ButtonVariant::Outline,
-                    ) {
-                        self.click_counter += 1;
-                    }
-                    if ui.button(
-                        322,
-                        Rect::new(col1_x + (bw4 + b_gap) * 2.0, y1, bw4, row_h),
-                        "Success",
-                        "",
-                        ButtonVariant::Success,
-                    ) {
-                        self.click_counter += 1;
-                    }
-                    if ui.button(
-                        323,
-                        Rect::new(col1_x + (bw4 + b_gap) * 3.0, y1, bw4, row_h),
-                        "Danger",
-                        "",
-                        ButtonVariant::Danger,
-                    ) {
-                        self.click_counter += 1;
-                    }
-                    y1 += row_h + rem * 0.75;
-
-                    // 4. Checkboxes & Switches (`nui-checkbox` & `variant="switch"`)
-                    let half_c = (col_w * 0.5).floor();
-                    ui.checkbox(
-                        330,
-                        Rect::new(col1_x, y1, half_c, rem * 1.7),
-                        "Preserve Formants",
-                        &mut self.chk_formant,
-                    );
-                    ui.switch(
-                        331,
-                        Rect::new(col1_x + half_c, y1, half_c, rem * 1.7),
-                        "HQ Oversampling",
-                        &mut self.sw_hq_mode,
-                    );
-
-                    // ---- Right Column of Tab 0: `nui-select`, `nui-slider`, `nui-radio` ----
-                    let mut y2 = content_y;
-
-                    // Notice: we draw lower widgets or trigger `nui-select` (which pushes its popup to Scene's overlay layer!)
-                    ui.input_label(col2_x, y2, "nui-select (audio output device)");
-                    y2 += rem * 1.15;
-                    let sel1_y = y2;
-                    y2 += row_h + rem * 0.85;
-
-                    // Bipolar Pitch Slider (`nui-slider`, double-click to reset to 0.0 st)
-                    let pitch_lbl = format!("{:+.1} st", self.pitch_semitones);
-                    ui.slider(
-                        340,
-                        Rect::new(col2_x, y2, col_w, rem * 2.55),
-                        "Pitch Shift (dbl-click reset)",
-                        &mut self.pitch_semitones,
-                        -12.0,
-                        12.0,
-                        0.0,
-                        &pitch_lbl,
-                    );
-                    y2 += rem * 2.85;
-
-                    // Tempo Slider (`nui-slider`, double-click to reset to 1.00x)
-                    let tempo_lbl = format!("{:.2}x", self.tempo_ratio);
-                    ui.slider(
-                        341,
-                        Rect::new(col2_x, y2, col_w, rem * 2.55),
-                        "Tempo / Speed (wheel fine-tune)",
-                        &mut self.tempo_ratio,
-                        0.5,
-                        2.0,
-                        1.0,
-                        &tempo_lbl,
-                    );
-                    y2 += rem * 2.85;
-
-                    // Radio buttons (`nui-radio`)
-                    let r_w = (col_w / 3.0).floor();
-                    for (ri, rlabel) in ["Linear", "Cubic", "Sinc 8-tap"].iter().enumerate() {
-                        if ui.radio(
-                            350 + ri as u32,
-                            Rect::new(col2_x + ri as f32 * r_w, y2, r_w, rem * 1.7),
-                            rlabel,
-                            self.radio_interp == ri,
-                        ) {
-                            self.radio_interp = ri;
+                        // 3. Button variants (0.5rem gaps)
+                        let blabel =
+                            format!("nui-button variants (clicked: {})", self.click_counter);
+                        let btns = ui.form_field(&blabel, Length::rem(2.25));
+                        let b_gap = theme.space_half();
+                        let bw4 = ((btns.w - b_gap * 3.0) / 4.0).floor();
+                        let variants = [
+                            (320u32, "Primary", ButtonVariant::Primary),
+                            (321u32, "Outline", ButtonVariant::Outline),
+                            (322u32, "Success", ButtonVariant::Success),
+                            (323u32, "Danger", ButtonVariant::Danger),
+                        ];
+                        for (i, (bid, lab, var)) in variants.into_iter().enumerate() {
+                            let br =
+                                Rect::new(btns.x + (bw4 + b_gap) * i as f32, btns.y, bw4, btns.h);
+                            if ui.button(bid, br, lab, "", var) {
+                                self.click_counter += 1;
+                            }
                         }
-                    }
 
-                    // Render `nui-select` (its open popup goes to the top overlay layer!)
-                    ui.select(
-                        360,
-                        Rect::new(col2_x, sel1_y, col_w, row_h),
-                        DEVICES,
-                        &mut self.selected_device,
-                    );
+                        // 4. Checkbox + switch on a shared 2rem form row
+                        ui.spacer(Length::rem(0.25));
+                        let [chk_r, sw_r] = ui.take_cols(
+                            Length::rem(2.0),
+                            Length::rem(1.0),
+                            [Length::fill(), Length::fill()],
+                        );
+                        ui.checkbox(330, chk_r, "Preserve Formants", &mut self.chk_formant);
+                        ui.switch(331, sw_r, "HQ Oversampling", &mut self.sw_hq_mode);
+                    });
+
+                    // ---- Right column: `nui-select`, `nui-slider`, `nui-radio` ----
+                    ui.with_column(col2, Length::rem(1.0), |ui| {
+                        sel1_r = ui.input_group("nui-select (audio output device)");
+
+                        let pitch_lbl = format!("{:+.1} st", self.pitch_semitones);
+                        let pr = ui.take(Length::rem(2.9));
+                        ui.slider(
+                            340,
+                            pr,
+                            "Pitch Shift (dbl-click reset)",
+                            &mut self.pitch_semitones,
+                            -12.0,
+                            12.0,
+                            0.0,
+                            &pitch_lbl,
+                        );
+
+                        let tempo_lbl = format!("{:.2}x", self.tempo_ratio);
+                        let tr = ui.take(Length::rem(2.9));
+                        ui.slider(
+                            341,
+                            tr,
+                            "Tempo / Speed (wheel fine-tune)",
+                            &mut self.tempo_ratio,
+                            0.5,
+                            2.0,
+                            1.0,
+                            &tempo_lbl,
+                        );
+
+                        let rr =
+                            ui.form_field("Interpolation Filter (nui-radio)", Length::rem(2.0));
+                        let r_w = (rr.w / 3.0).floor();
+                        for (ri, rlabel) in ["Linear", "Cubic", "Sinc 8-tap"].iter().enumerate() {
+                            if ui.radio(
+                                350 + ri as u32,
+                                Rect::new(rr.x + ri as f32 * r_w, rr.y, r_w, rr.h),
+                                rlabel,
+                                self.radio_interp == ri,
+                            ) {
+                                self.radio_interp = ri;
+                            }
+                        }
+                    });
+
+                    // Drawn after both columns so the open popup layers above every sibling.
+                    ui.select(360, sel1_r, DEVICES, &mut self.selected_device);
                 }
                 1 => {
-                    // ---- TAB 1: SoundApp Parameters & Engine Configuration ----
-                    let mut y1 = content_y;
-                    ui.input_label(col1_x, y1, "Preset Name (nui-input)");
-                    y1 += rem * 1.15;
-                    ui.text_input(
-                        401,
-                        Rect::new(col1_x, y1, col_w, row_h),
-                        "Enter preset name...",
-                        &mut self.preset_name,
+                    // ---- TAB 1: SoundApp Parameters — responsive `nui-layout` grid ----
+                    let grid = ui.layout_grid(body, 2, Length::rem(1.5));
+
+                    ui.with_column(grid[0], Length::rem(1.0), |ui| {
+                        let pn = ui.input_group("Preset Name (nui-input)");
+                        ui.text_input(401, pn, "Enter preset name...", &mut self.preset_name);
+
+                        let sf = ui.input_group("MIDI SoundFont (.sf2)");
+                        ui.select(430, sf, SOUNDFONTS, &mut self.selected_soundfont);
+
+                        let sr = ui.input_group("Target Sample Rate");
+                        ui.select(431, sr, SAMPLE_RATES, &mut self.selected_rate);
+                    });
+
+                    ui.with_column(grid[1], Length::rem(1.0), |ui| {
+                        let sep_str = format!("{:.0}%", self.stereo_sep);
+                        let s1 = ui.take(Length::rem(2.9));
+                        ui.slider(
+                            410,
+                            s1,
+                            "Tracker Stereo Separation",
+                            &mut self.stereo_sep,
+                            0.0,
+                            200.0,
+                            100.0,
+                            &sep_str,
+                        );
+
+                        let c1 = ui.take(Length::rem(2.0));
+                        ui.checkbox(
+                            411,
+                            c1,
+                            "Lock Parameters Across Track Changes",
+                            &mut self.chk_locked,
+                        );
+
+                        let s2 = ui.take(Length::rem(2.0));
+                        ui.switch(
+                            412,
+                            s2,
+                            "Keep Running in System Tray (0% CPU Idle)",
+                            &mut self.sw_keep_tray,
+                        );
+
+                        let [reset_r, save_r] =
+                            ui.take_form_row(false, [Length::fill(), Length::fill()]);
+                        if ui.button(420, reset_r, "Reset Defaults", "", ButtonVariant::Outline)
+                        {
+                            self.pitch_semitones = 0.0;
+                            self.tempo_ratio = 1.0;
+                            self.stereo_sep = 100.0;
+                            self.master_vol = 0.78;
+                        }
+                        let _ = ui.button(421, save_r, "Save Preset", "", ButtonVariant::Primary);
+                    });
+                }
+                2 => {
+                    // ---- TAB 2: Side-by-Side Typography A/B at 12/15/18 px ----
+                    let [abox, bbox] =
+                        ui.rows(body, Length::rem(0.65), [Length::fill(), Length::fill()]);
+
+                    ui.inset_card(
+                        abox,
+                        Length::rem(1.25),
+                        Length::rem(0.65),
+                        theme.highlight_dim,
+                        |ui| {
+                            let b = ui.bounds();
+                            let tx = b.x.round();
+                            let fs_head = theme.font_xsmall();
+                            let mut sy = b.y + fs_head * 1.3;
+                            ui.scene.text(
+                                ui.text_sys,
+                                FontFace::SemiBold,
+                                FontEngine::Swash,
+                                "A. SWASH — OpenType Kerning + Hinting + 4x Subpixel + Linear-Light Gamma",
+                                tx,
+                                sy.round(),
+                                fs_head,
+                                theme.highlight,
+                            );
+                            for (lbl, css_px) in [("12px", 12.0f32), ("15px", 15.0), ("18px", 18.0)]
+                            {
+                                sy += rem * 1.5;
+                                ui.scene.text(
+                                    ui.text_sys,
+                                    FontFace::Regular,
+                                    FontEngine::Swash,
+                                    &format!("{lbl}: {}", typo_sample(css_px)),
+                                    tx,
+                                    sy.round(),
+                                    rem * (css_px / 16.0),
+                                    theme.text,
+                                );
+                            }
+                        },
                     );
-                    y1 += row_h + rem * 0.85;
 
-                    ui.input_label(col1_x, y1, "MIDI SoundFont (.sf2)");
-                    y1 += rem * 1.15;
-                    let sf_y = y1;
-                    y1 += row_h + rem * 0.85;
-
-                    ui.input_label(col1_x, y1, "Target Sample Rate");
-                    y1 += rem * 1.15;
-                    let sr_y = y1;
-
-                    let mut y2 = content_y;
-                    let sep_str = format!("{:.0}%", self.stereo_sep);
-                    ui.slider(
-                        410,
-                        Rect::new(col2_x, y2, col_w, rem * 2.6),
-                        "Tracker Stereo Separation",
-                        &mut self.stereo_sep,
-                        0.0,
-                        200.0,
-                        100.0,
-                        &sep_str,
-                    );
-                    y2 += rem * 3.1;
-
-                    ui.checkbox(
-                        411,
-                        Rect::new(col2_x, y2, col_w, rem * 1.8),
-                        "Lock Parameters Across Track Changes",
-                        &mut self.chk_locked,
-                    );
-                    y2 += rem * 2.1;
-
-                    ui.switch(
-                        412,
-                        Rect::new(col2_x, y2, col_w, rem * 1.8),
-                        "Keep Running in System Tray (0% CPU Idle)",
-                        &mut self.sw_keep_tray,
-                    );
-                    y2 += rem * 2.3;
-
-                    let bw2 = (col_w - rem * 0.5) * 0.5;
-                    if ui.button(
-                        420,
-                        Rect::new(col2_x, y2, bw2, row_h),
-                        "Reset Defaults",
-                        "",
-                        ButtonVariant::Outline,
-                    ) {
-                        self.pitch_semitones = 0.0;
-                        self.tempo_ratio = 1.0;
-                        self.stereo_sep = 100.0;
-                        self.master_vol = 0.78;
-                    }
-                    let _ = ui.button(
-                        421,
-                        Rect::new(col2_x + bw2 + rem * 0.5, y2, bw2, row_h),
-                        "Save Preset",
-                        "",
-                        ButtonVariant::Primary,
-                    );
-
-                    ui.select(
-                        430,
-                        Rect::new(col1_x, sf_y, col_w, row_h),
-                        SOUNDFONTS,
-                        &mut self.selected_soundfont,
-                    );
-                    ui.select(
-                        431,
-                        Rect::new(col1_x, sr_y, col_w, row_h),
-                        SAMPLE_RATES,
-                        &mut self.selected_rate,
+                    ui.inset_card(
+                        bbox,
+                        Length::rem(1.25),
+                        Length::rem(0.65),
+                        theme.border2,
+                        |ui| {
+                            let b = ui.bounds();
+                            let tx = b.x.round();
+                            let fs_head = theme.font_xsmall();
+                            let mut fy = b.y + fs_head * 1.3;
+                            ui.scene.text(
+                                ui.text_sys,
+                                FontFace::SemiBold,
+                                FontEngine::Fontdue,
+                                "B. FONTDUE (Legacy POC) — Unhinted + Integer-Snapped + Naive sRGB Alpha",
+                                tx,
+                                fy.round(),
+                                fs_head,
+                                theme.text_dim,
+                            );
+                            for (lbl, css_px) in [("12px", 12.0f32), ("15px", 15.0), ("18px", 18.0)]
+                            {
+                                fy += rem * 1.5;
+                                ui.scene.text(
+                                    ui.text_sys,
+                                    FontFace::Regular,
+                                    FontEngine::Fontdue,
+                                    &format!("{lbl}: {}", typo_sample(css_px)),
+                                    tx,
+                                    fy.round(),
+                                    rem * (css_px / 16.0),
+                                    theme.text,
+                                );
+                            }
+                        },
                     );
                 }
                 _ => {
-                    // ---- TAB 2: Side-by-Side Typography A/B Comparison ----
-                    let box_h = ((top_y + main_h - pad - content_y - rem * 0.6) * 0.5).max(rem * 4.0);
-                    ui.scene.rounded_rect(
-                        rx,
-                        content_y,
-                        rw,
-                        box_h,
-                        theme.radius2(),
-                        theme.base,
-                        theme.highlight_dim,
-                        1.0,
-                    );
-                    let mut sy = content_y + rem * 1.3;
-                    ui.scene.text(
-                        ui.text_sys,
-                        FontFace::SemiBold,
-                        FontEngine::Swash,
-                        "A. SWASH — OpenType Kerning + Hinting + 4x Subpixel + Linear-Light Gamma",
-                        rx + rem * 0.75,
-                        sy,
-                        theme.font_xsmall(),
-                        theme.highlight,
-                    );
-                    sy += rem * 1.45;
+                    // ---- TAB 3: header bar + full-width 10,000-track virtual list ----
+                    // `body` is an already-consumed rect: split IT (never the card cursor,
+                    // which take_rest exhausted) into header + list rows.
+                    let [hdr_r, list_r] =
+                        ui.rows(body, Length::rem(0.5), [Length::rem(2.4), Length::fill()]);
+                    let badge_h = (rem * 1.45).round();
+                    let bx = hdr_r.x;
+                    let by = hdr_r.y + (hdr_r.h - badge_h) * 0.5;
+                    let info_x = ui.badge(
+                        bx,
+                        by,
+                        &format!("{} TRACKS", TRACK_COUNT),
+                        BadgeVariant::Primary,
+                        None,
+                    ) + theme.space();
+                    let fs_info = theme.font_small();
                     ui.scene.text(
                         ui.text_sys,
                         FontFace::Regular,
-                        FontEngine::Swash,
-                        "12px: To AV We Yo · -14.2 LUFS · 48,000 Hz · Pack my box with five dozen liquor jugs",
-                        rx + rem * 0.75,
-                        sy,
-                        rem * 0.85,
-                        theme.text,
-                    );
-                    sy += rem * 1.55;
-                    ui.scene.text(
-                        ui.text_sys,
-                        FontFace::Regular,
-                        FontEngine::Swash,
-                        "15px: Waveform & Spectrum Analyzer · 00:42 / 03:18 · Crisp Stems & Even Kerning",
-                        rx + rem * 0.75,
-                        sy,
-                        rem * 1.05,
-                        theme.text,
+                        ui.font_engine,
+                        "All Genres · no filter · sorted by Artist — click a row to load",
+                        info_x.round(),
+                        (hdr_r.y + hdr_r.h * 0.5 + fs_info * 0.33).round(),
+                        fs_info,
+                        theme.text_muted,
                     );
 
-                    let fy = content_y + box_h + rem * 0.6;
-                    ui.scene.rounded_rect(
-                        rx,
-                        fy,
-                        rw,
-                        box_h,
-                        theme.radius2(),
-                        theme.base,
-                        theme.border2,
-                        1.0,
-                    );
-                    let mut fty = fy + rem * 1.3;
-                    ui.scene.text(
-                        ui.text_sys,
-                        FontFace::SemiBold,
-                        FontEngine::Fontdue,
-                        "B. FONTDUE (Legacy POC) — Unhinted + Integer-Snapped + Naive sRGB Alpha",
-                        rx + rem * 0.75,
-                        fty,
-                        theme.font_xsmall(),
-                        theme.text_dim,
-                    );
-                    fty += rem * 1.45;
-                    ui.scene.text(
-                        ui.text_sys,
-                        FontFace::Regular,
-                        FontEngine::Fontdue,
-                        "12px: To AV We Yo · -14.2 LUFS · 48,000 Hz · Pack my box with five dozen liquor jugs",
-                        rx + rem * 0.75,
-                        fty,
-                        rem * 0.85,
-                        theme.text,
-                    );
-                    fty += rem * 1.55;
-                    ui.scene.text(
-                        ui.text_sys,
-                        FontFace::Regular,
-                        FontEngine::Fontdue,
-                        "15px: Waveform & Spectrum Analyzer · 00:42 / 03:18 · Crisp Stems & Even Kerning",
-                        rx + rem * 0.75,
-                        fty,
-                        rem * 1.05,
-                        theme.text,
-                    );
+                    let row_h = (rem * 2.25).round();
+                    ui.virtual_list(600, list_r, TRACK_COUNT, row_h, |ui, idx, rr| {
+                        let row_id = 20_000u32.wrapping_add(idx as u32);
+                        let hovered = ui.state.can_hover(row_id, rr);
+                        if hovered {
+                            ui.state.hovered_id = Some(row_id);
+                            if ui.state.mouse_pressed {
+                                ui.state.active_id = Some(row_id);
+                            }
+                        }
+                        let active = ui.state.active_id == Some(row_id);
+                        if hovered && ui.state.mouse_released && active {
+                            self.selected_track = idx;
+                        }
+                        let selected = idx == self.selected_track;
+
+                        if selected {
+                            ui.scene.rect(rr.x, rr.y, rr.w, rr.h, theme.shade3);
+                            ui.scene.rect(rr.x, rr.y, 3.0, rr.h, theme.highlight);
+                        } else if hovered {
+                            ui.scene.rect(rr.x, rr.y, rr.w, rr.h, theme.shade2);
+                        }
+                        ui.scene.rect(rr.x, rr.y + rr.h - 1.0, rr.w, 1.0, theme.border1);
+
+                        // Generous fixed columns: #index | title | artist — album | tech meta.
+                        let fs = theme.font_small();
+                        let fs2 = theme.font_xsmall();
+                        let baseline = (rr.y + rr.h * 0.5 + fs * 0.355).round();
+                        let face = if selected {
+                            FontFace::SemiBold
+                        } else {
+                            FontFace::Regular
+                        };
+
+                        let index_str = format!("#{:05}", idx + 1);
+                        ui.scene.text(
+                            ui.text_sys,
+                            FontFace::Regular,
+                            ui.font_engine,
+                            &index_str,
+                            (rr.x + rem * 0.75).round(),
+                            baseline,
+                            fs,
+                            theme.text_muted,
+                        );
+                        ui.scene.text(
+                            ui.text_sys,
+                            face,
+                            ui.font_engine,
+                            &track_name(idx),
+                            (rr.x + rem * 5.0).round(),
+                            baseline,
+                            fs,
+                            if selected { theme.highlight } else { theme.text },
+                        );
+                        ui.scene.text(
+                            ui.text_sys,
+                            FontFace::Regular,
+                            ui.font_engine,
+                            &track_credit(idx),
+                            (rr.x + rr.w * 0.42).round(),
+                            baseline,
+                            fs2,
+                            theme.text_dim,
+                        );
+                        let meta = track_meta(idx);
+                        let mw = ui
+                            .text_sys
+                            .measure(FontFace::Regular, ui.font_engine, &meta, fs2);
+                        ui.scene.text(
+                            ui.text_sys,
+                            FontFace::Regular,
+                            ui.font_engine,
+                            &meta,
+                            (rr.x + rr.w - mw - rem * 0.75).round(),
+                            baseline,
+                            fs2,
+                            theme.text_muted,
+                        );
+                    });
                 }
-            }
+                }
+            });
 
             // ================================================================
-            // 4. Bottom Transport Card
+            // 4. Bottom Transport Card (4.8rem `nui-card`, 1.0rem pad):
+            //    full-width seekbar on top, transport row below.
             // ================================================================
             let bot_y = ph - bot_h - m;
-            ui.scene.rounded_rect(
-                m,
-                bot_y,
-                pw - m * 2.0,
-                bot_h,
-                theme.radius2(),
-                theme.shade2,
-                theme.border2,
-                1.0,
-            );
+            ui.card(
+                Rect::new(m, bot_y, pw - m * 2.0, bot_h),
+                Length::rem(1.0),
+                Length::rem(0.5),
+                |ui| {
+                    // Full-width scrubbable seekbar.
+                    let bar = ui.take(Length::rem(0.38));
+                    let bar_x = bar.x;
+                    let bar_y = bar.y;
+                    let bar_w = bar.w;
+                    let bar_h = bar.h;
+                    let bar_hit = Rect::new(bar_x, bar_y - rem * 0.4, bar_w, bar_h + rem * 0.8);
 
-            let bar_x = m + pad;
-            let bar_y = bot_y + rem * 0.75;
-            let bar_w = pw - (m + pad) * 2.0;
-            let bar_h = (rem * 0.38).round().max(5.0);
-            let bar_hit = Rect::new(bar_x, bar_y - rem * 0.4, bar_w, bar_h + rem * 0.8);
+                    if ui.state.can_hover(500, bar_hit) {
+                        ui.state.hovered_id = Some(500);
+                        if ui.state.mouse_pressed {
+                            ui.state.active_id = Some(500);
+                        }
+                    }
+                    if ui.state.active_id == Some(500) && ui.state.mouse_down {
+                        self.scrub_frac = ((ui.state.cursor.0 - bar_x) / bar_w).clamp(0.0, 1.0);
+                    }
 
-            if ui.state.can_hover(500, bar_hit) {
-                ui.state.hovered_id = Some(500);
-                if ui.state.mouse_pressed {
-                    ui.state.active_id = Some(500);
-                }
-            }
-            if ui.state.active_id == Some(500) && ui.state.mouse_down {
-                self.scrub_frac = ((ui.state.cursor.0 - bar_x) / bar_w).clamp(0.0, 1.0);
-            }
+                    ui.scene.rounded_rect(
+                        bar_x,
+                        bar_y,
+                        bar_w,
+                        bar_h,
+                        bar_h * 0.5,
+                        theme.base,
+                        (0, 0, 0, 0),
+                        0.0,
+                    );
 
-            ui.scene.rounded_rect(
-                bar_x,
-                bar_y,
-                bar_w,
-                bar_h,
-                bar_h * 0.5,
-                theme.base,
-                (0, 0, 0, 0),
-                0.0,
-            );
+                    let (pos, dur) = self
+                        .audio
+                        .as_ref()
+                        .map(|a| (a.position_secs(), a.duration_secs()))
+                        .unwrap_or((0.0, 0.0));
+                    let is_finite = dur > 0.0 && dur < 360_000.0;
+                    let frac = if ui.state.active_id == Some(500) {
+                        self.scrub_frac
+                    } else if is_finite {
+                        (pos / dur).clamp(0.0, 1.0) as f32
+                    } else if playing {
+                        (self.t * 0.12).fract()
+                    } else {
+                        self.scrub_frac
+                    };
 
-            let (pos, dur) = self
-                .audio
-                .as_ref()
-                .map(|a| (a.position_secs(), a.duration_secs()))
-                .unwrap_or((0.0, 0.0));
-            let is_finite = dur > 0.0 && dur < 360_000.0;
-            let frac = if ui.state.active_id == Some(500) {
-                self.scrub_frac
-            } else if is_finite {
-                (pos / dur).clamp(0.0, 1.0) as f32
-            } else if playing {
-                (self.t * 0.12).fract()
-            } else {
-                self.scrub_frac
-            };
+                    ui.scene.rounded_rect(
+                        bar_x,
+                        bar_y,
+                        (bar_w * frac).max(bar_h),
+                        bar_h,
+                        bar_h * 0.5,
+                        theme.highlight,
+                        (0, 0, 0, 0),
+                        0.0,
+                    );
 
-            ui.scene.rounded_rect(
-                bar_x,
-                bar_y,
-                (bar_w * frac).max(bar_h),
-                bar_h,
-                bar_h * 0.5,
-                theme.highlight,
-                (0, 0, 0, 0),
-                0.0,
-            );
+                    // Transport row: elapsed | Prev · Play/Pause · Next | remaining.
+                    let ctrl = ui.take_rest();
+                    let ctrl_cy = ctrl.y + ctrl.h * 0.5;
+                    let fs = theme.font_small();
+                    ui.scene.text(
+                        ui.text_sys,
+                        FontFace::SemiBold,
+                        ui.font_engine,
+                        &fmt_time(pos),
+                        ctrl.x.round(),
+                        (ctrl_cy + fs * 0.34).round(),
+                        fs,
+                        theme.text,
+                    );
 
-            let ctrl_y = bot_y + rem * 3.15;
-            ui.scene.text(
-                ui.text_sys,
-                FontFace::SemiBold,
-                ui.font_engine,
-                &fmt_time(pos),
-                bar_x,
-                ctrl_y,
-                theme.font_small(),
-                theme.text,
-            );
+                    let tbtn_w = (rem * 2.4).round();
+                    let tbtn_h = (rem * 1.85).round();
+                    let tbtn_y = (ctrl_cy - tbtn_h * 0.5).round();
+                    let cx = ctrl.x + ctrl.w * 0.5;
+                    let _ = ui.button(
+                        501,
+                        Rect::new(cx - tbtn_w * 1.6, tbtn_y, tbtn_w, tbtn_h),
+                        "",
+                        ICON_PREV,
+                        ButtonVariant::Ghost,
+                    );
+                    if ui.button(
+                        502,
+                        Rect::new(cx - tbtn_w * 0.5, tbtn_y, tbtn_w, tbtn_h),
+                        "",
+                        if playing { ICON_PAUSE } else { ICON_PLAY },
+                        ButtonVariant::Primary,
+                    ) {
+                        self.animate = !self.animate;
+                    }
+                    let _ = ui.button(
+                        503,
+                        Rect::new(cx + tbtn_w * 0.6, tbtn_y, tbtn_w, tbtn_h),
+                        "",
+                        ICON_NEXT,
+                        ButtonVariant::Ghost,
+                    );
 
-            let tbtn_w = (rem * 2.4).round();
-            let tbtn_h = (rem * 1.85).round();
-            let tbtn_y = bot_y + rem * 1.75;
-            let cx = pw * 0.5;
-            let _ = ui.button(
-                501,
-                Rect::new(cx - tbtn_w * 1.6, tbtn_y, tbtn_w, tbtn_h),
-                "",
-                ICON_PREV,
-                ButtonVariant::Ghost,
-            );
-            if ui.button(
-                502,
-                Rect::new(cx - tbtn_w * 0.5, tbtn_y, tbtn_w, tbtn_h),
-                "",
-                if playing { ICON_PAUSE } else { ICON_PLAY },
-                ButtonVariant::Primary,
-            ) {
-                self.animate = !self.animate;
-            }
-            let _ = ui.button(
-                503,
-                Rect::new(cx + tbtn_w * 0.6, tbtn_y, tbtn_w, tbtn_h),
-                "",
-                ICON_NEXT,
-                ButtonVariant::Ghost,
-            );
-
-            let remain = if is_finite {
-                fmt_time((dur - pos).max(0.0))
-            } else if playing {
-                "LIVE".to_string()
-            } else {
-                "03:42".to_string()
-            };
-            let rw_time = ui.text_sys.measure(
-                FontFace::SemiBold,
-                ui.font_engine,
-                &remain,
-                theme.font_small(),
-            );
-            ui.scene.text(
-                ui.text_sys,
-                FontFace::SemiBold,
-                ui.font_engine,
-                &remain,
-                bar_x + bar_w - rw_time,
-                ctrl_y,
-                theme.font_small(),
-                theme.text,
+                    let remain = if is_finite {
+                        fmt_time((dur - pos).max(0.0))
+                    } else if playing {
+                        "LIVE".to_string()
+                    } else {
+                        "03:42".to_string()
+                    };
+                    let rw_time = ui.text_sys.measure(FontFace::SemiBold, ui.font_engine, &remain, fs);
+                    ui.scene.text(
+                        ui.text_sys,
+                        FontFace::SemiBold,
+                        ui.font_engine,
+                        &remain,
+                        (ctrl.x + ctrl.w - rw_time).round(),
+                        (ctrl_cy + fs * 0.34).round(),
+                        fs,
+                        theme.text,
+                    );
+                },
             );
 
             // Synthetic UI complexity stress test (--ops N)
@@ -1088,8 +1134,8 @@ impl ApplicationHandler for App {
         }
         let mut attrs = Window::default_attributes()
             .with_title("SoundApp POC — NUI Rust")
-            .with_inner_size(winit::dpi::LogicalSize::new(860.0, 490.0))
-            .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 380.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(1120.0, 700.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(760.0, 480.0))
             .with_decorations(false);
 
         #[cfg(target_os = "windows")]
@@ -1160,8 +1206,8 @@ impl ApplicationHandler for App {
                                 .as_ref()
                                 .map(|w| w.scale_factor() as f32 * self.ui_zoom)
                                 .unwrap_or(1.0);
-                            let rem = (14.5 * scale).round();
-                            let hdr_h = (rem * 2.55).round();
+                            let rem = (16.0 * scale).round();
+                            let hdr_h = (rem * 3.25).round();
                             // Drag window if clicking the empty header area (left of right-side buttons)
                             let right_btns_x = self.size.0 as f32 - rem * 21.0;
                             if self.ui_state.cursor.1 < hdr_h && self.ui_state.cursor.0 < right_btns_x {
@@ -1400,7 +1446,7 @@ fn main() {
     app.nopaint = nopaint;
     app.extra_ops = extra_ops;
     app.screenshot_path = app_screenshot;
-    app.active_tab = initial_tab.min(2);
+    app.active_tab = initial_tab.min(3);
     if open_select_demo {
         app.ui_state.open_popup_id = Some(360);
     }
