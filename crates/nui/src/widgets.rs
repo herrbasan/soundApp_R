@@ -32,6 +32,107 @@ pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
     (r, g, b, a)
 }
 
+// ============================================================================
+// Zero-dependency Win32 clipboard (CF_UNICODETEXT via user32 / kernel32 FFI)
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+mod clip {
+    use std::ffi::c_void;
+
+    type Hwnd = *mut c_void;
+    type Handle = *mut c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hwnd: Hwnd) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> Handle;
+        fn SetClipboardData(format: u32, mem: Handle) -> Handle;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+        fn GlobalLock(mem: Handle) -> *mut c_void;
+        fn GlobalUnlock(mem: Handle) -> i32;
+        fn GlobalSize(mem: Handle) -> usize;
+    }
+
+    const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+
+    pub fn get_text() -> Option<String> {
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return None;
+            }
+            let handle = GetClipboardData(CF_UNICODETEXT);
+            let result = if handle.is_null() {
+                None
+            } else {
+                let ptr = GlobalLock(handle) as *const u16;
+                if ptr.is_null() {
+                    None
+                } else {
+                    let count = GlobalSize(handle) / 2;
+                    let mut len = 0usize;
+                    while len < count && *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                    GlobalUnlock(handle);
+                    Some(s)
+                }
+            };
+            CloseClipboard();
+            result
+        }
+    }
+
+    pub fn set_text(text: &str) {
+        unsafe {
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return;
+            }
+            EmptyClipboard();
+            let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2);
+            if !mem.is_null() {
+                let dst = GlobalLock(mem) as *mut u16;
+                if !dst.is_null() {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+                    GlobalUnlock(mem);
+                    // Ownership of `mem` transfers to the clipboard on success.
+                    SetClipboardData(CF_UNICODETEXT, mem);
+                }
+            }
+            CloseClipboard();
+        }
+    }
+}
+
+/// Read the system clipboard as UTF-8 text (Windows only; `None` elsewhere).
+#[cfg(target_os = "windows")]
+pub fn clipboard_get_text() -> Option<String> {
+    clip::get_text()
+}
+
+/// Replace the system clipboard with UTF-8 text (Windows only; no-op elsewhere).
+#[cfg(target_os = "windows")]
+pub fn clipboard_set_text(text: &str) {
+    clip::set_text(text)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn clipboard_get_text() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn clipboard_set_text(_text: &str) {}
+
 // MaterialIcons-Regular.ttf codepoints matching nui_wc2 sprite usage
 pub const ICON_PLAY: &str = "\u{e037}";
 pub const ICON_PAUSE: &str = "\u{e034}";
@@ -325,6 +426,12 @@ pub enum KeyCmd {
     Enter,
     Escape,
     SelectAll,
+    Copy,
+    Cut,
+    Paste,
+    Tab,
+    ShiftTab,
+    Activate,
 }
 
 pub struct UiState {
@@ -354,6 +461,14 @@ pub struct UiState {
     pub scroll_offsets: Vec<(u32, f32)>,
     pub scroll_drag_grab: f32,
 
+    // Keyboard focus ring (Phase 1.4): focusable ids in draw order (rebuilt each
+    // frame), whether the ring is visible (`:focus-visible`), and the OS file-drop
+    // state driving the `nui-dropzone` overlay.
+    pub focus_order: Vec<u32>,
+    pub focus_visible: bool,
+    pub hovered_file: Option<std::path::PathBuf>,
+    pub dropped_files: Vec<std::path::PathBuf>,
+
     last_click_time: std::time::Instant,
     last_click_pos: (f32, f32),
 }
@@ -380,12 +495,18 @@ impl UiState {
             text_scroll_x: 0.0,
             scroll_offsets: Vec::new(),
             scroll_drag_grab: 0.0,
+            focus_order: Vec::new(),
+            focus_visible: false,
+            hovered_file: None,
+            dropped_files: Vec::new(),
             last_click_time: std::time::Instant::now(),
             last_click_pos: (-1000.0, -1000.0),
         }
     }
 
     pub fn on_mouse_press(&mut self) {
+        // Mouse interaction hides the keyboard-focus ring (`:focus-visible` semantics).
+        self.focus_visible = false;
         let now = std::time::Instant::now();
         let dx = self.cursor.0 - self.last_click_pos.0;
         let dy = self.cursor.1 - self.last_click_pos.1;
@@ -406,11 +527,39 @@ impl UiState {
 
     pub fn begin_frame(&mut self) {
         self.hovered_id = None;
+        self.focus_order.clear();
         // If a popup is open and the user clicks outside both the popup and its trigger,
         // we close the popup at the end of the frame if nothing claimed it.
     }
 
     pub fn end_frame(&mut self) {
+        // Keyboard focus traversal: Tab / Shift+Tab advance the ring built this frame.
+        let mut dir: i32 = 0;
+        for cmd in &self.key_cmds {
+            match cmd {
+                KeyCmd::Tab => dir = 1,
+                KeyCmd::ShiftTab => dir = -1,
+                _ => {}
+            }
+        }
+        if dir != 0 && !self.focus_order.is_empty() {
+            self.focus_visible = true;
+            let n = self.focus_order.len();
+            let cur = self
+                .focused_id
+                .and_then(|id| self.focus_order.iter().position(|&x| x == id));
+            let next = match cur {
+                Some(i) => (i as i32 + dir).rem_euclid(n as i32) as usize,
+                None => {
+                    if dir >= 0 {
+                        0
+                    } else {
+                        n - 1
+                    }
+                }
+            };
+            self.focused_id = Some(self.focus_order[next]);
+        }
         if self.mouse_pressed {
             if let (Some(_), Some(pr)) = (self.open_popup_id, self.popup_rect) {
                 if !pr.contains(self.cursor.0, self.cursor.1) && self.active_id != self.open_popup_id
@@ -463,6 +612,14 @@ impl UiState {
             entry.1 = v;
         } else {
             self.scroll_offsets.push((id, v));
+        }
+    }
+
+    /// Add a widget id to this frame's Tab-navigation order (draw order).
+    #[inline]
+    pub fn register_focusable(&mut self, id: u32) {
+        if !self.focus_order.contains(&id) {
+            self.focus_order.push(id);
         }
     }
 }
@@ -629,6 +786,7 @@ impl<'a> Ui<'a> {
         variant: ButtonVariant,
     ) -> bool {
         let t = self.theme;
+        self.state.register_focusable(id);
         let hovered = self.state.can_hover(id, r);
         if hovered {
             self.state.hovered_id = Some(id);
@@ -738,6 +896,7 @@ impl<'a> Ui<'a> {
                 fg,
             );
         }
+        self.draw_focus_ring(id, r, t.radius1());
         clicked
     }
 
@@ -839,6 +998,7 @@ impl<'a> Ui<'a> {
     /// `base` interior (`highlight` when checked + white checkmark).
     pub fn checkbox(&mut self, id: u32, r: Rect, label: &str, checked: &mut bool) -> bool {
         let t = self.theme;
+        self.state.register_focusable(id);
         let box_sz = (t.rem * 1.22).round();
         let fs = t.font_small();
         let hovered = self.state.can_hover(id, r);
@@ -888,12 +1048,14 @@ impl<'a> Ui<'a> {
             fs,
             if hovered { t.text } else { t.text_dim },
         );
+        self.draw_focus_ring(id, r, t.radius1());
         changed
     }
 
     /// `nui-checkbox[variant="switch"]`: 2.25em x 1.25em pill, `shade4` -> `highlight`, white thumb.
     pub fn switch(&mut self, id: u32, r: Rect, label: &str, on: &mut bool) -> bool {
         let t = self.theme;
+        self.state.register_focusable(id);
         let sw_h = (t.rem * 1.24).round();
         let sw_w = (sw_h * 1.82).round();
         let fs = t.font_small();
@@ -967,6 +1129,7 @@ impl<'a> Ui<'a> {
             fs,
             if hovered { t.text } else { t.text_dim },
         );
+        self.draw_focus_ring(id, r, t.radius1());
         changed
     }
 
@@ -1051,6 +1214,7 @@ impl<'a> Ui<'a> {
         val_text: &str,
     ) -> bool {
         let t = self.theme;
+        self.state.register_focusable(id);
         let fs = t.font_small();
         let label_h = (t.rem * 1.25).round();
         let track_area = Rect::new(r.x, r.y + label_h, r.w, r.h - label_h);
@@ -1204,6 +1368,7 @@ impl<'a> Ui<'a> {
             (0, 0, 0, 0),
             0.0,
         );
+        self.draw_focus_ring(id, r, t.radius1());
 
         changed
     }
@@ -1231,6 +1396,7 @@ impl<'a> Ui<'a> {
             clear_btn_sz,
         );
 
+        self.state.register_focusable(id);
         let hovered = self.state.can_hover(id, r);
         let clear_hovered = !text.is_empty()
             && clear_rect.contains(self.state.cursor.0, self.state.cursor.1)
@@ -1351,6 +1517,36 @@ impl<'a> Ui<'a> {
                             let next = next_char_boundary(text, self.state.text_cursor);
                             text.replace_range(self.state.text_cursor..next, "");
                             changed = true;
+                        }
+                    }
+                    KeyCmd::Copy => {
+                        if let Some((s0, s1)) = self.selection_range() {
+                            clipboard_set_text(&text[s0..s1]);
+                        }
+                    }
+                    KeyCmd::Cut => {
+                        if let Some((s0, s1)) = self.selection_range() {
+                            clipboard_set_text(&text[s0..s1]);
+                            text.replace_range(s0..s1, "");
+                            self.state.text_cursor = s0;
+                            self.state.text_sel_anchor = None;
+                            changed = true;
+                        }
+                    }
+                    KeyCmd::Paste => {
+                        if let Some(mut clip) = clipboard_get_text() {
+                            // Single-line input: strip line breaks from pasted text.
+                            clip.retain(|c| c != '\r' && c != '\n');
+                            if !clip.is_empty() {
+                                if let Some((s0, s1)) = self.selection_range() {
+                                    text.replace_range(s0..s1, "");
+                                    self.state.text_cursor = s0;
+                                    self.state.text_sel_anchor = None;
+                                }
+                                text.insert_str(self.state.text_cursor, &clip);
+                                self.state.text_cursor += clip.len();
+                                changed = true;
+                            }
                         }
                     }
                     KeyCmd::Escape | KeyCmd::Enter => {
@@ -1524,6 +1720,7 @@ impl<'a> Ui<'a> {
             );
         }
 
+        self.draw_focus_ring(id, r, t.radius1());
         changed
     }
 
@@ -1552,6 +1749,7 @@ impl<'a> Ui<'a> {
         let fs = t.font_small();
         // `padding: 0 var(--nui-space)` (nui-theme.css line 3425) — same text origin as nui-input.
         let pad_x = t.space();
+        self.state.register_focusable(id);
         let is_open = self.state.open_popup_id == Some(id);
         let hovered = r.contains(self.state.cursor.0, self.state.cursor.1)
             && (self.state.active_id.is_none() || self.state.active_id == Some(id));
@@ -1753,6 +1951,7 @@ impl<'a> Ui<'a> {
             self.scene.end_overlay();
         }
 
+        self.draw_focus_ring(id, r, t.radius2());
         changed
     }
 
@@ -2073,6 +2272,193 @@ impl<'a> Ui<'a> {
         }
 
         clicked
+    }
+
+    /// Draw the `:focus-visible` ring (2px `highlight` outline, 2px outside `r`)
+    /// when `id` is the currently keyboard-focused widget and the ring is visible.
+    pub fn draw_focus_ring(&mut self, id: u32, r: Rect, radius: f32) {
+        if self.state.focused_id == Some(id) && self.state.focus_visible {
+            let hl = self.theme.highlight;
+            self.scene.rounded_rect(
+                r.x - 3.0,
+                r.y - 3.0,
+                r.w + 6.0,
+                r.h + 6.0,
+                radius + 2.0,
+                (0, 0, 0, 0),
+                hl,
+                2.0,
+            );
+        }
+    }
+
+    /// `nui-graph` vector curve: connects normalized `(nx, ny)` points
+    /// (`0.0..=1.0`, `ny = 0.0` at the bottom) with `kind = 4` anti-aliased
+    /// capsule segments, clipped to `r`.
+    pub fn polyline(&mut self, r: Rect, points: &[(f32, f32)], thickness: f32, color: Color) {
+        if points.len() < 2 {
+            return;
+        }
+        self.scene.push_clip(r.x, r.y, r.w, r.h);
+        let to_screen = |nx: f32, ny: f32| -> (f32, f32) {
+            (r.x + nx * r.w, r.y + r.h - ny * r.h)
+        };
+        let (mut px, mut py) = to_screen(points[0].0, points[0].1);
+        for &(nx, ny) in &points[1..] {
+            let (x, y) = to_screen(nx, ny);
+            self.scene.line(px, py, x, y, thickness, color);
+            px = x;
+            py = y;
+        }
+        self.scene.pop_clip();
+    }
+
+    /// Interactive waveform seekbar: 96+ vertical peak bars between a centre
+    /// zero-line, a crisp `2px` playhead, hover highlight, and click/drag
+    /// scrubbing that writes `*playhead` (0.0..=1.0). Returns `true` when scrubbed.
+    pub fn waveform(&mut self, id: u32, r: Rect, peaks: &[f32], playhead: &mut f32) -> bool {
+        let t = self.theme;
+        self.state.register_focusable(id);
+
+        let hovered = self.state.can_hover(id, r);
+        let mut scrubbed = false;
+        if hovered {
+            self.state.hovered_id = Some(id);
+            if self.state.mouse_pressed {
+                self.state.active_id = Some(id);
+                self.state.focused_id = Some(id);
+            }
+        }
+        if self.state.active_id == Some(id) && self.state.mouse_down && r.w > 0.0 {
+            *playhead = ((self.state.cursor.0 - r.x) / r.w).clamp(0.0, 1.0);
+            scrubbed = true;
+        }
+
+        self.scene
+            .rounded_rect(r.x, r.y, r.w, r.h, t.radius1(), t.base, t.border2, 1.0);
+        self.scene
+            .push_clip(r.x + 1.0, r.y + 1.0, (r.w - 2.0).max(1.0), (r.h - 2.0).max(1.0));
+
+        let cy = (r.y + r.h * 0.5).round();
+        self.scene.rect(r.x + 2.0, cy, (r.w - 4.0).max(1.0), 1.0, t.border1);
+
+        let n = peaks.len();
+        if n > 0 && r.w > 6.0 {
+            let half = ((r.h - 4.0) * 0.5).max(1.0);
+            let step = ((r.w - 4.0) / n as f32).max(1.0);
+            let bw = (step * 0.6).clamp(1.0, 3.0);
+            for (i, &p) in peaks.iter().enumerate() {
+                let bar_frac = (i as f32 + 0.5) / n as f32;
+                let amp = p.abs().clamp(0.0, 1.0);
+                let bh = (amp * half).max(1.0);
+                let bx = (r.x + 2.0 + i as f32 * step).round();
+                let col = if bar_frac <= *playhead {
+                    t.highlight
+                } else if hovered {
+                    t.shade5
+                } else {
+                    t.shade4
+                };
+                self.scene
+                    .rect(bx, (cy - bh).round(), bw, (bh * 2.0).round(), col);
+            }
+        }
+
+        self.scene.pop_clip();
+
+        // Crisp white playhead.
+        let px = (r.x + r.w * (*playhead)).round();
+        self.scene
+            .rect(px - 1.0, r.y + 1.0, 2.0, (r.h - 2.0).max(1.0), rgb(255, 255, 255));
+
+        self.draw_focus_ring(id, r, t.radius1());
+        scrubbed
+    }
+
+    /// `nui-dropzone` full-window overlay: when `state.hovered_file` is set, dims
+    /// the whole window and draws a dashed drop target with the file path. Returns
+    /// the oldest queued dropped file (from `state.dropped_files`), if any.
+    pub fn dropzone_overlay(&mut self, win_r: Rect, title: &str) -> Option<std::path::PathBuf> {
+        let t = self.theme;
+        if let Some(hov_path) = self.state.hovered_file.clone() {
+            self.scene.begin_overlay();
+            self.scene.rect(
+                win_r.x,
+                win_r.y,
+                win_r.w,
+                win_r.h,
+                if t.dark {
+                    rgba(20, 20, 20, 235)
+                } else {
+                    rgba(240, 240, 240, 235)
+                },
+            );
+            let pad = t.space_double();
+            let dx = win_r.x + pad;
+            let dy = win_r.y + pad;
+            let dw = (win_r.w - pad * 2.0).max(1.0);
+            let dh = (win_r.h - pad * 2.0).max(1.0);
+            self.scene.rounded_rect(
+                dx,
+                dy,
+                dw,
+                dh,
+                t.radius2(),
+                rgba(76, 132, 229, 28),
+                (0, 0, 0, 0),
+                0.0,
+            );
+            self.scene.dashed_rect(
+                dx,
+                dy,
+                dw,
+                dh,
+                (t.rem * 0.6).round(),
+                (t.rem * 0.35).round(),
+                2.0,
+                t.highlight,
+            );
+
+            let cx = dx + dw * 0.5;
+            let cy = dy + dh * 0.5;
+            let icon_sz = (t.rem * 3.2).round();
+            self.scene
+                .icon_centered(self.text_sys, ICON_EQ, cx, cy - t.rem * 3.0, icon_sz, t.highlight);
+
+            let fs_large = t.font_large();
+            let tw = self
+                .text_sys
+                .measure(FontFace::SemiBold, self.font_engine, title, fs_large);
+            self.scene.text(
+                self.text_sys,
+                FontFace::SemiBold,
+                self.font_engine,
+                title,
+                (cx - tw * 0.5).round(),
+                (cy - t.rem * 0.2 + fs_large * 0.34).round(),
+                fs_large,
+                t.highlight,
+            );
+
+            let sub = hov_path.to_string_lossy();
+            let fs_base = t.font_base();
+            let sw = self
+                .text_sys
+                .measure(FontFace::Regular, self.font_engine, &sub, fs_base);
+            self.scene.text(
+                self.text_sys,
+                FontFace::Regular,
+                self.font_engine,
+                &sub,
+                (cx - sw * 0.5).round(),
+                (cy + t.rem * 1.4 + fs_base * 0.34).round(),
+                fs_base,
+                t.text,
+            );
+
+            self.scene.end_overlay();
+        }
+        self.state.dropped_files.pop()
     }
 }
 

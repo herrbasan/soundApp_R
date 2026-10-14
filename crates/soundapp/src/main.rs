@@ -68,6 +68,8 @@ struct App {
     click_counter: u32,
     scrub_frac: f32,
     selected_track: usize,
+    /// Deterministic 96-bar synthetic waveform for the transport seekbar.
+    wave_peaks: Vec<f32>,
 }
 
 const DEVICES: &[&str] = &[
@@ -153,6 +155,19 @@ fn track_meta(idx: usize) -> String {
     format!("48 kHz · 24-bit · -{lufs:.1} LUFS · {mm:02}:{ss:02}")
 }
 
+/// Deterministic synthetic audio waveform peaks (stable across frames so the
+/// interactive seekbar does not jitter while scrubbing).
+fn synth_wave_peaks(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let x = i as f32 / (n - 1).max(1) as f32;
+            let envelope = (x * std::f32::consts::PI).sin();
+            let detail = (x * 37.0).sin() * 0.35 + (x * 91.0).cos() * 0.22;
+            (envelope * (0.55 + detail)).abs().clamp(0.05, 1.0)
+        })
+        .collect()
+}
+
 /// Caption lines for the Typography A/B cards, keyed by the CSS px size being shown.
 fn typo_sample(css_px: f32) -> &'static str {
     if css_px <= 12.0 {
@@ -220,6 +235,7 @@ impl App {
             click_counter: 0,
             scrub_frac: 0.35,
             selected_track: 2,
+            wave_peaks: synth_wave_peaks(96),
         }
     }
 
@@ -415,7 +431,7 @@ impl App {
             //    nui_wc2 proportions: 1.25rem window padding + inter-card gap.
             // ================================================================
             let m = Length::Rem(1.25).resolve(rem).round();
-            let bot_h = Length::Rem(4.8).resolve(rem).round();
+            let bot_h = Length::Rem(5.6).resolve(rem).round();
             let top_y = hdr_h + m;
             let main_h = (ph - top_y - bot_h - m * 2.0).max(120.0);
             let left_w = Length::Rem(20.0).resolve(rem).round();
@@ -484,6 +500,22 @@ impl App {
                     ui.scene
                         .rounded_rect(bx, by, bar_w, bh, 2.0, theme.highlight, (0, 0, 0, 0), 0.0);
                 }
+
+                // Realtime stereo oscilloscope / harmonic curve drawn ON TOP of the
+                // spectrum bars — exercises `Scene::line` (kind = 4 anti-aliased
+                // capsule segments) alongside the kind = 0 spectrum rectangles.
+                let osc_pts: Vec<(f32, f32)> = (0..=64)
+                    .map(|i| {
+                        let nx = i as f32 / 64.0;
+                        let phase = self.t * 6.0 + nx * std::f32::consts::TAU * 2.0;
+                        let amp = 0.42 * phase.sin()
+                            + 0.20 * (phase * 2.3).cos()
+                            + 0.12 * (phase * 4.1).sin();
+                        let ny = (0.5 + amp * self.master_vol.max(0.2)).clamp(0.05, 0.95);
+                        (nx, ny)
+                    })
+                    .collect();
+                ui.polyline(spec_r, &osc_pts, 2.0, theme.palette_mark);
             });
 
             // ================================================================
@@ -874,61 +906,23 @@ impl App {
                 Length::rem(1.0),
                 Length::rem(0.5),
                 |ui| {
-                    // Full-width scrubbable seekbar.
-                    let bar = ui.take(Length::rem(0.38));
-                    let bar_x = bar.x;
-                    let bar_y = bar.y;
-                    let bar_w = bar.w;
-                    let bar_h = bar.h;
-                    let bar_hit = Rect::new(bar_x, bar_y - rem * 0.4, bar_w, bar_h + rem * 0.8);
-
-                    if ui.state.can_hover(500, bar_hit) {
-                        ui.state.hovered_id = Some(500);
-                        if ui.state.mouse_pressed {
-                            ui.state.active_id = Some(500);
-                        }
-                    }
-                    if ui.state.active_id == Some(500) && ui.state.mouse_down {
-                        self.scrub_frac = ((ui.state.cursor.0 - bar_x) / bar_w).clamp(0.0, 1.0);
-                    }
-
-                    ui.scene.rounded_rect(
-                        bar_x,
-                        bar_y,
-                        bar_w,
-                        bar_h,
-                        bar_h * 0.5,
-                        theme.base,
-                        (0, 0, 0, 0),
-                        0.0,
-                    );
-
+                    // Interactive waveform seekbar (`ui.waveform`: 96 peaked bars,
+                    // hover highlight, crisp kind = 4 white playhead, click/drag scrub).
                     let (pos, dur) = self
                         .audio
                         .as_ref()
                         .map(|a| (a.position_secs(), a.duration_secs()))
                         .unwrap_or((0.0, 0.0));
                     let is_finite = dur > 0.0 && dur < 360_000.0;
-                    let frac = if ui.state.active_id == Some(500) {
-                        self.scrub_frac
-                    } else if is_finite {
-                        (pos / dur).clamp(0.0, 1.0) as f32
-                    } else if playing {
-                        (self.t * 0.12).fract()
-                    } else {
-                        self.scrub_frac
-                    };
-
-                    ui.scene.rounded_rect(
-                        bar_x,
-                        bar_y,
-                        (bar_w * frac).max(bar_h),
-                        bar_h,
-                        bar_h * 0.5,
-                        theme.highlight,
-                        (0, 0, 0, 0),
-                        0.0,
-                    );
+                    if ui.state.active_id != Some(500) {
+                        if is_finite {
+                            self.scrub_frac = (pos / dur).clamp(0.0, 1.0) as f32;
+                        } else if playing {
+                            self.scrub_frac = (self.t * 0.12).fract();
+                        }
+                    }
+                    let wave = ui.take(Length::Rem(1.85));
+                    let _ = ui.waveform(500, wave, &self.wave_peaks, &mut self.scrub_frac);
 
                     // Transport row: elapsed | Prev · Play/Pause · Next | remaining.
                     let ctrl = ui.take_rest();
@@ -1007,6 +1001,17 @@ impl App {
                     7.0 * scale,
                     ((i % 200) as u8, 120, 160, 255),
                 );
+            }
+
+            // Full-window `nui-dropzone` overlay (OS drag-and-drop). A dropped file
+            // is loaded into the search field.
+            if let Some(path) =
+                ui.dropzone_overlay(Rect::new(0.0, 0.0, pw, ph), "Drop audio file to load")
+            {
+                self.search_text = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
             }
 
             // Append any open dropdown popups onto the top of the draw list!
@@ -1171,6 +1176,25 @@ impl ApplicationHandler for App {
                     w.request_redraw();
                 }
             }
+            WindowEvent::HoveredFile(path) => {
+                self.ui_state.hovered_file = Some(path);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::HoveredFileCancelled => {
+                self.ui_state.hovered_file = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.ui_state.hovered_file = None;
+                self.ui_state.dropped_files.push(path);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
             }
@@ -1277,8 +1301,24 @@ impl ApplicationHandler for App {
                         Key::Named(NamedKey::Enter) => {
                             self.ui_state.key_cmds.push(KeyCmd::Enter);
                         }
+                        Key::Named(NamedKey::Tab) => {
+                            if self.modifiers.shift_key() {
+                                self.ui_state.key_cmds.push(KeyCmd::ShiftTab);
+                            } else {
+                                self.ui_state.key_cmds.push(KeyCmd::Tab);
+                            }
+                        }
                         Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("a") => {
                             self.ui_state.key_cmds.push(KeyCmd::SelectAll);
+                        }
+                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("c") => {
+                            self.ui_state.key_cmds.push(KeyCmd::Copy);
+                        }
+                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("x") => {
+                            self.ui_state.key_cmds.push(KeyCmd::Cut);
+                        }
+                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("v") => {
+                            self.ui_state.key_cmds.push(KeyCmd::Paste);
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("b") => {
                             if let Some(r) = &mut self.renderer {
@@ -1382,6 +1422,8 @@ fn main() {
     let mut app_screenshot: Option<String> = None;
     let mut open_select_demo = false;
     let mut initial_tab: usize = 0;
+    let mut drop_preview = false;
+    let mut focus_preview = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -1391,6 +1433,8 @@ fn main() {
             "--static" => animate = false,
             "--nopaint" => nopaint = true,
             "--open-select" => open_select_demo = true,
+            "--drop-preview" => drop_preview = true,
+            "--focus-preview" => focus_preview = true,
             "--tab" => initial_tab = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--backend" => {
                 if let Some(b) = args.next() {
@@ -1449,6 +1493,14 @@ fn main() {
     app.active_tab = initial_tab.min(3);
     if open_select_demo {
         app.ui_state.open_popup_id = Some(360);
+    }
+    if drop_preview {
+        app.ui_state.hovered_file =
+            Some(std::path::PathBuf::from("D:\\Work\\_GIT\\SoundApp\\_Material\\test_track.flac"));
+    }
+    if focus_preview {
+        app.ui_state.focused_id = Some(301);
+        app.ui_state.focus_visible = true;
     }
     event_loop.run_app(&mut app).unwrap();
 }

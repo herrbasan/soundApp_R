@@ -269,6 +269,74 @@ impl Scene {
             clip_rect,
         });
     }
+
+    /// Anti-aliased capsule line segment (GPU/Cpu `kind = 4`).
+    /// `(x0, y0)-(x1, y1)` are physical screen px; the fragment shader / CPU blitter
+    /// recover the segment endpoints from `border_color` (there is no other slot).
+    pub fn line(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        thickness: f32,
+        color: (u8, u8, u8, u8),
+    ) {
+        if thickness <= 0.0 || color.3 == 0 {
+            return;
+        }
+        let pad = thickness * 0.5 + 1.5;
+        let rx = x0.min(x1) - pad;
+        let ry = y0.min(y1) - pad;
+        let rw = (x0 - x1).abs() + pad * 2.0;
+        let rh = (y0 - y1).abs() + pad * 2.0;
+        let clip_rect = self.current_clip();
+        self.push_instance(QuadInstance {
+            rect: [rx, ry, rw, rh],
+            uv_rect: [0.0; 4],
+            fill_color: [
+                color.0 as f32 / 255.0,
+                color.1 as f32 / 255.0,
+                color.2 as f32 / 255.0,
+                color.3 as f32 / 255.0,
+            ],
+            border_color: [x0, y0, x1, y1],
+            params: [thickness * 0.5, 0.0, 4.0, 0.0],
+            clip_rect,
+        });
+    }
+
+    /// Dashed outline: emits `kind = 4` line segments along all four edges of
+    /// `(x, y, w, h)` with the given `dash` / `gap` run lengths.
+    pub fn dashed_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        dash: f32,
+        gap: f32,
+        thickness: f32,
+        color: (u8, u8, u8, u8),
+    ) {
+        let step = (dash + gap).max(1.0);
+        let mut dx = 0.0;
+        while dx < w {
+            let x0 = x + dx;
+            let x1 = (x + dx + dash).min(x + w);
+            self.line(x0, y, x1, y, thickness, color);
+            self.line(x0, y + h, x1, y + h, thickness, color);
+            dx += step;
+        }
+        let mut dy = 0.0;
+        while dy < h {
+            let y0 = y + dy;
+            let y1 = (y + dy + dash).min(y + h);
+            self.line(x, y0, x, y1, thickness, color);
+            self.line(x + w, y0, x + w, y1, thickness, color);
+            dy += step;
+        }
+    }
 }
 
 // ============================================================================
@@ -398,7 +466,7 @@ void main() {
         if (cov <= 0.002) discard;
         float a = cov * v_fill.a;
         frag_color = vec4(v_fill.rgb * a, a);
-    } else {
+    } else if (kind == 3) {
         // kind == 3: Soft SDF drop shadow
         float radius = v_params.x;
         float blur = max(v_params.y, 1.0);
@@ -409,6 +477,17 @@ void main() {
         float t = clamp(1.0 - max(d, 0.0) / blur, 0.0, 1.0);
         float a = t * t * (3.0 - 2.0 * t) * v_fill.a;
         if (a <= 0.002) discard;
+        frag_color = vec4(v_fill.rgb * a, a);
+    } else if (kind == 4) {
+        // 2D capsule line segment from v_border.xy to v_border.zw with radius v_params.x
+        vec2 pa = v_screen_px - v_border.xy;
+        vec2 ba = v_border.zw - v_border.xy;
+        float baba = dot(ba, ba);
+        float h = baba > 0.0001 ? clamp(dot(pa, ba) / baba, 0.0, 1.0) : 0.0;
+        float d = length(pa - ba * h) - v_params.x;
+        float cov = clamp(0.5 - d, 0.0, 1.0);
+        if (cov <= 0.002) discard;
+        float a = cov * v_fill.a;
         frag_color = vec4(v_fill.rgb * a, a);
     }
 }
@@ -1054,6 +1133,44 @@ impl Renderer {
                         }
                     }
                 }
+            } else if kind == 4 {
+                // Anti-aliased capsule line segment (matches the GPU kind==4 shader).
+                // Endpoints ride in border_color; radius in params.x.
+                let ax = inst.border_color[0];
+                let ay = inst.border_color[1];
+                let bx = inst.border_color[2];
+                let by = inst.border_color[3];
+                let rad = inst.params[0];
+                let bax = bx - ax;
+                let bay = by - ay;
+                let baba = bax * bax + bay * bay;
+
+                let x0 = (inst.rect[0].floor() as i32).clamp(cx0, cx1);
+                let y0 = (inst.rect[1].floor() as i32).clamp(cy0, cy1);
+                let x1 = ((inst.rect[0] + inst.rect[2]).ceil() as i32).clamp(cx0, cx1);
+                let y1 = ((inst.rect[1] + inst.rect[3]).ceil() as i32).clamp(cy0, cy1);
+                for py in y0..y1 {
+                    let row_off = py as usize * stride;
+                    let sy = py as f32 + 0.5;
+                    for px in x0..x1 {
+                        let sx = px as f32 + 0.5;
+                        let pax = sx - ax;
+                        let pay = sy - ay;
+                        let h = if baba > 0.0001 {
+                            ((pax * bax + pay * bay) / baba).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let qx = pax - bax * h;
+                        let qy = pay - bay * h;
+                        let d = (qx * qx + qy * qy).sqrt() - rad;
+                        let cov = ((0.5 - d).clamp(0.0, 1.0) * a as f32 + 0.5) as u8;
+                        if cov > 0 {
+                            let dst = &mut buf[row_off + px as usize];
+                            *dst = crate::text::GammaLut::blend_naive_srgb(*dst, r, g, b, cov);
+                        }
+                    }
+                }
             } else {
                 // Atlas glyph (kind 1 = Swash gamma-corrected, kind 2 = Fontdue naive sRGB)
                 let gx = inst.rect[0] as i32;
@@ -1163,5 +1280,25 @@ impl Renderer {
             0.0
         };
         Self::blend_sdf_color(dst, outer_a, bmix, fill, border);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `kind = 4` capsule primitive must paint a filled anti-aliased band,
+    /// not just its outline (a regression here renders one-pixel hairlines).
+    #[test]
+    fn kind4_line_fills_a_band() {
+        let mut scene = Scene::new();
+        scene.clear_all((0, 0, 0));
+        scene.line(10.0, 10.0, 90.0, 10.0, 10.0, (255, 0, 255, 255));
+        let (w, h) = (100u32, 40u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        let ts = TextSystem::new();
+        Renderer::rasterize_slice(&mut buf, w, h, &scene.instances, &ts);
+        let filled = buf.iter().filter(|&&p| p != 0).count();
+        assert!(filled > 400, "kind4 band covers only {filled} px");
     }
 }

@@ -75,13 +75,15 @@ Goal: Make building complex multi-window UIs in `crates/nui` declarative and com
 - [x] **1.2 Scrollable & Virtualized List (`nui-list` / `ui.scroll_area()` & `ui.virtual_list()`):**
   - Vertical scroll container with `push_clip`, mouse-wheel scrolling, clamping, and a draggable scrollbar thumb (`--space-scrollbar-width: 0.5rem`).
   - Virtualized row callback `ui.virtual_list(id, rect, row_count, row_height, |ui, idx, row_rect| ...)` so a 10,000-track playlist only emits `QuadInstance`s for the ~15 visible rows.
-- [ ] **1.3 Anti-Aliased Vector Line & Waveform Primitive (`kind = 4` in `render.rs`):**
-  - Add `kind = 4` (2D capsule line segment `(x0, y0) -> (x1, y1)` with thickness `w`) to `QuadInstance` in `FRAG_SRC` and `rasterize_slice`.
-  - Add `ui.waveform()` (min/max peak columns + playhead scrub) and `ui.polyline()` (`nui-graph` sparkline / FFT curve / oscilloscope / goniometer) on top of it.
-- [ ] **1.4 Clipboard, Keyboard Focus Ring & File Drop (`nui-dropzone`):**
-  - Native Windows clipboard (`Ctrl+C`, `Ctrl+X`, `Ctrl+V`) in `ui.text_input()`.
-  - `Tab` / `Shift+Tab` focus traversal + `:focus-visible` `2px` `--color-highlight` outline ring.
-  - `WindowEvent::HoveredFile` / `DroppedFile` wired to an `nui-dropzone` dashed overlay (`NUI/css/nui-theme.css` line 2170).
+- [x] **1.3 Anti-Aliased Vector Line & Waveform Primitive (`kind = 4` in `render.rs`):**
+  - `Scene::line(x0, y0, x1, y1, thickness, color)` emits a `kind = 4` capsule segment (endpoints ride in `border_color`, radius in `params.x`); `Scene::dashed_rect()` builds dashed outlines from it. GPU: capsule SDF in `FRAG_SRC`; CPU: matching segment SDF in `rasterize_slice` (both blend via `GammaLut::blend_naive_srgb`).
+  - `ui.polyline(rect, points, thickness, color)` (`nui-graph` sparkline / FFT curve / oscilloscope / goniometer) and `ui.waveform(id, rect, peaks, playhead)` (centre zero-line, played/unplayed bar tint, hover highlight, crisp `2px` white playhead, click/drag scrub).
+  - Verified: `cargo test -p nui` `kind4_line_fills_a_band`; `--screenshot` pixel counts confirm ~33k px (40px test line) / ~14k px (polyline) on **both** GPU and CPU backends.
+- [x] **1.4 Clipboard, Keyboard Focus Ring & File Drop (`nui-dropzone`):**
+  - Zero-dependency Win32 clipboard (`clipboard_get_text` / `clipboard_set_text` via `user32`/`kernel32` FFI, `CF_UNICODETEXT`); `KeyCmd::{Copy, Cut, Paste, Tab, ShiftTab, Activate}` handled in `ui.text_input()`.
+  - `Tab` / `Shift+Tab` traversal over the per-frame `focus_order`; `:focus-visible` `2px` `highlight` ring via `Ui::draw_focus_ring()` on button/checkbox/switch/slider/text-input/select; the ring hides on mouse press.
+  - `WindowEvent::HoveredFile` / `HoveredFileCancelled` / `DroppedFile` wired to `ui.dropzone_overlay()` (full-window dim + dashed target + icon/title/path); dropped files load into the search field. `--drop-preview` / `--focus-preview` CLI flags for screenshot verification.
+  - Verified: overlay darkens the frame on both backends (meanLuma `127.3` → `102.0` GPU / `104.6` CPU).
 - [ ] **1.5 Multi-Window Manager inside `crates/nui`:**
   - Support multiple native `winit` windows (`Player`, `Parameters`, `Monitoring`, `Mixer`, `Settings`, `Help`) in a single process (`HashMap<WindowId, WindowEntry>`), sharing the `TextSystem` glyph cache.
   - Implement `hide()` / `show()` fast toggling (matching SoundApp's `P`, `N`, `M`, `S`, `H` window behavior).
