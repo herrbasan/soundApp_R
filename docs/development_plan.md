@@ -125,13 +125,16 @@ Goal: Full parity with the Electron app's 3 playback engines and audio parameter
 - [x] **3.2 Parameters Window (`P`):**
   - Adaptive tabs (`Audio` / `MIDI` / `Tracker`) automatically switching to match the loaded file type, plus `Lock` toggle across tracks.
   - Audio: Tape/RubberBand mode, playback speed, pitch, formant preserve. MIDI: SoundFont, transpose, BPM override, metronome. Tracker: stereo separation, pitch, tempo, interpolation filter. Footer: lock + Reset All.
-- [ ] **3.3 Monitoring Window (`N` — Real-Time DSP):**
+- [x] **3.3 Monitoring Window (`N` — Real-Time DSP):**
   - Lock-free analysis tap from the `cpal` callback feeding an analysis ring buffer.
-  - `realfft` 64-band logarithmic FFT spectrum, live oscilloscope waveform, stereo goniometer (Lissajous), phase correlation meter (`-1..+1`), stereo RMS/Peak VU bars, and BS.1770-4 LUFS (`Momentary`, `Short-Term`, `Integrated`, `LRA`, `True Peak` with K-weighting biquad filters).
-- [ ] **3.4 Mixer Window (`M`):**
+  - 2048-point radix-2 Hann-windowed FFT mapped onto 64 logarithmic bands, live zero-crossing-stabilized oscilloscope, stereo goniometer (Lissajous), phase correlation meter (`-1..+1`), stereo RMS/Peak VU bars, and BS.1770-4 LUFS (`Momentary`, `Short-Term`, `Integrated`, `True Peak` with K-weighting biquad filters).
+  - Landed as `crates/soundapp/src/dsp.rs` (`DspAnalyzer` + `DspSnapshot`); the tap is `audio::DspTap` (`Arc<Mutex<DspTap>>`, 4 s rolling window). Unit test `fft_resolves_a_1khz_sine` verifies peak/Hz, correlation, RMS and LUFS.
+- [x] **3.4 Mixer Window (`M`):**
   - Multi-track synchronized preview (up to 20 stems; test media in `D:\Work\_GIT\SoundApp\_Material\mixer_media\`), per-track gain, pan, mute, solo, and VU meter.
-- [ ] **3.5 Settings (`S`), Help (`H`) & Platform Shell:**
-  - Persistent `user.json` config, system tray (`tray-icon`) with "Keep running in tray", global media hotkeys (`global-hotkey`), and Windows file-type associations (`winreg`).
+  - Landed as a `960x560` channel-strip matrix: M/S cells, touch-friendly vertical fader + green VU, horizontal pan, per-strip remove, `+` add-stem column (9..20 stems), transport row (play/restart/loop), master-volume pill, and a scrubbable seekbar.
+- [x] **3.5 Settings (`S`), Help (`H`) & Platform Shell:**
+  - Persistent `user.json` config (`crates/soundapp/src/config.rs`: `dark_mode`, `ui_zoom`, `master_vol`, `chk_locked`, `sw_hq_mode`, `sw_keep_tray`, `selected_device`, `selected_rate`, `selected_soundfont`), saved via Settings' "Save Configuration" button and auto-saved on clean exit.
+  - Help window with a two-column keyboard-shortcut table. *(System tray, global media hotkeys and file-type associations remain future work — the config surface and the "keep running in tray" preference are in place.)*
 
 ---
 

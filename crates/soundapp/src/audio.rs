@@ -298,6 +298,44 @@ struct Shared {
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
     kind: Arc<Mutex<Option<SourceKind>>>,
+    dsp: Arc<Mutex<DspTap>>,
+}
+
+// ---------------------------------------------------------------------------
+// Real-time DSP tap (Phase 3.3)
+// ---------------------------------------------------------------------------
+
+/// Rolling window of the final post-fader stereo frames, published by the audio
+/// callback and read by the DSP analyzer. A fixed-capacity `VecDeque` keeps the
+/// memory bounded; the callback locks it once per output buffer.
+pub struct DspTap {
+    cap: usize,
+    buf: VecDeque<(f32, f32)>,
+}
+
+impl DspTap {
+    fn new(sample_rate: u32) -> Self {
+        // Four seconds is enough to cover the BS.1770 3 s short-term window.
+        let cap = (sample_rate as usize * 4).max(4096);
+        Self {
+            cap,
+            buf: VecDeque::with_capacity(cap.min(1 << 16)),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, l: f32, r: f32) {
+        if self.buf.len() == self.cap {
+            self.buf.pop_front();
+        }
+        self.buf.push_back((l, r));
+    }
+
+    /// Copy the most recent frames (oldest → newest) into `out`, clearing it first.
+    pub fn snapshot_into(&self, out: &mut Vec<(f32, f32)>) {
+        out.clear();
+        out.extend(self.buf.iter().copied());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +356,7 @@ pub struct Audio {
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
     kind: Arc<Mutex<Option<SourceKind>>>,
+    dsp: Arc<Mutex<DspTap>>,
 }
 
 impl Audio {
@@ -385,6 +424,10 @@ impl Audio {
     pub fn source_kind(&self) -> Option<SourceKind> {
         *self.kind.lock().unwrap()
     }
+    /// Shared rolling stereo tap feeding the real-time DSP analyzer (Phase 3.3).
+    pub fn dsp_tap(&self) -> Arc<Mutex<DspTap>> {
+        self.dsp.clone()
+    }
 }
 
 const RING_SECONDS: usize = 8;
@@ -418,6 +461,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
         total_frames: Arc::new(AtomicU64::new(0)),
         frames_played: Arc::new(AtomicU64::new(0)),
         started: Arc::new(AtomicBool::new(false)),
+        dsp: Arc::new(Mutex::new(DspTap::new(rate))),
         peaks: Arc::new(Mutex::new(Vec::new())),
         meta: Arc::new(Mutex::new(None)),
         current: Arc::new(Mutex::new(None)),
@@ -437,6 +481,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
 
     // Consumer: the cpal callback. Copy + fade + volume only.
     let sh = shared.clone();
+    let dsp = shared.dsp.clone();
     let mut consumer = consumer;
     let err_fn = |e| eprintln!("[cpal] stream error: {e}");
     let mut last_playing = false;
@@ -444,6 +489,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
     let mut local_flush = 0u64;
     let mut fade = Fade::Steady;
     let mut vol_smooth = 1.0f32;
+    let mut dsp_frames: Vec<(f32, f32)> = Vec::with_capacity(4096);
     let in_inc = 1.0f32 / (0.015 * rate as f32);
     let out_inc = 1.0f32 / (0.012 * rate as f32);
 
@@ -515,12 +561,24 @@ pub fn start(src: Source) -> Result<Audio, String> {
                         };
                         data[f * out_ch + c] = s * vol_smooth * gain;
                     }
+                    // Publish the final post-fader stereo frame to the DSP tap.
+                    let l = data[f * out_ch];
+                    let r = if out_ch > 1 { data[f * out_ch + 1] } else { l };
+                    dsp_frames.push((l, r));
                     if last_playing {
                         advanced += 1;
                     }
                 }
                 if advanced > 0 {
                     sh.frames_played.fetch_add(advanced, Ordering::Relaxed);
+                }
+                if !dsp_frames.is_empty() {
+                    if let Ok(mut tap) = dsp.lock() {
+                        for &(l, r) in &dsp_frames {
+                            tap.push(l, r);
+                        }
+                    }
+                    dsp_frames.clear();
                 }
             },
             err_fn,
@@ -543,6 +601,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
         peaks: shared.peaks.clone(),
         meta: shared.meta.clone(),
         current: shared.current.clone(),
+        dsp: shared.dsp.clone(),
         kind: shared.kind.clone(),
     })
 }

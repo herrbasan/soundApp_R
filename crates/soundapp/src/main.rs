@@ -2,6 +2,8 @@
 // with nui_wc2 v3.0.0 "slate" theme & components and Swash browser-grade typography.
 
 mod audio;
+mod config;
+mod dsp;
 mod midi;
 mod tracker;
 
@@ -17,12 +19,28 @@ use winit::window::{Window, WindowId};
 
 use audio::{Audio, PlaybackParams, Source, SourceKind};
 use audio::TrackMetadata;
+use config::UserConfig;
+use dsp::{DspAnalyzer, DspSnapshot, BANDS};
 use nui::{
-    BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Length, Rect, Renderer,
-    Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_CLOSE, ICON_DARK_MODE,
-    ICON_EQ, ICON_LIGHT_MODE, ICON_LOOP, ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV,
-    ICON_RESTART, ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE, ICON_VOLUME,
+    rgb, rgba, BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Length,
+    Rect, Renderer, Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_ADD,
+    ICON_CLOSE, ICON_DARK_MODE, ICON_EQ, ICON_LIGHT_MODE, ICON_LOOP, ICON_NEXT, ICON_PAUSE,
+    ICON_PLAY, ICON_PREV, ICON_RESTART, ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE,
+    ICON_VOLUME,
 };
+
+/// One channel strip in the Phase 3.4 multitrack preview mixer.
+#[derive(Clone, Debug)]
+struct MixerStem {
+    /// Display number (`01`..`20`).
+    number: usize,
+    /// Fader gain, `0.0..=2.0` (`1.0` = unity).
+    gain: f32,
+    /// Stereo pan, `-1.0` = hard left .. `+1.0` = hard right.
+    pan: f32,
+    muted: bool,
+    solo: bool,
+}
 
 struct App {
     start: Instant,
@@ -84,8 +102,6 @@ struct App {
     click_counter: u32,
     scrub_frac: f32,
     selected_track: usize,
-    mixer_gains: [f32; 4],
-    mixer_mutes: [bool; 4],
     /// Deterministic 96-bar synthetic waveform for the transport seekbar.
     wave_peaks: Vec<f32>,
 
@@ -112,6 +128,28 @@ struct App {
     track_meta: Option<TrackMetadata>,
     /// True while the waveform seekbar is being dragged (seek on release).
     scrub_active: bool,
+
+    // Phase 3.3 — real-time DSP analysis tap + last snapshot for the Monitoring window.
+    dsp: DspAnalyzer,
+    dsp_buf: Vec<(f32, f32)>,
+    dsp_snap: DspSnapshot,
+    /// Output-frame counter at the last Monitoring redraw (delta = new frames).
+    last_dsp_frames: u64,
+
+    // Phase 3.4 — multitrack stem preview mixer state.
+    mixer_stems: Vec<MixerStem>,
+    mixer_playing: bool,
+    mixer_loop: bool,
+    mixer_master_vol: f32,
+    mixer_pos_frac: f32,
+
+    // Phase 3.5 — persistent user configuration.
+    config: UserConfig,
+    /// Set true when the Settings "Save Configuration" button fires, flushed after
+    /// the render borrow ends.
+    save_config_req: bool,
+    /// Transient status text shown in the Settings footer after a save.
+    config_status: String,
 }
 
 const DEVICES: &[&str] = &[
@@ -162,20 +200,20 @@ const SPEC_PARAMETERS: WindowSpec = WindowSpec {
 const SPEC_MONITORING: WindowSpec = WindowSpec {
     key: "monitoring",
     title: "SoundApp · Real-Time DSP Monitoring [N]",
-    width: 760.0,
-    height: 480.0,
-    min_width: 560.0,
-    min_height: 360.0,
+    width: 900.0,
+    height: 600.0,
+    min_width: 620.0,
+    min_height: 420.0,
     undecorated: true,
 };
 
 const SPEC_MIXER: WindowSpec = WindowSpec {
     key: "mixer",
     title: "SoundApp · Multi-Track Stem Mixer [M]",
-    width: 820.0,
-    height: 480.0,
-    min_width: 600.0,
-    min_height: 360.0,
+    width: 960.0,
+    height: 560.0,
+    min_width: 720.0,
+    min_height: 420.0,
     undecorated: true,
 };
 
@@ -192,10 +230,10 @@ const SPEC_SETTINGS: WindowSpec = WindowSpec {
 const SPEC_HELP: WindowSpec = WindowSpec {
     key: "help",
     title: "SoundApp · Keyboard Shortcuts & Help [H]",
-    width: 640.0,
-    height: 460.0,
-    min_width: 500.0,
-    min_height: 340.0,
+    width: 720.0,
+    height: 480.0,
+    min_width: 520.0,
+    min_height: 360.0,
     undecorated: true,
 };
 
@@ -238,6 +276,296 @@ fn window_header_badge(key: &str) -> &'static str {
         _ => "SHORTCUTS",
     }
 }
+
+/// The nine default multitrack stems (Phase 3.4). Media lives in
+/// `D:\Work\_GIT\SoundApp\_Material\mixer_media\Again\01.m4a .. 09.m4a`.
+fn default_mixer_stems() -> Vec<MixerStem> {
+    (1..=9)
+        .map(|n| MixerStem {
+            number: n,
+            gain: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+        })
+        .collect()
+}
+
+/// Deterministic synthetic stereo signal used by the Monitoring window when the
+/// audio tap has no frames yet (silent / headless), so the DSP panels stay alive.
+fn synth_dsp_frames(t: f32, n: usize) -> Vec<(f32, f32)> {
+    (0..n)
+        .map(|i| {
+            let x = i as f32 / n as f32;
+            let ph = t * 3.0 + x * std::f32::consts::TAU * 4.0;
+            let amp = 0.35 * (0.6 + 0.4 * (t * 0.7).sin());
+            let l = amp * (ph.sin() + 0.4 * (ph * 2.7).sin() + 0.2 * (ph * 5.3).cos());
+            let r = amp * (ph.sin() * 0.93 + 0.4 * (ph * 2.7 + 0.3).sin());
+            (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0))
+        })
+        .collect()
+}
+
+/// Keyboard-shortcut rows for the Help window's two-column table.
+const HELP_ROWS: &[(&str, &str)] = &[
+    ("Space", "Play / Pause transport"),
+    ("Left / Right", "Seek -5 s / +5 s"),
+    ("Up / Down", "Master volume +5% / -5%"),
+    ("L", "Toggle loop"),
+    ("C", "Toggle compact player mode"),
+    ("P", "Parameters window"),
+    ("N", "Monitoring window"),
+    ("M", "Mixer window"),
+    ("S", "Settings window"),
+    ("H", "This Help window"),
+    ("B", "Toggle GPU / CPU backend"),
+    ("F", "Toggle Swash / Fontdue engine"),
+    ("T", "Toggle dark / light theme"),
+    ("Ctrl + / - / 0", "UI zoom in / out / reset"),
+    ("Ctrl+C / X / V", "Copy / Cut / Paste text"),
+    ("Tab / Shift+Tab", "Move keyboard focus"),
+    ("Dbl-Click / Right-Click", "Reset slider / fader to default"),
+    ("Esc", "Close window / quit app"),
+];
+
+// ---------------------------------------------------------------------------
+// Small draw helpers shared by the Monitoring / Mixer windows
+// ---------------------------------------------------------------------------
+
+/// Draw `s` horizontally centered inside `r`, vertically centered on its height.
+fn draw_centered_text(
+    ui: &mut Ui,
+    r: Rect,
+    s: &str,
+    face: FontFace,
+    fs: f32,
+    color: (u8, u8, u8, u8),
+) {
+    let fs = fs.round();
+    let w = ui.text_sys.measure(face, ui.font_engine, s, fs);
+    let x = (r.x + (r.w - w) * 0.5).round();
+    let baseline = (r.y + r.h * 0.5 + fs * 0.34).round();
+    ui.scene
+        .text(ui.text_sys, face, ui.font_engine, s, x, baseline, fs, color);
+}
+
+/// Draw `s` centered horizontally on `cx` with an exact `baseline`.
+fn draw_text_at(
+    ui: &mut Ui,
+    cx: f32,
+    baseline: f32,
+    s: &str,
+    face: FontFace,
+    fs: f32,
+    color: (u8, u8, u8, u8),
+) {
+    let fs = fs.round();
+    let w = ui.text_sys.measure(face, ui.font_engine, s, fs);
+    ui.scene.text(
+        ui.text_sys,
+        face,
+        ui.font_engine,
+        s,
+        (cx - w * 0.5).round(),
+        baseline.round(),
+        fs,
+        color,
+    );
+}
+
+/// A dark `inset_card`-style readout box with an uppercase label and a value.
+fn draw_readout(ui: &mut Ui, r: Rect, label: &str, value: &str) {
+    let t = ui.theme;
+    ui.scene
+        .rounded_rect(r.x, r.y, r.w, r.h, t.radius2(), t.base, t.border1, 1.0);
+    let pad = (t.rem * 0.4).round();
+    let lx = (r.x + pad).round();
+    let lfs = t.font_xsmall();
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        label,
+        lx,
+        (r.y + pad + lfs * 0.85).round(),
+        lfs,
+        t.text_muted,
+    );
+    let vfs = t.font_small();
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::SemiBold,
+        ui.font_engine,
+        value,
+        lx,
+        (r.y + r.h - pad - vfs * 0.15).round(),
+        vfs,
+        t.text,
+    );
+}
+
+/// One color segment of a VU meter, limited to the region above the `top` fill line.
+fn meter_segment(
+    ui: &mut Ui,
+    r: Rect,
+    top: f32,
+    lo_db: f32,
+    hi_db: f32,
+    color: (u8, u8, u8, u8),
+) {
+    let db_to_y = |db: f32| r.y + r.h * (1.0 - ((db + 60.0) / 60.0).clamp(0.0, 1.0));
+    let y_start = db_to_y(hi_db).max(top);
+    let y_end = db_to_y(lo_db);
+    if y_end > y_start + 0.5 {
+        ui.scene
+            .rect(r.x + 1.0, y_start, (r.w - 2.0).max(1.0), y_end - y_start, color);
+    }
+}
+
+/// Vertical L/R VU meter: dark slot, green/yellow/red fill, white peak tick, label.
+fn draw_vu_meter(ui: &mut Ui, r: Rect, lvl_db: f32, peak_db: f32, label: &str) {
+    let t = ui.theme;
+    ui.scene
+        .rounded_rect(r.x, r.y, r.w, r.h, 2.0, t.base, t.border1, 1.0);
+    let top = r.y + r.h * (1.0 - ((lvl_db + 60.0) / 60.0).clamp(0.0, 1.0));
+    meter_segment(ui, r, top, -60.0, -12.0, t.palette_activate);
+    meter_segment(ui, r, top, -12.0, -3.0, t.palette_mark);
+    meter_segment(ui, r, top, -3.0, 0.0, t.palette_alert);
+    let py = (r.y + r.h * (1.0 - ((peak_db + 60.0) / 60.0).clamp(0.0, 1.0))).round();
+    ui.scene.rect(r.x, py, r.w, 1.5, rgb(235, 235, 235));
+    let lfs = t.font_xsmall();
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::SemiBold,
+        ui.font_engine,
+        label,
+        (r.x + 2.0).round(),
+        (r.y + r.h - 3.0).round(),
+        lfs,
+        t.text_dim,
+    );
+}
+
+/// The Mute / Solo toggle cell used by the multitrack mixer strips.
+fn mixer_toggle_cell(
+    ui: &mut Ui,
+    r: Rect,
+    id: u32,
+    label: &str,
+    active: bool,
+    active_col: (u8, u8, u8, u8),
+) -> bool {
+    let t = ui.theme;
+    ui.state.register_focusable(id);
+    let hovered = ui.state.can_hover(id, r);
+    if hovered {
+        ui.state.hovered_id = Some(id);
+    }
+    let mut clicked = false;
+    if hovered && ui.state.mouse_pressed {
+        ui.state.active_id = Some(id);
+        ui.state.focused_id = Some(id);
+        clicked = true;
+    }
+    let fill = if active {
+        active_col
+    } else if hovered {
+        t.shade3
+    } else {
+        t.base
+    };
+    ui.scene
+        .rounded_rect(r.x, r.y, r.w, r.h, t.radius1(), fill, t.border1, 1.0);
+    draw_centered_text(
+        ui,
+        r,
+        label,
+        FontFace::SemiBold,
+        t.font_small(),
+        if active { t.contrast } else { t.text_dim },
+    );
+    ui.draw_focus_ring(id, r, t.radius1());
+    clicked
+}
+
+/// The master-volume pill (icon + horizontal track + fill/thumb).
+fn master_volume_pill(ui: &mut Ui, r: Rect, vol: &mut f32, id: u32) {
+    let t = ui.theme;
+    ui.scene
+        .rounded_rect(r.x, r.y, r.w, r.h, t.radius2(), t.base, t.border1, 1.0);
+    let icon_sz = (t.rem * 1.1).round();
+    ui.scene.icon_centered(
+        ui.text_sys,
+        ICON_VOLUME,
+        r.x + t.rem * 0.7 + icon_sz * 0.5,
+        r.y + r.h * 0.5,
+        icon_sz,
+        t.text_dim,
+    );
+    let track_x0 = r.x + t.rem * 1.5;
+    let track_w = (r.x + r.w - t.rem * 0.6 - track_x0).max(1.0);
+
+    ui.state.register_focusable(id);
+    let hovered = ui.state.can_hover(id, r);
+    if hovered {
+        ui.state.hovered_id = Some(id);
+        if ui.state.double_clicked || ui.state.right_pressed {
+            *vol = 0.85;
+        } else if ui.state.mouse_pressed {
+            ui.state.active_id = Some(id);
+            ui.state.focused_id = Some(id);
+        }
+        if ui.state.wheel_y.abs() > 0.01 {
+            *vol = (*vol + 0.05 * ui.state.wheel_y.signum()).clamp(0.0, 1.0);
+        }
+    }
+    if ui.state.active_id == Some(id) && ui.state.mouse_down {
+        *vol = ((ui.state.cursor.0 - track_x0) / track_w).clamp(0.0, 1.0);
+    }
+
+    let cy = r.y + r.h * 0.5;
+    let th = (t.rem * 0.3).round().max(3.0);
+    let track_bg = if t.dark {
+        rgba(255, 255, 255, 38)
+    } else {
+        rgba(0, 0, 0, 38)
+    };
+    ui.scene.rounded_rect(
+        track_x0,
+        cy - th * 0.5,
+        track_w,
+        th,
+        th * 0.5,
+        track_bg,
+        (0, 0, 0, 0),
+        0.0,
+    );
+    let fill = track_w * vol.clamp(0.0, 1.0);
+    if fill > 0.5 {
+        ui.scene.rounded_rect(
+            track_x0,
+            cy - th * 0.5,
+            fill,
+            th,
+            th * 0.5,
+            t.highlight,
+            (0, 0, 0, 0),
+            0.0,
+        );
+    }
+    let thumb_d = (t.rem * 0.9).round();
+    ui.scene.rounded_rect(
+        track_x0 + fill - thumb_d * 0.5,
+        cy - thumb_d * 0.5,
+        thumb_d,
+        thumb_d,
+        thumb_d * 0.5,
+        t.highlight,
+        (0, 0, 0, 0),
+        0.0,
+    );
+}
+
 
 /// Synthetic library size for the virtualized playlist demos (Phase 1.2).
 const TRACK_COUNT: usize = 10_000;
@@ -659,7 +987,9 @@ impl App {
         quit_at: Option<Instant>,
         prefer_backend: BackendKind,
         font_engine: FontEngine,
+        config: UserConfig,
     ) -> Self {
+        let mixer_stems = default_mixer_stems();
         Self {
             start: Instant::now(),
             reported: false,
@@ -667,8 +997,8 @@ impl App {
             quit_at,
             prefer_backend,
             font_engine,
-            dark_mode: true, // Dark mode by default (accessibility requirement)
-            ui_zoom: 1.0,
+            dark_mode: config.dark_mode, // Dark mode by default (accessibility requirement)
+            ui_zoom: config.ui_zoom.clamp(0.75, 2.0),
             screenshot_path: None,
             window: None,
             renderer: None,
@@ -704,18 +1034,16 @@ impl App {
             selected_soundfont: 0,
             pitch_semitones: 3.0,
             tempo_ratio: 1.18,
-            master_vol: 0.78,
+            master_vol: config.master_vol.clamp(0.0, 1.0),
             stereo_sep: 100.0,
             chk_formant: true,
-            chk_locked: false,
-            sw_hq_mode: true,
-            sw_keep_tray: true,
+            chk_locked: config.chk_locked,
+            sw_hq_mode: config.sw_hq_mode,
+            sw_keep_tray: config.sw_keep_tray,
             radio_interp: 1,
             click_counter: 0,
             scrub_frac: 0.35,
             selected_track: 0,
-            mixer_gains: [0.8, 0.7, 0.75, 0.6],
-            mixer_mutes: [false; 4],
             wave_peaks: audio::synth_wave_peaks(96),
             loop_enabled: false,
             shuffle_enabled: false,
@@ -728,6 +1056,36 @@ impl App {
             playlist: default_playlist(),
             track_meta: None,
             scrub_active: false,
+            dsp: DspAnalyzer::new(48_000),
+            last_dsp_frames: 0,
+            dsp_buf: Vec::new(),
+            dsp_snap: DspSnapshot::default(),
+            mixer_stems,
+            mixer_playing: true,
+            mixer_loop: true,
+            mixer_master_vol: 0.85,
+            mixer_pos_frac: 0.74,
+            config,
+            save_config_req: false,
+            config_status: String::new(),
+        }
+    }
+
+    /// Capture the current UI state as a persistable config and write `user.json`.
+    fn save_config(&mut self) {
+        self.config.dark_mode = self.dark_mode;
+        self.config.ui_zoom = self.ui_zoom;
+        self.config.master_vol = self.master_vol;
+        self.config.chk_locked = self.chk_locked;
+        self.config.sw_hq_mode = self.sw_hq_mode;
+        self.config.sw_keep_tray = self.sw_keep_tray;
+        match self.config.save() {
+            Ok(()) => {
+                self.config_status = format!("Saved to {}", UserConfig::path().display());
+            }
+            Err(e) => {
+                self.config_status = format!("Save failed: {e}");
+            }
         }
     }
 
@@ -1987,11 +2345,33 @@ impl App {
             } else {
                 (theme.shade2.0, theme.shade2.1, theme.shade2.2)
             };
-            let playing = self
-                .audio
-                .as_ref()
-                .map(|a| a.is_playing())
-                .unwrap_or(false);
+            // Phase 3.3 — refresh the DSP snapshot before the UI reads it (Monitoring
+            // only). Feed exactly the frames produced since the last redraw; when the
+            // engine is silent, fall back to a synthetic signal so the panels stay live.
+            if key == "monitoring" {
+                let mut new_frames: Vec<(f32, f32)> = Vec::new();
+                if let Some(a) = &self.audio {
+                    let fp = a
+                        .frames_played
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let delta = fp.saturating_sub(self.last_dsp_frames) as usize;
+                    self.last_dsp_frames = fp;
+                    let tap = a.dsp_tap();
+                    if let Ok(g) = tap.lock() {
+                        g.snapshot_into(&mut self.dsp_buf);
+                    }
+                    if delta > 0 && !self.dsp_buf.is_empty() {
+                        let take = delta.min(self.dsp_buf.len());
+                        let start = self.dsp_buf.len() - take;
+                        new_frames.extend_from_slice(&self.dsp_buf[start..]);
+                    }
+                }
+                if new_frames.is_empty() {
+                    new_frames = synth_dsp_frames(self.t, 2048);
+                }
+                self.dsp.process(&new_frames);
+                self.dsp_snap = self.dsp.snapshot();
+            }
 
             let close_clicked;
             {
@@ -2006,7 +2386,8 @@ impl App {
                     Ui::new(ui_state, scene, &mut self.text_sys, self.font_engine, theme);
 
                 // The Parameters window's header badge follows its active tab.
-                let (hdr_icon, hdr_title, hdr_badge) = if key == "parameters" {
+                let mixer_badge = format!("{} STEMS", self.mixer_stems.len());
+                let (hdr_icon, hdr_title, hdr_badge): (&str, &str, &str) = if key == "parameters" {
                     (
                         ICON_TUNE,
                         "PARAMETERS",
@@ -2016,6 +2397,10 @@ impl App {
                             _ => "TRACKER",
                         },
                     )
+                } else if key == "monitoring" {
+                    (ICON_EQ, "AUDIO MONITORING", "REALTIME DSP")
+                } else if key == "mixer" {
+                    (ICON_EQ, "MULTITRACK PREVIEW", &mixer_badge)
                 } else {
                     (window_header_icon(key), spec.title, window_header_badge(key))
                 };
@@ -2305,175 +2690,610 @@ impl App {
                         (pw - m * 2.0).max(0.0),
                         (ph - hdr_h - m * 2.0).max(80.0),
                     );
-                    ui.nui_card(body, |ui| {
-                        match key {
-                            "monitoring" => {
-                            ui.heading("Real-Time DSP Monitoring");
-                            ui.kv_row(
-                                "Tap:",
-                                "Post-Master · 48 kHz · 32-band spectrum",
-                                Length::rem(4.0),
-                            );
-                            let panel = ui.take_rest();
-                            ui.scene.rounded_rect(
-                                panel.x,
-                                panel.y,
-                                panel.w,
-                                panel.h,
-                                theme.radius2(),
-                                theme.base,
-                                theme.border2,
-                                1.0,
-                            );
-                            ui.scene.push_clip(
-                                panel.x + 1.0,
-                                panel.y + 1.0,
-                                (panel.w - 2.0).max(0.0),
-                                (panel.h - 2.0).max(0.0),
-                            );
-                            // Upper half: 32-band realtime spectrum.
-                            let bands = 32usize;
-                            let inset = (rem * 0.4).round();
-                            let g = (rem * 0.3).round().max(2.0);
-                            let spec_h = panel.h * 0.52;
-                            let bar_w = ((panel.w - inset * 2.0 - g * (bands as f32 - 1.0))
-                                / bands as f32)
-                                .floor()
-                                .max(2.0);
-                            for i in 0..bands {
-                                let phase = self.t * 5.8 + i as f32 * 0.42;
-                                let amp = if playing {
-                                    ((phase.sin() * 0.35
-                                        + (phase * 1.7).cos() * 0.25
-                                        + 0.45)
-                                        * self.master_vol)
-                                        .clamp(0.06, 0.94)
-                                } else {
-                                    (0.14 + 0.08 * (i as f32 * 0.5).sin()) * self.master_vol
-                                };
-                                let bh = ((spec_h - rem * 0.6) * amp).max(2.0);
-                                let bx = panel.x + inset + i as f32 * (bar_w + g);
-                                let by = panel.y + spec_h - rem * 0.4 - bh;
-                                ui.scene.rounded_rect(
-                                    bx,
-                                    by,
-                                    bar_w,
-                                    bh,
-                                    2.0,
+                    let gap = theme.space_half();
+                    match key {
+                        // ====================================================
+                        // Phase 3.3 — AUDIO MONITORING: 2x2 DSP panel grid.
+                        // ====================================================
+                        "monitoring" => {
+                            let snap = &self.dsp_snap;
+                            let [top_row, bot_row] =
+                                ui.rows(body, Length::Px(gap), [Length::fill(), Length::fill()]);
+                            let [tl, tr] = ui.cols(top_row, Length::Px(gap), [Length::fill(), Length::fill()]);
+                            let [bl, br] = ui.cols(bot_row, Length::Px(gap), [Length::fill(), Length::fill()]);
+
+                            // ---- Top-Left: 64-band logarithmic FFT spectrum ----
+                            ui.card(tl, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                                let hdr = ui.take(Length::Rem(1.2));
+                                let fs = theme.font_small();
+                                let baseline = (hdr.y + fs * 0.85).round();
+                                ui.text_clipped(
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    "SPECTRUM",
+                                    hdr.x.round(),
+                                    baseline,
+                                    fs,
+                                    hdr.w,
+                                    theme.text_dim,
+                                );
+                                let peak_txt =
+                                    format!("Peak: {:.0}Hz ({:+.1}dB)", snap.peak_hz, snap.peak_db);
+                                let ptw = ui.text_sys.measure(
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &peak_txt,
+                                    fs,
+                                );
+                                ui.scene.text(
+                                    ui.text_sys,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &peak_txt,
+                                    (hdr.x + hdr.w - ptw).round(),
+                                    baseline,
+                                    fs,
                                     theme.highlight,
-                                    (0, 0, 0, 0),
-                                    0.0,
                                 );
-                            }
-                            // Lower half: oscilloscope curve (`kind = 4` polyline).
-                            let scope = Rect::new(
-                                panel.x + inset,
-                                panel.y + spec_h,
-                                (panel.w - inset * 2.0).max(0.0),
-                                (panel.h - spec_h - inset).max(0.0),
-                            );
-                            let pts: Vec<(f32, f32)> = (0..=96)
-                                .map(|i| {
-                                    let nx = i as f32 / 96.0;
-                                    let phase = self.t * 6.0 + nx * std::f32::consts::TAU * 2.0;
-                                    let amp = 0.42 * phase.sin()
-                                        + 0.20 * (phase * 2.3).cos()
-                                        + 0.12 * (phase * 4.1).sin();
-                                    let ny =
-                                        (0.5 + amp * self.master_vol.max(0.2)).clamp(0.05, 0.95);
-                                    (nx, ny)
-                                })
-                                .collect();
-                            ui.polyline(scope, &pts, 2.0, theme.palette_mark);
-                            ui.scene.pop_clip();
+                                let canvas = ui.take_rest();
+                                ui.scene.rounded_rect(
+                                    canvas.x, canvas.y, canvas.w, canvas.h, theme.radius1(),
+                                    theme.base, theme.border1, 1.0,
+                                );
+                                ui.scene.push_clip(
+                                    canvas.x + 1.0, canvas.y + 1.0,
+                                    (canvas.w - 2.0).max(1.0), (canvas.h - 2.0).max(1.0),
+                                );
+                                for f in [50.0f32, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0] {
+                                    let nx = (f / 20.0).ln() / (20000.0f32 / 20.0).ln();
+                                    let gx = (canvas.x + nx * canvas.w).round();
+                                    ui.scene.rect(gx, canvas.y, 1.0, canvas.h, theme.border1);
+                                }
+                                for db in [-12.0f32, -24.0, -36.0, -48.0] {
+                                    let ny = (db + 60.0) / 60.0;
+                                    let gy = (canvas.y + (1.0 - ny) * canvas.h).round();
+                                    ui.scene.rect(canvas.x, gy, canvas.w, 1.0, theme.border1);
+                                }
+                                let n = BANDS;
+                                let bgap = 1.0f32;
+                                let bw = ((canvas.w - bgap * (n as f32 - 1.0)) / n as f32).max(1.0);
+                                for i in 0..n {
+                                    let h = ((snap.spectrum_db[i] + 60.0) / 60.0).clamp(0.0, 1.0)
+                                        * canvas.h;
+                                    if h > 0.5 {
+                                        let bx = canvas.x + i as f32 * (bw + bgap);
+                                        ui.scene.rounded_rect(
+                                            bx, canvas.y + canvas.h - h, bw, h, 1.5,
+                                            theme.highlight, (0, 0, 0, 0), 0.0,
+                                        );
+                                    }
+                                }
+                                let pts: Vec<(f32, f32)> = (0..n)
+                                    .map(|i| {
+                                        (
+                                            (i as f32 + 0.5) / n as f32,
+                                            ((snap.peak_hold_db[i] + 60.0) / 60.0).clamp(0.0, 1.0),
+                                        )
+                                    })
+                                    .collect();
+                                ui.polyline(canvas, &pts, 1.5, rgb(235, 235, 235));
+                                ui.scene.pop_clip();
+                            });
+
+                            // ---- Top-Right: zero-crossing-stabilized oscilloscope ----
+                            ui.card(tr, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                                let hdr = ui.take(Length::Rem(1.2));
+                                let fs = theme.font_small();
+                                let baseline = (hdr.y + fs * 0.85).round();
+                                ui.text_clipped(
+                                    FontFace::SemiBold, ui.font_engine, "OSCILLOSCOPE",
+                                    hdr.x.round(), baseline, fs, hdr.w, theme.text_dim,
+                                );
+                                let rms_txt = format!("RMS: {:+.1} dB", snap.rms_db);
+                                let rtw = ui.text_sys.measure(
+                                    FontFace::SemiBold, ui.font_engine, &rms_txt, fs,
+                                );
+                                ui.scene.text(
+                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &rms_txt,
+                                    (hdr.x + hdr.w - rtw).round(), baseline, fs, theme.highlight,
+                                );
+                                let canvas = ui.take_rest();
+                                ui.scene.rounded_rect(
+                                    canvas.x, canvas.y, canvas.w, canvas.h, theme.radius1(),
+                                    theme.base, theme.border1, 1.0,
+                                );
+                                ui.scene.push_clip(
+                                    canvas.x + 1.0, canvas.y + 1.0,
+                                    (canvas.w - 2.0).max(1.0), (canvas.h - 2.0).max(1.0),
+                                );
+                                for ny in [0.75f32, 0.5, 0.25] {
+                                    let gy = (canvas.y + (1.0 - ny) * canvas.h).round();
+                                    ui.scene.rect(canvas.x, gy, canvas.w, 1.0, theme.border1);
+                                }
+                                ui.polyline(canvas, &snap.osc_points, 2.0, theme.highlight);
+                                ui.scene.pop_clip();
+                            });
+
+                            // ---- Bottom-Left: stereo goniometer + correlation ----
+                            ui.card(bl, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                                let hdr = ui.take(Length::Rem(1.2));
+                                let fs = theme.font_small();
+                                let baseline = (hdr.y + fs * 0.85).round();
+                                ui.text_clipped(
+                                    FontFace::SemiBold, ui.font_engine, "STEREO FIELD (GONIOMETER)",
+                                    hdr.x.round(), baseline, fs, hdr.w, theme.text_dim,
+                                );
+                                let corr_txt = format!("Correlation: {:+.2}", snap.correlation);
+                                let ctw = ui.text_sys.measure(
+                                    FontFace::SemiBold, ui.font_engine, &corr_txt, fs,
+                                );
+                                ui.scene.text(
+                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &corr_txt,
+                                    (hdr.x + hdr.w - ctw).round(), baseline, fs, theme.highlight,
+                                );
+                                let rest = ui.take_rest();
+                                let [radar, corr] = ui.rows(
+                                    rest, Length::Px(theme.space_half()),
+                                    [Length::fill(), Length::rem(1.5)],
+                                );
+                                ui.scene.rounded_rect(
+                                    radar.x, radar.y, radar.w, radar.h, theme.radius1(),
+                                    theme.base, theme.border1, 1.0,
+                                );
+                                let cx = radar.x + radar.w * 0.5;
+                                let cy = radar.y + radar.h * 0.5;
+                                let rad = (radar.w.min(radar.h) * 0.5 - 8.0).max(4.0);
+                                let tau = std::f32::consts::TAU;
+                                for i in 0..32 {
+                                    let a0 = i as f32 / 32.0 * tau;
+                                    let a1 = (i + 1) as f32 / 32.0 * tau;
+                                    ui.scene.line(
+                                        cx + rad * a0.cos(), cy + rad * a0.sin(),
+                                        cx + rad * a1.cos(), cy + rad * a1.sin(),
+                                        1.0, theme.border2,
+                                    );
+                                }
+                                let d = rad * 0.7071;
+                                ui.scene.line(cx - d, cy + d, cx + d, cy - d, 1.0, theme.border1);
+                                ui.scene.line(cx - d, cy - d, cx + d, cy + d, 1.0, theme.border1);
+                                ui.scene.line(cx, cy - rad, cx, cy + rad, 1.0, theme.border1);
+                                ui.scene.line(cx - rad, cy, cx + rad, cy, 1.0, theme.border1);
+                                let lfs = theme.font_xsmall();
+                                for (lbl, lx, ly) in [
+                                    ("L", cx - d - 12.0, cy - d + 4.0),
+                                    ("R", cx + d + 2.0, cy + d + 6.0),
+                                    ("+M", cx + 3.0, cy - rad + 6.0),
+                                    ("-S", cx + 3.0, cy + rad),
+                                ] {
+                                    ui.scene.text(
+                                        ui.text_sys, FontFace::SemiBold, ui.font_engine, lbl,
+                                        lx.round(), ly.round(), lfs, theme.text_muted,
+                                    );
+                                }
+                                ui.polyline(radar, &snap.gonio_points, 1.5, theme.highlight);
+
+                                // Phase correlation bar: centre 0, fill toward ±1.
+                                ui.scene.rounded_rect(
+                                    corr.x, corr.y, corr.w, corr.h, theme.radius1(),
+                                    theme.base, theme.border1, 1.0,
+                                );
+                                let mid = (corr.x + corr.w * 0.5).round();
+                                ui.scene.rect(mid - 1.0, corr.y + 2.0, 2.0, corr.h - 4.0, theme.border3);
+                                let c = snap.correlation.clamp(-1.0, 1.0);
+                                let half = corr.w * 0.5;
+                                let (bx0, bwid) = if c >= 0.0 {
+                                    (mid, half * c)
+                                } else {
+                                    (mid + half * c, -half * c)
+                                };
+                                if bwid > 0.5 {
+                                    ui.scene.rect(bx0, corr.y + 2.0, bwid, corr.h - 4.0, theme.highlight);
+                                }
+                                let lfs2 = theme.font_xsmall();
+                                ui.scene.text(
+                                    ui.text_sys, FontFace::Regular, ui.font_engine, "-1",
+                                    (corr.x + 3.0).round(), (corr.y + corr.h * 0.5 + 4.0).round(),
+                                    lfs2, theme.text_muted,
+                                );
+                                ui.scene.text(
+                                    ui.text_sys, FontFace::Regular, ui.font_engine, "+1",
+                                    (corr.x + corr.w - 16.0).round(),
+                                    (corr.y + corr.h * 0.5 + 4.0).round(), lfs2, theme.text_muted,
+                                );
+                            });
+
+                            // ---- Bottom-Right: meters + BS.1770 loudness ----
+                            ui.card(br, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                                let hdr = ui.take(Length::Rem(1.2));
+                                let fs = theme.font_small();
+                                let baseline = (hdr.y + fs * 0.85).round();
+                                ui.text_clipped(
+                                    FontFace::SemiBold, ui.font_engine, "LEVELS & LOUDNESS (LUFS)",
+                                    hdr.x.round(), baseline, fs, hdr.w, theme.text_dim,
+                                );
+                                let int_txt = format!("Int: {:+.1} LUFS", snap.integrated_lufs);
+                                let itw = ui.text_sys.measure(
+                                    FontFace::SemiBold, ui.font_engine, &int_txt, fs,
+                                );
+                                ui.scene.text(
+                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &int_txt,
+                                    (hdr.x + hdr.w - itw).round(), baseline, fs, theme.highlight,
+                                );
+                                let rest = ui.take_rest();
+                                let [meters_r, lufs_r] = ui.cols(
+                                    rest, Length::Px(theme.space_half()),
+                                    [Length::rem(6.0), Length::fill()],
+                                );
+                                let [lm, sm, rm] = ui.cols(
+                                    meters_r, Length::Px(2.0),
+                                    [Length::fill(), Length::rem(1.5), Length::fill()],
+                                );
+                                draw_vu_meter(ui, lm, snap.vu_l_db, snap.peak_l_db, "L");
+                                draw_vu_meter(ui, rm, snap.vu_r_db, snap.peak_r_db, "R");
+                                let sfs = theme.font_xsmall();
+                                for (db, lbl) in [
+                                    (0.0f32, "0"), (-12.0, "-12"), (-24.0, "-24"),
+                                    (-36.0, "-36"), (-48.0, "-48"),
+                                ] {
+                                    let y = sm.y
+                                        + (1.0 - ((db + 60.0) / 60.0).clamp(0.0, 1.0)) * sm.h;
+                                    ui.scene.text(
+                                        ui.text_sys, FontFace::Regular, ui.font_engine, lbl,
+                                        sm.x.round(), (y + 3.0).round(), sfs, theme.text_muted,
+                                    );
+                                }
+                                let [grid_r, btn_row] = ui.rows(
+                                    lufs_r, Length::Px(theme.space_half()),
+                                    [Length::fill(), Length::rem(2.1)],
+                                );
+                                let [r0, r1] = ui.rows(
+                                    grid_r, Length::Px(theme.space_half()),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                let [a0, a1] = ui.cols(
+                                    r0, Length::Px(theme.space_half()),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                let [b0, b1] = ui.cols(
+                                    r1, Length::Px(theme.space_half()),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                draw_readout(ui, a0, "MOMENTARY", &format!("{:+.1} LUFS", snap.momentary_lufs));
+                                draw_readout(ui, a1, "SHORT-TERM", &format!("{:+.1} LUFS", snap.short_term_lufs));
+                                draw_readout(ui, b0, "INTEGRATED", &format!("{:+.1} LUFS", snap.integrated_lufs));
+                                draw_readout(ui, b1, "TRUE PEAK", &format!("{:+.1} dBTP", snap.true_peak_dbtp));
+                                let bw2 = Length::Rem(8.0).resolve(rem).round();
+                                let btn = Rect::new(btn_row.x + btn_row.w - bw2, btn_row.y, bw2, btn_row.h);
+                                if ui.button(
+                                    1290, btn, "RESET LUFS", ICON_RESTART, ButtonVariant::Outline,
+                                ) {
+                                    self.dsp.reset_lufs();
+                                }
+                            });
                         }
+
+                        // ====================================================
+                        // Phase 3.4 — MULTITRACK PREVIEW mixer.
+                        // ====================================================
                         "mixer" => {
-                            ui.heading("Multi-Track Stem Mixer");
-                            ui.kv_row(
-                                "Session:",
-                                "4 stems · 48 kHz · synchronized preview",
-                                Length::rem(4.0),
+                            let pad = Length::Rem(1.25).resolve(rem).round();
+                            let inner = Rect::new(
+                                pad, hdr_h + pad,
+                                (pw - pad * 2.0).max(0.0),
+                                (ph - hdr_h - pad * 2.0).max(0.0),
                             );
-                            for i in 0..4usize {
-                                let stem = TRACK_ARTISTS[i % TRACK_ARTISTS.len()];
-                                let gain_lbl = format!("{:.0}%", self.mixer_gains[i] * 100.0);
-                                let [sld_r, mute_r] = ui.take_cols(
-                                    Length::rem(2.4),
-                                    Length::rem(1.0),
-                                    [Length::fill(), Length::rem(9.0)],
+                            let toolbar_h = Length::Rem(2.5).resolve(rem).round();
+                            let seek_h = Length::Rem(2.4).resolve(rem).round();
+                            let toolbar = Rect::new(inner.x, inner.y, inner.w, toolbar_h);
+
+                            // ---- Top toolbar: transport + master volume ----
+                            let sq = Length::Rem(2.5).resolve(rem).round();
+                            let bh = Length::Rem(2.3).resolve(rem).round();
+                            let bgap = Length::Rem(0.4).resolve(rem).round();
+                            let by = toolbar.y + (toolbar.h - bh) * 0.5;
+                            let play_icon = if self.mixer_playing { ICON_PAUSE } else { ICON_PLAY };
+                            if ui.button(1301, Rect::new(toolbar.x, by, sq, bh), "", play_icon, ButtonVariant::Outline) {
+                                self.mixer_playing = !self.mixer_playing;
+                            }
+                            if ui.button(1302, Rect::new(toolbar.x + (sq + bgap), by, sq, bh), "", ICON_RESTART, ButtonVariant::Outline) {
+                                self.mixer_pos_frac = 0.0;
+                            }
+                            let loop_var = if self.mixer_loop { ButtonVariant::Primary } else { ButtonVariant::Outline };
+                            if ui.button(1303, Rect::new(toolbar.x + (sq + bgap) * 2.0, by, sq, bh), "", ICON_LOOP, loop_var) {
+                                self.mixer_loop = !self.mixer_loop;
+                            }
+                            let vol_w = Length::Rem(15.0).resolve(rem).round();
+                            let vol_r = Rect::new(toolbar.x + toolbar.w - vol_w, by, vol_w, bh);
+                            master_volume_pill(&mut ui, vol_r, &mut self.mixer_master_vol, 1304);
+
+                            // ---- Channel strip matrix ----
+                            let matrix_y = toolbar.y + toolbar.h + gap;
+                            let seek_y = inner.y + inner.h - seek_h;
+                            let matrix = Rect::new(
+                                inner.x, matrix_y, inner.w, (seek_y - matrix_y - gap).max(40.0),
+                            );
+                            let n = self.mixer_stems.len().max(1);
+                            let col_gap = Length::Rem(0.4).resolve(rem).round();
+                            let plus_w = Length::Rem(3.2).resolve(rem).round();
+                            let strip_w = ((matrix.w - plus_w - col_gap * n as f32) / n as f32)
+                                .max(24.0)
+                                .floor();
+                            let any_solo = self.mixer_stems.iter().any(|s| s.solo);
+                            let m_h = Length::Rem(1.55).resolve(rem).round();
+                            let lbl_h = Length::Rem(1.65).resolve(rem).round();
+                            let cgap = 2.0f32;
+                            let fader_h = (matrix.h - (m_h + m_h + lbl_h) - cgap * 4.0).max(30.0);
+                            let mut remove_i: Option<usize> = None;
+
+                            for i in 0..n {
+                                let x = matrix.x + i as f32 * (strip_w + col_gap);
+                                let mut y = matrix.y;
+
+                                // Mute cell
+                                let m_r = Rect::new(x, y, strip_w, m_h);
+                                y += m_h + cgap;
+                                let is_muted = self.mixer_stems[i].muted;
+                                if mixer_toggle_cell(&mut ui, m_r, 1310 + i as u32, "M", is_muted, theme.palette_alert) {
+                                    self.mixer_stems[i].muted = !is_muted;
+                                }
+
+                                // Solo cell
+                                let s_r = Rect::new(x, y, strip_w, m_h);
+                                y += m_h + cgap;
+                                let is_solo = self.mixer_stems[i].solo;
+                                if mixer_toggle_cell(&mut ui, s_r, 1330 + i as u32, "S", is_solo, theme.palette_mark) {
+                                    self.mixer_stems[i].solo = !is_solo;
+                                }
+
+                                // Tall touch-friendly vertical fader + green VU
+                                let fader_r = Rect::new(x, y, strip_w, fader_h);
+                                y += fader_h + cgap;
+                                let fid = 1350 + i as u32;
+                                ui.state.register_focusable(fid);
+                                let fhov = ui.state.can_hover(fid, fader_r);
+                                let mut gain = self.mixer_stems[i].gain;
+                                if fhov {
+                                    ui.state.hovered_id = Some(fid);
+                                    if ui.state.double_clicked || ui.state.right_pressed {
+                                        gain = 1.0;
+                                    } else if ui.state.mouse_pressed {
+                                        ui.state.active_id = Some(fid);
+                                        ui.state.focused_id = Some(fid);
+                                    }
+                                    if ui.state.wheel_y.abs() > 0.01 {
+                                        gain = (gain + 0.05 * ui.state.wheel_y.signum()).clamp(0.0, 2.0);
+                                    }
+                                }
+                                if ui.state.active_id == Some(fid) && ui.state.mouse_down {
+                                    gain = ((1.0 - (ui.state.cursor.1 - fader_r.y) / fader_r.h) * 2.0)
+                                        .clamp(0.0, 2.0);
+                                }
+                                self.mixer_stems[i].gain = gain;
+
+                                ui.scene.rounded_rect(
+                                    fader_r.x, fader_r.y, fader_r.w, fader_r.h, theme.radius1(),
+                                    theme.base, theme.border1, 1.0,
                                 );
-                                ui.slider(
-                                    720 + i as u32,
-                                    sld_r,
-                                    stem,
-                                    &mut self.mixer_gains[i],
-                                    0.0,
-                                    1.0,
-                                    0.8,
-                                    &gain_lbl,
+                                let lvl = if self.mixer_stems[i].muted
+                                    || (any_solo && !self.mixer_stems[i].solo)
+                                {
+                                    0.0
+                                } else {
+                                    let phase = self.t * 2.2 + i as f32 * 0.6;
+                                    let base = 0.45 + 0.35 * (phase.sin() * 0.5 + 0.5);
+                                    (base * gain.min(1.0)).clamp(0.0, 1.0)
+                                };
+                                let vu_h = (fader_r.h * lvl).clamp(0.0, fader_r.h);
+                                if vu_h > 1.0 {
+                                    ui.scene.rect(
+                                        fader_r.x + 1.0, fader_r.y + fader_r.h - vu_h,
+                                        (fader_r.w - 2.0).max(1.0), vu_h, rgb(58, 175, 52),
+                                    );
+                                }
+                                let line_y = (fader_r.y
+                                    + fader_r.h * (1.0 - (gain / 2.0).clamp(0.0, 1.0)))
+                                    .round();
+                                ui.scene.rect(fader_r.x, line_y, fader_r.w, 1.5, rgb(230, 230, 230));
+                                draw_text_at(
+                                    &mut ui, fader_r.x + fader_r.w * 0.5, line_y - 5.0,
+                                    &format!("{:.2}", gain), FontFace::SemiBold,
+                                    theme.font_xsmall(), rgb(245, 245, 245),
                                 );
-                                ui.checkbox(
-                                    730 + i as u32,
-                                    mute_r,
-                                    "Mute",
-                                    &mut self.mixer_mutes[i],
+                                ui.draw_focus_ring(fid, fader_r, theme.radius1());
+
+                                // Horizontal pan cell
+                                let pan_r = Rect::new(x, y, strip_w, m_h);
+                                y += m_h + cgap;
+                                let pid = 1370 + i as u32;
+                                ui.state.register_focusable(pid);
+                                let phov = ui.state.can_hover(pid, pan_r);
+                                let mut pan = self.mixer_stems[i].pan;
+                                if phov {
+                                    ui.state.hovered_id = Some(pid);
+                                    if ui.state.double_clicked || ui.state.right_pressed {
+                                        pan = 0.0;
+                                    } else if ui.state.mouse_pressed {
+                                        ui.state.active_id = Some(pid);
+                                        ui.state.focused_id = Some(pid);
+                                    }
+                                    if ui.state.wheel_y.abs() > 0.01 {
+                                        pan = (pan + 0.05 * ui.state.wheel_y.signum()).clamp(-1.0, 1.0);
+                                    }
+                                }
+                                if ui.state.active_id == Some(pid) && ui.state.mouse_down {
+                                    pan = (((ui.state.cursor.0 - pan_r.x) / pan_r.w) * 2.0 - 1.0)
+                                        .clamp(-1.0, 1.0);
+                                }
+                                self.mixer_stems[i].pan = pan;
+                                ui.scene.rounded_rect(
+                                    pan_r.x, pan_r.y, pan_r.w, pan_r.h, theme.radius1(),
+                                    theme.base, theme.border1, 1.0,
+                                );
+                                let px = (pan_r.x + 4.0
+                                    + (pan_r.w - 8.0) * ((pan + 1.0) * 0.5))
+                                    .round();
+                                let tick_h = pan_r.h * 0.55;
+                                ui.scene.rect(
+                                    px - 1.0, pan_r.y + (pan_r.h - tick_h) * 0.5,
+                                    2.0, tick_h, rgb(230, 230, 230),
+                                );
+
+                                // Bottom label + remove ×
+                                let lbl_r = Rect::new(x, y, strip_w, lbl_h);
+                                ui.scene.rounded_rect(
+                                    lbl_r.x, lbl_r.y, lbl_r.w, lbl_r.h, theme.radius1(),
+                                    theme.base, theme.border1, 1.0,
+                                );
+                                let lfs = theme.font_xsmall();
+                                let num = format!("{:02}", self.mixer_stems[i].number);
+                                ui.scene.text(
+                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &num,
+                                    (lbl_r.x + 5.0).round(),
+                                    (lbl_r.y + lbl_r.h * 0.5 + lfs * 0.34).round(),
+                                    lfs, theme.text_dim,
+                                );
+                                let xbtn = (rem * 1.2).round();
+                                let xr = Rect::new(
+                                    lbl_r.x + lbl_r.w - xbtn - 2.0,
+                                    lbl_r.y + (lbl_r.h - xbtn) * 0.5, xbtn, xbtn,
+                                );
+                                if ui.button(1390 + i as u32, xr, "", ICON_CLOSE, ButtonVariant::Ghost) {
+                                    remove_i = Some(i);
+                                }
+                            }
+
+                            if let Some(i) = remove_i {
+                                if self.mixer_stems.len() > 1 {
+                                    self.mixer_stems.remove(i);
+                                }
+                            }
+
+                            // `+` add-stem column (up to 20 stems).
+                            let plus_r = Rect::new(
+                                matrix.x + matrix.w - plus_w, matrix.y, plus_w, matrix.h,
+                            );
+                            if ui.button(1340, plus_r, "", ICON_ADD, ButtonVariant::Outline) {
+                                if self.mixer_stems.len() < 20 {
+                                    let num = self.mixer_stems.len() + 1;
+                                    self.mixer_stems.push(MixerStem {
+                                        number: num, gain: 1.0, pan: 0.0,
+                                        muted: false, solo: false,
+                                    });
+                                }
+                            }
+
+                            // ---- Bottom seekbar + time readouts ----
+                            let bar_h = 6.0f32;
+                            let bar_r = Rect::new(inner.x, seek_y + 3.0, inner.w, bar_h);
+                            ui.scene.rounded_rect(
+                                bar_r.x, bar_r.y, bar_r.w, bar_h, bar_h * 0.5,
+                                theme.base, theme.border1, 1.0,
+                            );
+                            let played = bar_r.w * self.mixer_pos_frac.clamp(0.0, 1.0);
+                            if played > 0.5 {
+                                ui.scene.rounded_rect(
+                                    bar_r.x, bar_r.y, played, bar_h, bar_h * 0.5,
+                                    rgb(180, 180, 180), (0, 0, 0, 0), 0.0,
                                 );
                             }
-                            let [apply_r] = ui.take_form_row(false, [Length::fill()]);
-                            let _ = ui.button(
-                                740,
-                                apply_r,
-                                "Apply Mix Downstem",
-                                "",
-                                ButtonVariant::Primary,
+                            let sid = 1305u32;
+                            ui.state.register_focusable(sid);
+                            let hit = Rect::new(bar_r.x, bar_r.y - 5.0, bar_r.w, bar_h + 10.0);
+                            let shov = ui.state.can_hover(sid, hit);
+                            if shov && ui.state.mouse_pressed {
+                                ui.state.active_id = Some(sid);
+                            }
+                            if ui.state.active_id == Some(sid) && ui.state.mouse_down {
+                                self.mixer_pos_frac =
+                                    ((ui.state.cursor.0 - bar_r.x) / bar_r.w).clamp(0.0, 1.0);
+                            }
+                            let tfs = theme.font_xsmall();
+                            let tbase = (seek_y + seek_h - 2.0).round();
+                            ui.scene.text(
+                                ui.text_sys, FontFace::SemiBold, ui.font_engine, "2:34",
+                                inner.x.round(), tbase, tfs, theme.text_dim,
+                            );
+                            let tot = "3:26";
+                            let tw = ui.text_sys.measure(FontFace::SemiBold, ui.font_engine, tot, tfs);
+                            ui.scene.text(
+                                ui.text_sys, FontFace::SemiBold, ui.font_engine, tot,
+                                (inner.x + inner.w - tw).round(), tbase, tfs, theme.text_dim,
                             );
                         }
+
+                        // ====================================================
+                        // Phase 3.5 — Settings (persistent user.json).
+                        // ====================================================
                         "settings" => {
-                            ui.heading("Settings");
-                            let sel_rate = ui.input_group("Default Sample Rate");
-                            ui.select(750, sel_rate, SAMPLE_RATES, &mut self.selected_rate);
-                            let sel_sf = ui.input_group("MIDI SoundFont (.sf2)");
-                            ui.select(751, sel_sf, SOUNDFONTS, &mut self.selected_soundfont);
-                            let [c1, c2] = ui.take_cols(
-                                Length::rem(2.0),
-                                Length::rem(1.0),
-                                [Length::fill(), Length::fill()],
-                            );
-                            ui.checkbox(
-                                752,
-                                c1,
-                                "Keep Running in System Tray",
-                                &mut self.sw_keep_tray,
-                            );
-                            ui.checkbox(753, c2, "HQ Oversampling", &mut self.sw_hq_mode);
-                            let [apply_r] = ui.take_form_row(false, [Length::fill()]);
-                            let _ =
-                                ui.button(754, apply_r, "Apply & Save", "", ButtonVariant::Primary);
+                            ui.nui_card(body, |ui| {
+                                let sel_dev = ui.input_group("Default Output Device");
+                                let sel_rate = ui.input_group("Default Sample Rate");
+                                let sel_sf = ui.input_group("MIDI SoundFont (.sf2)");
+                                let [c1, c2] = ui.take_cols(
+                                    Length::rem(1.8), Length::rem(1.0),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                ui.checkbox(752, c1, "Keep Running in System Tray", &mut self.sw_keep_tray);
+                                ui.checkbox(753, c2, "HQ Oversampling", &mut self.sw_hq_mode);
+                                let [c3, c4] = ui.take_cols(
+                                    Length::rem(1.8), Length::rem(1.0),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                ui.checkbox(754, c3, "Lock Parameters Across Tracks", &mut self.chk_locked);
+                                ui.checkbox(755, c4, "Dark Mode (Accessibility Default)", &mut self.dark_mode);
+                                let [apply_r] = ui.take_form_row(true, [Length::fill()]);
+                                if ui.button(756, apply_r, "Save Configuration", ICON_SETTINGS, ButtonVariant::Primary) {
+                                    self.save_config_req = true;
+                                }
+                                let fs = theme.font_xsmall();
+                                ui.text_clipped(
+                                    FontFace::Regular, ui.font_engine, &self.config_status,
+                                    apply_r.x.round(), (apply_r.y + apply_r.h + fs * 1.1).round(),
+                                    fs, apply_r.w, theme.text_muted,
+                                );
+                                // Render selects last so open popups layer above siblings
+                                ui.select(760, sel_dev, DEVICES, &mut self.selected_device);
+                                ui.select(750, sel_rate, SAMPLE_RATES, &mut self.selected_rate);
+                                ui.select(751, sel_sf, SOUNDFONTS, &mut self.selected_soundfont);
+                            });
                         }
+
+                        // ---- Help: two-column keyboard-shortcut table ----
                         _ => {
-                            ui.heading("Keyboard Shortcuts & Help");
-                            for (k, v) in [
-                                (
-                                    "P / N / M / S / H",
-                                    "Pop open or hide Parameters / Monitoring / Mixer / Settings / this window",
-                                ),
-                                (
-                                    "Drag header",
-                                    "Move this undecorated window; the red button (or Esc) hides it",
-                                ),
-                                ("Space", "Play / Pause transport"),
-                                (
-                                    "B / F / T",
-                                    "Toggle GPU-CPU backend / Swash-Fontdue engine / dark-light theme",
-                                ),
-                                ("Ctrl +  / - / 0", "UI zoom in / out / reset"),
-                                ("Esc (main window)", "Quit SoundApp"),
-                            ] {
-                                ui.kv_row(k, v, Length::rem(7.5));
-                            }
+                            ui.nui_card(body, |ui| {
+                                let table = ui.take_rest();
+                                let [lc, rc] = ui.cols(
+                                    table, Length::rem(1.25), [Length::fill(), Length::fill()],
+                                );
+                                let half = HELP_ROWS.len().div_ceil(2);
+                                let rh = (table.h / half.max(1) as f32).floor().min((rem * 2.0).round());
+                                let kfs = theme.font_xsmall();
+                                let dfs = theme.font_small();
+                                let kw = Length::Rem(8.5).resolve(rem).round();
+                                for (idx, &(k, v)) in HELP_ROWS.iter().enumerate() {
+                                    let (col, row) = if idx < half { (lc, idx) } else { (rc, idx - half) };
+                                    let y = (col.y + row as f32 * rh).round();
+                                    let kbd_h = (rh - 6.0).max(16.0);
+                                    let kbd_y = (y + (rh - kbd_h) * 0.5).round();
+                                    let kbd_w = (kw - 10.0).max(24.0);
+                                    ui.scene.rounded_rect(
+                                        col.x, kbd_y, kbd_w, kbd_h, theme.radius1(),
+                                        theme.base, theme.border3, 1.0,
+                                    );
+                                    let baseline = (y + rh * 0.5 + dfs * 0.34).round();
+                                    ui.text_clipped(
+                                        FontFace::SemiBold, ui.font_engine, k,
+                                        (col.x + 6.0).round(), baseline, kfs, kbd_w - 12.0, theme.highlight,
+                                    );
+                                    ui.text_clipped(
+                                        FontFace::Regular, ui.font_engine, v,
+                                        (col.x + kw).round(), baseline, dfs,
+                                        (col.w - kw).max(0.0), theme.text,
+                                    );
+                                }
+                            });
                         }
                     }
-                });
                 } // non-parameters secondary windows
 
                 ui.scene.finish_frame();
@@ -2481,6 +3301,16 @@ impl App {
             }
             (w, h, close_clicked, shot)
         };
+
+        // Phase 3.5 — the Settings window's "Save Configuration" button persists
+        // `user.json` (applied here, after the scene-build borrow has ended).
+        if self.save_config_req {
+            self.save_config_req = false;
+            self.save_config();
+            if let Some(mw) = self.secondary_windows.find_by_key_mut("settings") {
+                mw.window.request_redraw();
+            }
+        }
 
         // --- Phase 3.2 Parameters-window intents: forward every change to the
         // engine immediately (same frame), then refresh the main window's
@@ -2869,8 +3699,7 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(q) = self.quit_at {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {        if let Some(q) = self.quit_at {
             if Instant::now() >= q {
                 if !self.quitting {
                     self.quitting = true;
@@ -2908,6 +3737,19 @@ impl ApplicationHandler for App {
         match next {
             Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
+    /// Phase 3.5 — auto-save the configuration on a clean exit.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.config.dark_mode = self.dark_mode;
+        self.config.ui_zoom = self.ui_zoom;
+        self.config.master_vol = self.master_vol;
+        self.config.chk_locked = self.chk_locked;
+        self.config.sw_hq_mode = self.sw_hq_mode;
+        self.config.sw_keep_tray = self.sw_keep_tray;
+        if let Err(e) = self.config.save() {
+            eprintln!("[poc] config save failed: {e}");
         }
     }
 }
@@ -3007,7 +3849,10 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let quit_at = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
-    let mut app = App::new(audio, animate, quit_at, backend, font_engine);
+    // Phase 3.5 — restore the persisted configuration before building the app.
+    let cfg = UserConfig::load();
+    println!("[poc] config: {}", UserConfig::path().display());
+    let mut app = App::new(audio, animate, quit_at, backend, font_engine, cfg);
     // Push the initial UI state into the engine (gain + the full parameter set).
     let initial_params = app.playback_params();
     let initial_vol = app.master_vol;

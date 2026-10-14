@@ -30,13 +30,21 @@ soundApp_R/
       assets/fonts/       # OpenSans-Regular, OpenSans-SemiBold, MaterialIcons-Regular
       src/
         lib.rs            # Public exports
-        render.rs         # Unified Scene display-list + Dual Backend (GPU OpenGL 3.3 SDF + CPU Softbuffer)
+        render.rs         # Unified Scene display-list + Dual Backend (GPU OpenGL 3.3 SDF + CPU Softbuffer, kind 0..4)
         text.rs           # Swash OpenType shaping + Skrifa hinting + 4x subpixel + linear-light Gamma LUT
-        widgets.rs        # nui_wc2 v3.0.0 "slate" theme tokens & interactive widgets
+        widgets.rs        # nui_wc2 v3.0.0 "slate" theme tokens, interactive widgets, virtual_list, waveform, polyline, Win32 clipboard, dropzone
+        layout.rs         # Declarative layout engine (Length, cols, rows, layout_grid, card, nui_card, input_group, form_field)
+        window.rs         # Multi-Window Manager (WindowManager, ManagedWindow, shared TextSystem atlas_gen sync)
     soundapp/             # SoundApp application crate (`soundapp_r` binary)
+      build.rs            # Compiles ffmpeg_bridge.cpp against FFmpeg 7+ headers/libs and stages runtime DLLs
       src/
-        main.rs           # Winit ApplicationHandler, NUI component showcase & player shell
-        audio.rs          # Lock-free rtrb ring buffer + cpal output + streaming decode
+        main.rs           # Winit ApplicationHandler, Main Player (compact & studio), Parameters, Monitoring, Mixer, Settings & Help windows
+        audio.rs          # Lock-free rtrb ring buffer + cpal output + cosine fades + 8-tap Lanczos + WSOLA pitch/tempo/formant
+        ffmpeg_bridge.cpp # C ABI bridge over SoundApp's FFmpegDecoder (decoding, seeking, metadata, rubberband/atempo filter graph)
+        midi.rs           # Pure-Rust SF2 SoundFont synthesizer & SMF sequencer (rustysynth + metronome + transpose/BPM)
+        tracker.rs        # Native ProTracker .mod parser & 4-8 channel Paula synthesizer with LRRL stereo separation
+        dsp.rs            # Real-time 2048-pt Hann FFT (64 log bands), stabilized oscilloscope, stereo goniometer & BS.1770-4 K-weighted LUFS
+        config.rs         # Persistent user.json configuration loader/writer
 ```
 
 ## Core Design Principles & Rules
