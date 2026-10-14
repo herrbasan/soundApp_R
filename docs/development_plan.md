@@ -125,3 +125,21 @@ Goal: Full parity with the Electron app's 3 playback engines and audio parameter
   - Multi-track synchronized preview (up to 20 stems; test media in `D:\Work\_GIT\SoundApp\_Material\mixer_media\`), per-track gain, pan, mute, solo, and VU meter.
 - [ ] **3.5 Settings (`S`), Help (`H`) & Platform Shell:**
   - Persistent `user.json` config, system tray (`tray-icon`) with "Keep running in tray", global media hotkeys (`global-hotkey`), and Windows file-type associations (`winreg`).
+
+---
+
+## 5. Milestone Commit Plan (Rollback Checkpoints)
+
+Every milestone commit must **compile cleanly (`cargo build --release`)**, **pass runtime/visual verification (`--screenshot` in dark mode)**, and represent a self-contained unit of meaning we can safely `git reset --hard` to if a subagent or FFI step goes sideways.
+
+| Milestone | Scope | Verification Gate before Commit |
+|---|---|---|
+| **`m0-baseline`** (`0169810`) | Initial workspace: `crates/nui` (GPU/CPU renderer, `Swash` text, `nui_wc2` v3.0.0 widgets) + `crates/soundapp` shell | Already committed & verified |
+| **`m1-layout-and-lists`** (Phase 1.1–1.2) | Declarative layout engine (`layout.rs`: `column`, `row`, `grid`, `form_row`, `card`) + `scroll_list` / `virtual_list` (10k rows); `main.rs` refactored off manual `x, y` math | Release build + dark-mode `--screenshot` visual parity check |
+| **`m2-vectors-and-input`** (Phase 1.3–1.4) | `kind = 4` AA capsule line primitive (GPU shader + CPU blitter), `ui.waveform()`, `ui.polyline()`, Windows clipboard (`Ctrl+C/X/V`), `Tab` focus ring, `nui-dropzone` | Release build + `--screenshot` of waveform/sparkline + input/dropzone test |
+| **`m3-multi-window`** (Phase 1.5) | Multi-window manager (`HashMap<WindowId, WindowEntry>`) sharing `TextSystem` + fast `hide()`/`show()` toggling (`P`, `N`, `M`, `S`, `H`) | Release build + multi-window toggle verification *(Completes Phase 1)* |
+| **`m4-transport-and-ffmpeg`** (Phase 2.1–2.2) | Transport/seek/cosine-fade state machine, playlist manager, background peak extraction, FFmpeg decoding/metadata + `rubato` HQ resampling | Headless + UI playback test across audio formats & sample rates |
+| **`m5-rubberband-midi-tracker`** (Phase 2.3–2.5) | Rubber Band pitch/tempo/formant FFI, MIDI SF2 engine (`rustysynth` + `midly`), and Tracker engine (`libopenmpt` FFI) | Playback verification on `.mp3`/`.flac`, `.mid`, and `.mod`/`.xm`/`.it`/`.s3m` *(Completes Phase 2)* |
+| **`m6-player-and-params-ui`** (Phase 3.1–3.2) | Production Main Player window (cover art, waveform seekbar, playlist drawer, shortcuts) + adaptive Parameters window (`P`) | Release build + dark-mode `--screenshot` of Player & Parameters windows |
+| **`m7-dsp-mixer-and-shell`** (Phase 3.3–3.5) | Monitoring window (`N`: 64-band FFT, oscilloscope, goniometer, LUFS), 20-stem Mixer (`M`), Settings (`S`), Help (`H`), tray, global hotkeys, file associations | Full end-to-end verification + benchmark pass via `scripts/measure-proc.ps1` |
+
