@@ -310,6 +310,11 @@ impl App {
             ui.scene
                 .rect(0.0, hdr_h - 1.0, pw, 1.0, theme.border2);
 
+            // Clip header left zone (logo, title, badges) so it never collides with right-side buttons
+            let right_zone_w = (rem * 20.8).round();
+            ui.scene
+                .push_clip(0.0, 0.0, (pw - right_zone_w).max(0.0), hdr_h);
+
             let icon_sz = (rem * 1.25).round();
             ui.scene.icon_centered(
                 ui.text_sys,
@@ -350,6 +355,7 @@ impl App {
                 "0% IDLE".to_string()
             };
             let _ = ui.badge(bx, badge_y, &fps_badge, BadgeVariant::Success, None);
+            ui.scene.pop_clip();
 
             // Header right controls (Backend, Font, Theme, Zoom -, Zoom +, Close)
             let btn_h = (rem * 1.75).round();
@@ -479,6 +485,12 @@ impl App {
                     theme.border2,
                     1.0,
                 );
+                ui.scene.push_clip(
+                    spec_r.x + 1.0,
+                    spec_r.y + 1.0,
+                    (spec_r.w - 2.0).max(0.0),
+                    (spec_r.h - 2.0).max(0.0),
+                );
                 let bands = 18usize;
                 let inset = (rem * 0.4).round();
                 let g = (rem * 0.3).round().max(2.0);
@@ -516,6 +528,7 @@ impl App {
                     })
                     .collect();
                 ui.polyline(spec_r, &osc_pts, 2.0, theme.palette_mark);
+                ui.scene.pop_clip();
             });
 
             // ================================================================
@@ -651,8 +664,18 @@ impl App {
                 1 => {
                     // ---- TAB 1: SoundApp Parameters — responsive `nui-layout` grid ----
                     let grid = ui.layout_grid(body, 2, Length::rem(1.5));
+                    // `layout_grid` collapses to a single column below 30rem. Stack the two
+                    // parameter groups vertically in that case instead of indexing [1].
+                    let (col_a, col_b) = if grid.len() >= 2 {
+                        (grid[0], grid[1])
+                    } else {
+                        let g = grid[0];
+                        let [top, bottom] =
+                            ui.rows(g, Length::rem(1.5), [Length::fill(), Length::fill()]);
+                        (top, bottom)
+                    };
 
-                    ui.with_column(grid[0], Length::rem(1.0), |ui| {
+                    ui.with_column(col_a, Length::rem(1.0), |ui| {
                         let pn = ui.input_group("Preset Name (nui-input)");
                         ui.text_input(401, pn, "Enter preset name...", &mut self.preset_name);
 
@@ -663,7 +686,7 @@ impl App {
                         ui.select(431, sr, SAMPLE_RATES, &mut self.selected_rate);
                     });
 
-                    ui.with_column(grid[1], Length::rem(1.0), |ui| {
+                    ui.with_column(col_b, Length::rem(1.0), |ui| {
                         let sep_str = format!("{:.0}%", self.stereo_sep);
                         let s1 = ui.take(Length::rem(2.9));
                         ui.slider(
@@ -720,27 +743,27 @@ impl App {
                             let tx = b.x.round();
                             let fs_head = theme.font_xsmall();
                             let mut sy = b.y + fs_head * 1.3;
-                            ui.scene.text(
-                                ui.text_sys,
+                            ui.text_clipped(
                                 FontFace::SemiBold,
                                 FontEngine::Swash,
                                 "A. SWASH — OpenType Kerning + Hinting + 4x Subpixel + Linear-Light Gamma",
                                 tx,
                                 sy.round(),
                                 fs_head,
+                                b.w,
                                 theme.highlight,
                             );
                             for (lbl, css_px) in [("12px", 12.0f32), ("15px", 15.0), ("18px", 18.0)]
                             {
                                 sy += rem * 1.5;
-                                ui.scene.text(
-                                    ui.text_sys,
+                                ui.text_clipped(
                                     FontFace::Regular,
                                     FontEngine::Swash,
                                     &format!("{lbl}: {}", typo_sample(css_px)),
                                     tx,
                                     sy.round(),
                                     rem * (css_px / 16.0),
+                                    b.w,
                                     theme.text,
                                 );
                             }
@@ -757,27 +780,27 @@ impl App {
                             let tx = b.x.round();
                             let fs_head = theme.font_xsmall();
                             let mut fy = b.y + fs_head * 1.3;
-                            ui.scene.text(
-                                ui.text_sys,
+                            ui.text_clipped(
                                 FontFace::SemiBold,
                                 FontEngine::Fontdue,
                                 "B. FONTDUE (Legacy POC) — Unhinted + Integer-Snapped + Naive sRGB Alpha",
                                 tx,
                                 fy.round(),
                                 fs_head,
+                                b.w,
                                 theme.text_dim,
                             );
                             for (lbl, css_px) in [("12px", 12.0f32), ("15px", 15.0), ("18px", 18.0)]
                             {
                                 fy += rem * 1.5;
-                                ui.scene.text(
-                                    ui.text_sys,
+                                ui.text_clipped(
                                     FontFace::Regular,
                                     FontEngine::Fontdue,
                                     &format!("{lbl}: {}", typo_sample(css_px)),
                                     tx,
                                     fy.round(),
                                     rem * (css_px / 16.0),
+                                    b.w,
                                     theme.text,
                                 );
                             }
@@ -801,14 +824,14 @@ impl App {
                         None,
                     ) + theme.space();
                     let fs_info = theme.font_small();
-                    ui.scene.text(
-                        ui.text_sys,
+                    ui.text_clipped(
                         FontFace::Regular,
                         ui.font_engine,
                         "All Genres · no filter · sorted by Artist — click a row to load",
                         info_x.round(),
                         (hdr_r.y + hdr_r.h * 0.5 + fs_info * 0.33).round(),
                         fs_info,
+                        (hdr_r.x + hdr_r.w - info_x).max(0.0),
                         theme.text_muted,
                     );
 
@@ -847,48 +870,54 @@ impl App {
                         };
 
                         let index_str = format!("#{:05}", idx + 1);
-                        ui.scene.text(
-                            ui.text_sys,
-                            FontFace::Regular,
-                            ui.font_engine,
-                            &index_str,
-                            (rr.x + rem * 0.75).round(),
-                            baseline,
-                            fs,
-                            theme.text_muted,
-                        );
-                        ui.scene.text(
-                            ui.text_sys,
-                            face,
-                            ui.font_engine,
-                            &track_name(idx),
-                            (rr.x + rem * 5.0).round(),
-                            baseline,
-                            fs,
-                            if selected { theme.highlight } else { theme.text },
-                        );
-                        ui.scene.text(
-                            ui.text_sys,
-                            FontFace::Regular,
-                            ui.font_engine,
-                            &track_credit(idx),
-                            (rr.x + rr.w * 0.42).round(),
-                            baseline,
-                            fs2,
-                            theme.text_dim,
-                        );
+                        let idx_x = rr.x + rem * 0.75;
+                        let title_x = rr.x + rem * 5.0;
+                        let credit_x = rr.x + rr.w * 0.42;
                         let meta = track_meta(idx);
                         let mw = ui
                             .text_sys
                             .measure(FontFace::Regular, ui.font_engine, &meta, fs2);
-                        ui.scene.text(
-                            ui.text_sys,
+                        let meta_w = mw + rem * 0.75;
+                        let meta_x = rr.x + rr.w - meta_w;
+
+                        ui.text_clipped(
+                            FontFace::Regular,
+                            ui.font_engine,
+                            &index_str,
+                            idx_x.round(),
+                            baseline,
+                            fs,
+                            (title_x - idx_x - rem * 0.4).max(0.0),
+                            theme.text_muted,
+                        );
+                        ui.text_clipped(
+                            face,
+                            ui.font_engine,
+                            &track_name(idx),
+                            title_x.round(),
+                            baseline,
+                            fs,
+                            (credit_x - title_x - rem * 0.4).max(0.0),
+                            if selected { theme.highlight } else { theme.text },
+                        );
+                        ui.text_clipped(
+                            FontFace::Regular,
+                            ui.font_engine,
+                            &track_credit(idx),
+                            credit_x.round(),
+                            baseline,
+                            fs2,
+                            (meta_x - credit_x - rem * 0.4).max(0.0),
+                            theme.text_dim,
+                        );
+                        ui.text_clipped(
                             FontFace::Regular,
                             ui.font_engine,
                             &meta,
-                            (rr.x + rr.w - mw - rem * 0.75).round(),
+                            meta_x.round(),
                             baseline,
                             fs2,
+                            meta_w.max(0.0),
                             theme.text_muted,
                         );
                     });
@@ -1200,8 +1229,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui_state.cursor = (position.x as f32, position.y as f32);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                // While playing with animation on, the 60fps `about_to_wait` timer already
+                // redraws every frame — only force a redraw here for immediate drag feedback
+                // (mouse held) or when the timer is idle, so a 1000Hz mouse cannot spike FPS.
+                let playing = self
+                    .audio
+                    .as_ref()
+                    .map(|a| a.started.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(false);
+                if !(playing && self.animate) || self.ui_state.mouse_down {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {

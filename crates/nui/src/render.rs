@@ -47,6 +47,10 @@ pub struct Scene {
     pub overlay_instances: Vec<QuadInstance>,
     pub in_overlay: bool,
     pub clip_stack: Vec<[f32; 4]>,
+    /// Clip stack used while `in_overlay` is true. Kept separate from `clip_stack` so
+    /// top-layer overlays (select popups, dropzone) are never clipped by the cards or
+    /// columns that own the widget they belong to.
+    pub overlay_clip_stack: Vec<[f32; 4]>,
     pub static_count: usize,
     pub static_gen: u64,
     glyph_scratch: Vec<PositionedGlyph>,
@@ -60,6 +64,7 @@ impl Scene {
             overlay_instances: Vec::with_capacity(256),
             in_overlay: false,
             clip_stack: Vec::with_capacity(16),
+            overlay_clip_stack: Vec::with_capacity(8),
             static_count: 0,
             static_gen: 0,
             glyph_scratch: Vec::with_capacity(256),
@@ -72,6 +77,7 @@ impl Scene {
         self.overlay_instances.clear();
         self.in_overlay = false;
         self.clip_stack.clear();
+        self.overlay_clip_stack.clear();
         self.static_count = 0;
         self.static_gen = self.static_gen.wrapping_add(1);
     }
@@ -85,13 +91,21 @@ impl Scene {
         self.overlay_instances.clear();
         self.in_overlay = false;
         self.clip_stack.clear();
+        self.overlay_clip_stack.clear();
     }
 
     pub fn current_clip(&self) -> [f32; 4] {
-        self.clip_stack
-            .last()
-            .copied()
-            .unwrap_or([0.0, 0.0, 32768.0, 32768.0])
+        if self.in_overlay {
+            self.overlay_clip_stack
+                .last()
+                .copied()
+                .unwrap_or([0.0, 0.0, 32768.0, 32768.0])
+        } else {
+            self.clip_stack
+                .last()
+                .copied()
+                .unwrap_or([0.0, 0.0, 32768.0, 32768.0])
+        }
     }
 
     pub fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -100,11 +114,19 @@ impl Scene {
         let ny0 = y.max(prev[1]);
         let nx1 = (x + w).min(prev[2]).max(nx0);
         let ny1 = (y + h).min(prev[3]).max(ny0);
-        self.clip_stack.push([nx0, ny0, nx1, ny1]);
+        if self.in_overlay {
+            self.overlay_clip_stack.push([nx0, ny0, nx1, ny1]);
+        } else {
+            self.clip_stack.push([nx0, ny0, nx1, ny1]);
+        }
     }
 
     pub fn pop_clip(&mut self) {
-        let _ = self.clip_stack.pop();
+        if self.in_overlay {
+            let _ = self.overlay_clip_stack.pop();
+        } else {
+            let _ = self.clip_stack.pop();
+        }
     }
 
     pub fn begin_overlay(&mut self) {
@@ -113,10 +135,12 @@ impl Scene {
 
     pub fn end_overlay(&mut self) {
         self.in_overlay = false;
+        self.overlay_clip_stack.clear();
     }
 
     pub fn finish_frame(&mut self) {
         self.in_overlay = false;
+        self.overlay_clip_stack.clear();
         if !self.overlay_instances.is_empty() {
             self.instances.extend_from_slice(&self.overlay_instances);
             self.overlay_instances.clear();

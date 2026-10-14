@@ -181,7 +181,16 @@ impl<'a> Ui<'a> {
             y: r.y.round(),
             gap: gap_px,
         });
+        // A `4px` pad keeps `:focus-visible` rings and slider thumbs at the column edge
+        // intact while clipping any overflowing text or child rows to the column.
+        self.scene.push_clip(
+            r.x - 4.0,
+            r.y - 4.0,
+            (r.w + 8.0).max(0.0),
+            (r.h + 8.0).max(0.0),
+        );
         let out = f(self);
+        self.scene.pop_clip();
         self.layout_stack.pop();
         out
     }
@@ -211,7 +220,15 @@ impl<'a> Ui<'a> {
             1.0,
         );
         let inner = self.pad(r, pad);
-        self.with_column(inner, gap, f)
+        self.scene.push_clip(
+            r.x + 1.0,
+            r.y + 1.0,
+            (r.w - 2.0).max(0.0),
+            (r.h - 2.0).max(0.0),
+        );
+        let out = self.with_column(inner, gap, f);
+        self.scene.pop_clip();
+        out
     }
 
     /// Standard `nui-card` defaults from `nui-theme.css`: `1.25rem` padding, `1.0rem` gap.
@@ -232,7 +249,15 @@ impl<'a> Ui<'a> {
         self.scene
             .rounded_rect(r.x, r.y, r.w, r.h, t.radius2(), t.base, border, 1.0);
         let inner = self.pad(r, pad);
-        self.with_column(inner, gap, f)
+        self.scene.push_clip(
+            r.x + 1.0,
+            r.y + 1.0,
+            (r.w - 2.0).max(0.0),
+            (r.h - 2.0).max(0.0),
+        );
+        let out = self.with_column(inner, gap, f);
+        self.scene.pop_clip();
+        out
     }
 
     // ------------------------------------------------------------------
@@ -367,25 +392,26 @@ impl<'a> Ui<'a> {
         let rem = self.theme.rem;
         let fs = self.theme.font_base();
         let h = (rem * 1.35).round();
-        let (x, y) = {
+        let (x, y, w) = {
             let c = self
                 .layout_stack
                 .last_mut()
                 .expect("Ui layout_stack is empty");
             let x = c.bounds.x;
             let y = c.y;
+            let w = c.bounds.w;
             c.y = (c.y + h).round();
-            (x, y)
+            (x, y, w)
         };
         let color = self.theme.text;
-        self.scene.text(
-            self.text_sys,
+        self.text_clipped(
             FontFace::SemiBold,
             self.font_engine,
             text,
             x.round(),
             (y + fs * 0.8).round(),
             fs,
+            w,
             color,
         );
     }
@@ -396,37 +422,38 @@ impl<'a> Ui<'a> {
         let fs = self.theme.font_small();
         let kw = key_w.resolve(rem);
         let h = (rem * 1.45).round();
-        let (x, y) = {
+        let (x, y, w) = {
             let c = self
                 .layout_stack
                 .last_mut()
                 .expect("Ui layout_stack is empty");
             let x = c.bounds.x;
             let y = c.y;
+            let w = c.bounds.w;
             c.y = (c.y + h).round();
-            (x, y)
+            (x, y, w)
         };
         let key_color = self.theme.text_dim;
         let val_color = self.theme.text;
         let baseline = (y + fs * 0.8).round();
-        self.scene.text(
-            self.text_sys,
+        self.text_clipped(
             FontFace::Regular,
             self.font_engine,
             key,
             x.round(),
             baseline,
             fs,
+            (kw - 4.0).max(0.0),
             key_color,
         );
-        self.scene.text(
-            self.text_sys,
+        self.text_clipped(
             FontFace::SemiBold,
             self.font_engine,
             val,
             (x + kw).round(),
             baseline,
             fs,
+            (w - kw).max(0.0),
             val_color,
         );
     }
@@ -435,11 +462,11 @@ impl<'a> Ui<'a> {
     /// (`0.95rem`) plus the `--nui-space-quarter` label/control gap, then a control row of
     /// `control_h`. Returns the control rect.
     pub fn form_field(&mut self, label: &str, control_h: Length) -> Rect {
-        let (x, y) = {
+        let (x, y, w) = {
             let c = self.layout_stack.last().expect("Ui layout_stack is empty");
-            (c.bounds.x, c.y)
+            (c.bounds.x, c.y, c.bounds.w)
         };
-        self.input_label(x, y, label);
+        self.input_label_clipped(x, y, w, label);
         let adv = (self.theme.rem * 0.95).round() + self.theme.space_quarter();
         {
             let c = self

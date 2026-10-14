@@ -652,19 +652,75 @@ impl<'a> Ui<'a> {
         }
     }
 
-    /// Draw an `nui-input-group` uppercase label above a control.
-    pub fn input_label(&mut self, x: f32, y: f32, label: &str) {
+    /// Draw single-line text clipped to `max_w`, truncating with `"…"` if it exceeds
+    /// `max_w`. Returns the drawn advance width (`0.0` when there is nothing to draw).
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_clipped(
+        &mut self,
+        face: FontFace,
+        engine: FontEngine,
+        s: &str,
+        x: f32,
+        baseline: f32,
+        px: f32,
+        max_w: f32,
+        color: Color,
+    ) -> f32 {
+        if max_w <= 2.0 || s.is_empty() {
+            return 0.0;
+        }
+        let clip_x = x - 2.0;
+        let clip_y = baseline - px * 1.35;
+        let clip_w = max_w + 4.0;
+        let clip_h = px * 1.85;
+        let full_w = self.text_sys.measure(face, engine, s, px);
+        if full_w <= max_w {
+            self.scene.push_clip(clip_x, clip_y, clip_w, clip_h);
+            let w = self
+                .scene
+                .text(self.text_sys, face, engine, s, x, baseline, px, color);
+            self.scene.pop_clip();
+            return w;
+        }
+        // Longest char-boundary prefix that still fits once an ellipsis is appended.
+        let mut end = s.len();
+        let drawn = loop {
+            if end == 0 {
+                break "…".to_string();
+            }
+            let cand = format!("{}…", &s[..end]);
+            if self.text_sys.measure(face, engine, &cand, px) <= max_w {
+                break cand;
+            }
+            end = prev_char_boundary(s, end);
+        };
+        self.scene.push_clip(clip_x, clip_y, clip_w, clip_h);
+        let w = self
+            .scene
+            .text(self.text_sys, face, engine, &drawn, x, baseline, px, color);
+        self.scene.pop_clip();
+        w
+    }
+
+    /// Draw an `nui-input-group` uppercase label above a control, clipped to `max_w`.
+    pub fn input_label_clipped(&mut self, x: f32, y: f32, max_w: f32, label: &str) {
         let fs = self.theme.font_xsmall();
-        self.scene.text(
-            self.text_sys,
+        let upper = label.to_uppercase();
+        self.text_clipped(
             FontFace::SemiBold,
             self.font_engine,
-            &label.to_uppercase(),
+            &upper,
             x.round(),
             (y + fs * 0.85).round(),
             fs,
+            max_w,
             self.theme.label_upper,
         );
+    }
+
+    /// Draw an `nui-input-group` uppercase label above a control.
+    pub fn input_label(&mut self, x: f32, y: f32, label: &str) {
+        self.input_label_clipped(x, y, 32768.0, label);
     }
 
     /// `nui-tabs` horizontal tab bar with bottom border and 2px highlight active underline.
@@ -691,6 +747,7 @@ impl<'a> Ui<'a> {
         let cy = r.y + (r.h - 2.0) * 0.5;
         let baseline = (cy + fs * 0.33).round();
 
+        self.scene.push_clip(r.x, r.y, r.w, r.h);
         for (i, &(icon, label)) in labels.iter().enumerate() {
             let id = base_id + i as u32;
             let text_w = self
@@ -772,6 +829,7 @@ impl<'a> Ui<'a> {
 
             tx += tab_w + gap;
         }
+        self.scene.pop_clip();
         changed
     }
 
@@ -873,6 +931,8 @@ impl<'a> Ui<'a> {
         let mut cx = r.x + (r.w - total_w) * 0.5;
         let cy = r.y + r.h * 0.5;
 
+        self.scene
+            .push_clip(r.x + 2.0, r.y + 1.0, (r.w - 4.0).max(0.0), (r.h - 2.0).max(0.0));
         if !icon.is_empty() {
             self.scene.icon_centered(
                 self.text_sys,
@@ -896,6 +956,7 @@ impl<'a> Ui<'a> {
                 fg,
             );
         }
+        self.scene.pop_clip();
         self.draw_focus_ring(id, r, t.radius1());
         clicked
     }
@@ -980,16 +1041,19 @@ impl<'a> Ui<'a> {
             } else {
                 t.text
             };
-            self.scene.text(
-                self.text_sys,
+            self.scene
+                .push_clip(sr.x + 2.0, sr.y, (sr.w - 4.0).max(0.0), sr.h);
+            self.text_clipped(
                 FontFace::SemiBold,
                 self.font_engine,
                 &upper,
                 (sr.x + (sr.w - tw) * 0.5).round(),
                 baseline,
                 fs,
+                (sr.w - 4.0).max(0.0),
                 fg,
             );
+            self.scene.pop_clip();
         }
         changed
     }
@@ -1038,14 +1102,15 @@ impl<'a> Ui<'a> {
             );
         }
 
-        self.scene.text(
-            self.text_sys,
+        let ltx = (r.x + box_sz + t.rem * 0.55).round();
+        self.text_clipped(
             FontFace::Regular,
             self.font_engine,
             label,
-            (r.x + box_sz + t.rem * 0.55).round(),
+            ltx,
             (cy + fs * 0.33).round(),
             fs,
+            (r.x + r.w - ltx).max(0.0),
             if hovered { t.text } else { t.text_dim },
         );
         self.draw_focus_ring(id, r, t.radius1());
@@ -1119,14 +1184,15 @@ impl<'a> Ui<'a> {
             0.0,
         );
 
-        self.scene.text(
-            self.text_sys,
+        let ltx = (r.x + sw_w + t.rem * 0.55).round();
+        self.text_clipped(
             FontFace::Regular,
             self.font_engine,
             label,
-            (r.x + sw_w + t.rem * 0.55).round(),
+            ltx,
             (cy + fs * 0.33).round(),
             fs,
+            (r.x + r.w - ltx).max(0.0),
             if hovered { t.text } else { t.text_dim },
         );
         self.draw_focus_ring(id, r, t.radius1());
@@ -1186,14 +1252,15 @@ impl<'a> Ui<'a> {
             );
         }
 
-        self.scene.text(
-            self.text_sys,
+        let ltx = (rx + d + t.rem * 0.55).round();
+        self.text_clipped(
             FontFace::Regular,
             self.font_engine,
             label,
-            (rx + d + t.rem * 0.55).round(),
+            ltx,
             (cy + fs * 0.33).round(),
             fs,
+            (r.x + r.w - ltx).max(0.0),
             if hovered || selected { t.text } else { t.text_dim },
         );
         clicked
@@ -1252,21 +1319,21 @@ impl<'a> Ui<'a> {
             }
         }
 
-        // Top row: label on left, formatted value on right
+        // Top row: label on left (clipped so it never collides with the value), value on right.
         let lbl_y = (r.y + fs * 0.88).round();
-        self.scene.text(
-            self.text_sys,
+        let vw = self
+            .text_sys
+            .measure(FontFace::SemiBold, self.font_engine, val_text, fs);
+        self.text_clipped(
             FontFace::Regular,
             self.font_engine,
             label,
             r.x.round(),
             lbl_y,
             fs,
+            (r.w - vw - t.rem * 0.5).max(0.0),
             t.text_dim,
         );
-        let vw = self
-            .text_sys
-            .measure(FontFace::SemiBold, self.font_engine, val_text, fs);
         self.scene.text(
             self.text_sys,
             FontFace::SemiBold,
@@ -1920,8 +1987,7 @@ impl<'a> Ui<'a> {
                 let o_cy = opt_r.y + opt_r.h * 0.5;
                 let o_base = (o_cy + fs * 0.33).round();
 
-                self.scene.text(
-                    self.text_sys,
+                self.text_clipped(
                     if is_sel {
                         FontFace::SemiBold
                     } else {
@@ -1932,6 +1998,7 @@ impl<'a> Ui<'a> {
                     (pop_r.x + pad_x).round(),
                     o_base,
                     fs,
+                    (pop_r.w - pad_x * 2.0 - arrow_sz).max(0.0),
                     fg,
                 );
 
@@ -2227,46 +2294,52 @@ impl<'a> Ui<'a> {
         let fs = t.font_small();
         let baseline = (r.y + r.h * 0.5 + fs * 0.355).round();
 
-        self.scene.text(
-            self.text_sys,
+        let title_x = r.x + t.rem * 3.4;
+        let meta_w = if right_meta.is_empty() {
+            0.0
+        } else {
+            self.text_sys
+                .measure(FontFace::Regular, self.font_engine, right_meta, fs)
+                + t.rem * 0.6
+        };
+        let meta_x = r.x + r.w - meta_w;
+
+        self.text_clipped(
             FontFace::Regular,
             self.font_engine,
             index_str,
             (r.x + t.rem * 0.6).round(),
             baseline,
             fs,
+            (title_x - (r.x + t.rem * 0.6) - t.rem * 0.4).max(0.0),
             t.text_muted,
         );
 
-        let title_x = r.x + t.rem * 3.4;
         let face = if selected {
             FontFace::SemiBold
         } else {
             FontFace::Regular
         };
-        self.scene.text(
-            self.text_sys,
+        self.text_clipped(
             face,
             self.font_engine,
             title,
             title_x.round(),
             baseline,
             fs,
+            (meta_x - title_x - t.rem * 0.4).max(0.0),
             t.text,
         );
 
         if !right_meta.is_empty() {
-            let mw = self
-                .text_sys
-                .measure(FontFace::Regular, self.font_engine, right_meta, fs);
-            self.scene.text(
-                self.text_sys,
+            self.text_clipped(
                 FontFace::Regular,
                 self.font_engine,
                 right_meta,
-                (r.x + r.w - mw - t.rem * 0.6).round(),
+                meta_x.round(),
                 baseline,
                 fs,
+                meta_w.max(0.0),
                 t.text_dim,
             );
         }
