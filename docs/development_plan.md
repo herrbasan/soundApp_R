@@ -119,10 +119,12 @@ Goal: Full parity with the Electron app's 3 playback engines and audio parameter
 
 ### Phase 3 — SoundApp Windows, DSP Visualizers & OS Integration
 
-- [ ] **3.1 Main Player Window (`player`):**
+- [x] **3.1 Main Player Window (`player`):**
   - Cover art / file info panel, interactive waveform seekbar, transport row, playlist drawer, and keyboard shortcuts (`Space`, `Left`/`Right`, `Up`/`Down` volume, `M`/`N`/`P`/`S`/`H`, `Ctrl +/-` scale).
-- [ ] **3.2 Parameters Window (`P`):**
+  - Transport: Prev/Play/Next + Loop (`L`) / Shuffle toggles, elapsed + remaining/total, compact master volume slider in the bar. Compact player mode (`C`, 580x300) vs full studio layout (1120x700).
+- [x] **3.2 Parameters Window (`P`):**
   - Adaptive tabs (`Audio` / `MIDI` / `Tracker`) automatically switching to match the loaded file type, plus `Lock` toggle across tracks.
+  - Audio: Tape/RubberBand mode, playback speed, pitch, formant preserve. MIDI: SoundFont, transpose, BPM override, metronome. Tracker: stereo separation, pitch, tempo, interpolation filter. Footer: lock + Reset All.
 - [ ] **3.3 Monitoring Window (`N` — Real-Time DSP):**
   - Lock-free analysis tap from the `cpal` callback feeding an analysis ring buffer.
   - `realfft` 64-band logarithmic FFT spectrum, live oscilloscope waveform, stereo goniometer (Lissajous), phase correlation meter (`-1..+1`), stereo RMS/Peak VU bars, and BS.1770-4 LUFS (`Momentary`, `Short-Term`, `Integrated`, `LRA`, `True Peak` with K-weighting biquad filters).

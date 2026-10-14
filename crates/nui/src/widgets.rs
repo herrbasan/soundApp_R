@@ -150,6 +150,10 @@ pub const ICON_EQ: &str = "\u{e01d}";
 pub const ICON_VOLUME: &str = "\u{e050}";
 pub const ICON_LOCK: &str = "\u{e897}";
 pub const ICON_TUNE: &str = "\u{e429}";
+pub const ICON_LOOP: &str = "\u{e040}";
+pub const ICON_SHUFFLE: &str = "\u{e043}";
+pub const ICON_RESTART: &str = "\u{e042}";
+pub const ICON_ADD: &str = "\u{e145}";
 
 /// Exact nui_wc2 v3.0.0 "slate" theme tokens (NUI/css/nui-theme.css)
 #[derive(Clone, Copy, Debug)]

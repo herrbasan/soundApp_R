@@ -195,6 +195,15 @@ pub fn extract_waveform_peaks(path: &Path, num_bins: usize) -> Vec<f32> {
 // Sources, parameters & commands
 // ---------------------------------------------------------------------------
 
+/// What kind of source the engine currently has loaded. Published alongside the
+/// metadata so the UI can adapt (Parameters window tab auto-selection).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    Audio,
+    Midi,
+    Tracker,
+}
+
 /// What the engine should play.
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -219,6 +228,10 @@ pub struct PlaybackParams {
     pub formant_preserve: bool,
     pub stereo_sep: f32,
     pub interp: usize,
+    /// MIDI transpose in semitones (`-12..=12`, forwarded to the SF2 engine).
+    pub midi_transpose: f32,
+    /// MIDI tempo override in BPM (`40..=240`).
+    pub midi_bpm: f32,
     pub metronome: bool,
 }
 
@@ -232,6 +245,8 @@ impl Default for PlaybackParams {
             formant_preserve: true,
             stereo_sep: 100.0,
             interp: 1,
+            midi_transpose: 0.0,
+            midi_bpm: 120.0,
             metronome: false,
         }
     }
@@ -241,6 +256,7 @@ enum Cmd {
     Seek(f64),
     Load(PathBuf),
     LoadMidiDemo,
+    LoadTrackerDemo,
     SetSoundfont(PathBuf),
     SetParams(PlaybackParams),
 }
@@ -281,6 +297,7 @@ struct Shared {
     peaks: Arc<Mutex<Vec<f32>>>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
+    kind: Arc<Mutex<Option<SourceKind>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +317,7 @@ pub struct Audio {
     peaks: Arc<Mutex<Vec<f32>>>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
+    kind: Arc<Mutex<Option<SourceKind>>>,
 }
 
 impl Audio {
@@ -339,6 +357,10 @@ impl Audio {
     pub fn load_midi_demo(&self) {
         let _ = self.cmd_tx.send(Cmd::LoadMidiDemo);
     }
+    /// Load the built-in tracker demo module.
+    pub fn load_tracker_demo(&self) {
+        let _ = self.cmd_tx.send(Cmd::LoadTrackerDemo);
+    }
     /// Switch the MIDI engine's SoundFont at runtime.
     pub fn set_soundfont(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::SetSoundfont(path));
@@ -358,6 +380,10 @@ impl Audio {
     }
     pub fn current_file(&self) -> Option<PathBuf> {
         self.current.lock().unwrap().clone()
+    }
+    /// Kind of the currently-loaded source (`None` before the first load).
+    pub fn source_kind(&self) -> Option<SourceKind> {
+        *self.kind.lock().unwrap()
     }
 }
 
@@ -395,6 +421,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
         peaks: Arc::new(Mutex::new(Vec::new())),
         meta: Arc::new(Mutex::new(None)),
         current: Arc::new(Mutex::new(None)),
+        kind: Arc::new(Mutex::new(None)),
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -516,6 +543,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
         peaks: shared.peaks.clone(),
         meta: shared.meta.clone(),
         current: shared.current.clone(),
+        kind: shared.kind.clone(),
     })
 }
 
@@ -865,6 +893,12 @@ fn decoder_thread(
                     tone_hz = None;
                     open_midi(&mut engine, None, out_rate, &sh);
                 }
+                Cmd::LoadTrackerDemo => {
+                    shifter.reset();
+                    silence = false;
+                    tone_hz = None;
+                    open_tracker(&mut engine, None, out_rate, &sh);
+                }
                 Cmd::SetSoundfont(path) => {
                     if let Engine::Midi(m) = &mut engine {
                         if let Err(e) = m.set_soundfont(&path) {
@@ -1074,6 +1108,7 @@ fn open_ffmpeg(
     let peaks = extract_waveform_peaks(path, 96);
     *sh.peaks.lock().unwrap() = peaks;
     *sh.current.lock().unwrap() = Some(path.to_path_buf());
+    *sh.kind.lock().unwrap() = Some(SourceKind::Audio);
 
     let mut handle: *mut c_void = std::ptr::null_mut();
     if let Some(c) = path_cstring(path) {
@@ -1115,6 +1150,7 @@ fn open_midi(engine: &mut Engine, path: Option<&Path>, out_rate: u32, sh: &Share
             *sh.meta.lock().unwrap() = None;
             *sh.peaks.lock().unwrap() = synth_wave_peaks(96);
             *sh.current.lock().unwrap() = path.map(|p| p.to_path_buf());
+            *sh.kind.lock().unwrap() = Some(SourceKind::Midi);
             *engine = Engine::Midi(Box::new(m));
             post_load(sh, (dur * out_rate as f64) as u64);
         }
@@ -1141,6 +1177,7 @@ fn open_tracker(engine: &mut Engine, path: Option<&Path>, out_rate: u32, sh: &Sh
     *sh.meta.lock().unwrap() = None;
     *sh.peaks.lock().unwrap() = synth_wave_peaks(96);
     *sh.current.lock().unwrap() = path.map(|p| p.to_path_buf());
+    *sh.kind.lock().unwrap() = Some(SourceKind::Tracker);
     *engine = Engine::Tracker(Box::new(t));
     post_load(sh, 0);
 }
@@ -1170,10 +1207,10 @@ fn apply_engine_params(engine: &mut Engine, p: &PlaybackParams) {
             t.set_interp(p.interp);
         }
         Engine::Midi(m) => {
-            // Pitch/tempo are applied by the pipeline; the MIDI engine keeps its
-            // own transpose/BPM neutral and owns the metronome.
-            m.set_transpose(0);
-            m.set_bpm(None);
+            // Pitch/tempo of the rendered stream are applied by the pipeline; the
+            // MIDI engine owns its own transpose, BPM override and metronome.
+            m.set_transpose(p.midi_transpose.round().clamp(-12.0, 12.0) as i32);
+            m.set_bpm(Some(p.midi_bpm.clamp(40.0, 240.0)));
             m.set_metronome(p.metronome);
         }
         Engine::None => {}
