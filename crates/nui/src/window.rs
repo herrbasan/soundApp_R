@@ -7,12 +7,106 @@ use std::sync::Arc;
 
 use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{ResizeDirection, Window, WindowAttributes, WindowId};
 
 use crate::render::{BackendKind, Renderer};
 use crate::text::FontFace;
 use crate::widgets::{BadgeVariant, ButtonVariant, Rect, Ui, UiState, ICON_CLOSE};
 use crate::Scene;
+
+#[cfg(target_os = "windows")]
+mod live_drag {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::{ResizeDirection, Window};
+
+    type TimerProc = unsafe extern "system" fn(isize, u32, usize, u32);
+    type WndEnumProc = unsafe extern "system" fn(isize, isize) -> i32;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetTimer(hwnd: isize, id: usize, elapse: u32, func: Option<TimerProc>) -> usize;
+        fn KillTimer(hwnd: isize, id: usize) -> i32;
+        fn InvalidateRect(hwnd: isize, rect: *const [i32; 4], erase: i32) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn EnumThreadWindows(thread_id: u32, func: WndEnumProc, lparam: isize) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    const DRAG_TIMER_ID: usize = 0x4E55_4901;
+
+    unsafe extern "system" fn enum_invalidate(hwnd: isize, _lparam: isize) -> i32 {
+        if IsWindowVisible(hwnd) != 0 {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
+        1
+    }
+
+    unsafe extern "system" fn drag_timer_proc(_hwnd: isize, _msg: u32, _id: usize, _time: u32) {
+        EnumThreadWindows(GetCurrentThreadId(), enum_invalidate, 0);
+    }
+
+    fn hwnd_of(window: &Window) -> Option<isize> {
+        let wh = window.window_handle().ok()?;
+        match wh.as_raw() {
+            RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+            _ => None,
+        }
+    }
+
+    pub fn drag_window(window: &Window) {
+        if let Some(hwnd) = hwnd_of(window) {
+            unsafe {
+                SetTimer(hwnd, DRAG_TIMER_ID, 16, Some(drag_timer_proc));
+            }
+            let _ = window.drag_window();
+            unsafe {
+                KillTimer(hwnd, DRAG_TIMER_ID);
+            }
+        } else {
+            let _ = window.drag_window();
+        }
+    }
+
+    pub fn drag_resize_window(window: &Window, dir: ResizeDirection) {
+        if let Some(hwnd) = hwnd_of(window) {
+            unsafe {
+                SetTimer(hwnd, DRAG_TIMER_ID, 16, Some(drag_timer_proc));
+            }
+            let _ = window.drag_resize_window(dir);
+            unsafe {
+                KillTimer(hwnd, DRAG_TIMER_ID);
+            }
+        } else {
+            let _ = window.drag_resize_window(dir);
+        }
+    }
+}
+
+/// Start an OS window drag while keeping `RedrawRequested` active at ~60 Hz during
+/// the Win32 modal move loop.
+pub fn drag_window_live(window: &Window) {
+    #[cfg(target_os = "windows")]
+    live_drag::drag_window(window);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window.drag_window();
+    }
+}
+
+/// Start an OS edge/corner resize drag while keeping `RedrawRequested` active at
+/// ~60 Hz during the Win32 modal size loop.
+pub fn drag_resize_window_live(window: &Window, dir: ResizeDirection) {
+    #[cfg(target_os = "windows")]
+    live_drag::drag_resize_window(window, dir);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window.drag_resize_window(dir);
+    }
+}
 
 /// Declarative creation spec for a managed window (`WindowManager::ensure_window`).
 #[derive(Clone, Debug)]
@@ -120,7 +214,7 @@ impl WindowManager {
     pub fn hide(&mut self, key: &str) {
         if let Some(w) = self.windows.iter_mut().find(|w| w.key == key) {
             w.visible = false;
-            w.window.set_visible(false);
+            w.renderer.cloak_and_hide();
         }
     }
 

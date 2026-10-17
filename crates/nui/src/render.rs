@@ -90,6 +90,14 @@ impl Scene {
         self.image_gen = self.image_gen.wrapping_add(1);
     }
 
+    /// Clear the scene's RGBA image when switching to a track without cover art.
+    pub fn clear_image(&mut self) {
+        if self.image_rgba.is_some() {
+            self.image_rgba = None;
+            self.image_gen = self.image_gen.wrapping_add(1);
+        }
+    }
+
     /// Emit an image quad (`kind = 5`) sampling the scene image with 0..1 UVs.
     pub fn image_quad(&mut self, x: f32, y: f32, w: f32, h: f32) {
         if w <= 0.0 || h <= 0.0 || self.image_rgba.is_none() {
@@ -754,16 +762,28 @@ impl Renderer {
     /// Request that the window be revealed and focused once the next frame is presented.
     pub fn request_reveal(&mut self) {
         self.pending_reveal = true;
+        #[cfg(target_os = "windows")]
+        Self::set_win32_cloak(&self.window, true);
+        self.window.set_visible(true);
         self.window.request_redraw();
+    }
+
+    /// Cloak and hide the window so re-showing it later via `request_reveal()`
+    /// still receives `WM_PAINT` (`RedrawRequested`) without flashing.
+    pub fn cloak_and_hide(&mut self) {
+        self.pending_reveal = false;
+        #[cfg(target_os = "windows")]
+        Self::set_win32_cloak(&self.window, true);
+        self.window.set_visible(false);
     }
 
     /// Uncloak + map + focus the window after the first completed present.
     fn reveal_if_pending(&mut self) {
         if self.pending_reveal {
             self.pending_reveal = false;
+            self.window.set_visible(true);
             #[cfg(target_os = "windows")]
             Self::set_win32_cloak(&self.window, false);
-            self.window.set_visible(true);
             self.window.focus_window();
         }
     }

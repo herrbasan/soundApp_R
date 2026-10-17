@@ -60,8 +60,8 @@ extern "C" {
     fn sa_ffmpeg_read(handle: *mut c_void, out_buf: *mut f32, num_samples: c_int) -> c_int;
     fn sa_ffmpeg_seek(handle: *mut c_void, seconds: c_double) -> c_int;
     fn sa_ffmpeg_duration(handle: *mut c_void) -> c_double;
-    fn sa_ffmpeg_probe_metadata(
-        path: *const c_char,
+    fn sa_ffmpeg_read_handle_metadata(
+        handle: *mut c_void,
         out_meta: *mut SaAudioMeta,
         out_cover_rgba: *mut u8,
         cover_side: c_int,
@@ -112,17 +112,17 @@ fn path_cstring(path: &Path) -> Option<CString> {
     CString::new(path.to_string_lossy().as_bytes()).ok()
 }
 
-/// Probe a file's metadata via FFmpeg (one format open, no decode). The same
-/// open also yields the attached-picture bytes, which are decoded to the 128x128
-/// RGBA thumbnail here — so metadata + cover art never touch the file twice.
-/// `None` when the file cannot be opened or has no audio stream.
-pub fn probe_metadata(path: &Path) -> Option<TrackMetadata> {
-    let c = path_cstring(path)?;
+/// Extract metadata + cover art directly from an already-opened `FFmpegDecoder`
+/// handle (no second SMB `avformat_open_input` or `avformat_find_stream_info`).
+fn read_handle_metadata(handle: *mut c_void, path: &Path) -> Option<TrackMetadata> {
+    if handle.is_null() {
+        return None;
+    }
     let mut m: SaAudioMeta = unsafe { std::mem::zeroed() };
     let mut cover_buf = vec![0u8; (COVER_SIDE * COVER_SIDE * 4) as usize];
     let ok = unsafe {
-        sa_ffmpeg_probe_metadata(
-            c.as_ptr(),
+        sa_ffmpeg_read_handle_metadata(
+            handle,
             &mut m,
             cover_buf.as_mut_ptr(),
             COVER_SIDE as c_int,
@@ -131,21 +131,16 @@ pub fn probe_metadata(path: &Path) -> Option<TrackMetadata> {
     if ok == 0 {
         return None;
     }
-    // `cover_buf` is zero-filled when the file has no art (or it failed to
-    // decode), which is indistinguishable from real black art — only trust it
-    // when FFmpeg reported an attached picture.
     let cover_rgba = if m.has_cover_art != 0 && cover_buf.iter().any(|&b| b != 0) {
         Some((COVER_SIDE, COVER_SIDE, cover_buf))
     } else {
-        if m.has_cover_art != 0 {
-            eprintln!(
-                "[audio] cover art present but did not decode for {}",
-                path.display()
-            );
-        }
         None
     };
-    let file_size_bytes = std::fs::metadata(path).map(|s| s.len()).unwrap_or(0);
+    let file_size_bytes = if m.bitrate == 0 {
+        std::fs::metadata(path).map(|s| s.len()).unwrap_or(0)
+    } else {
+        0
+    };
     Some(TrackMetadata {
         title: cstr(&m.title),
         artist: cstr(&m.artist),
@@ -212,12 +207,16 @@ enum Cmd {
 struct Shared {
     playing: Arc<AtomicBool>,
     fade_out: Arc<AtomicBool>,
+    flushing: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     transport_gen: Arc<AtomicU64>,
     flush_gen: Arc<AtomicU64>,
+    flush_ack: Arc<AtomicU64>,
     total_frames: Arc<AtomicU64>,
     frames_played: Arc<AtomicU64>,
     started: Arc<AtomicBool>,
+    /// Gapless single-track loop mode (`L` key / Loop button).
+    loop_enabled: Arc<AtomicBool>,
     /// The decoder has pushed its last sample; the ring may still hold audio.
     decoder_eof: Arc<AtomicBool>,
     /// The callback drained the ring after `decoder_eof` — one-shot for the UI.
@@ -279,6 +278,8 @@ pub struct Audio {
     pub started: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
+    transport_gen: Arc<AtomicU64>,
+    loop_enabled: Arc<AtomicBool>,
     track_ended: Arc<AtomicBool>,
     dsp_enabled: Arc<AtomicBool>,
     cmd_tx: mpsc::Sender<Cmd>,
@@ -289,7 +290,13 @@ pub struct Audio {
 
 impl Audio {
     pub fn position_secs(&self) -> f64 {
-        self.frames_played.load(Ordering::Relaxed) as f64 / self.rate as f64
+        let pos = self.frames_played.load(Ordering::Relaxed) as f64 / self.rate as f64;
+        let dur = self.duration_secs();
+        if self.loop_enabled.load(Ordering::Relaxed) && dur > 0.0 {
+            pos % dur
+        } else {
+            pos
+        }
     }
     pub fn duration_secs(&self) -> f64 {
         self.total_frames.load(Ordering::Relaxed) as f64 / self.rate as f64
@@ -297,8 +304,14 @@ impl Audio {
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::SeqCst)
     }
+    pub fn set_loop(&self, enabled: bool) {
+        self.loop_enabled.store(enabled, Ordering::Release);
+    }
     /// True when the play head has reached the end of the loaded file.
     fn at_track_end(&self) -> bool {
+        if self.loop_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
         let dur = self.duration_secs();
         dur > 0.0 && self.position_secs() >= dur - 0.05
     }
@@ -335,8 +348,13 @@ impl Audio {
     pub fn seek(&self, seconds: f64) {
         let _ = self.cmd_tx.send(Cmd::Seek(seconds.max(0.0)));
     }
-    /// Load any supported source by path.
+    /// Load any supported source by path. Immediately clears the published
+    /// metadata and updates `current` on the caller thread so the very next UI
+    /// frame never latches the previous track's cover art.
     pub fn load_file(&self, path: PathBuf) {
+        self.transport_gen.fetch_add(1, Ordering::SeqCst);
+        *self.meta.lock().unwrap() = None;
+        *self.current.lock().unwrap() = Some(path.clone());
         let _ = self.cmd_tx.send(Cmd::Load(path));
     }
     pub fn set_volume(&self, vol: f32) {
@@ -383,12 +401,15 @@ pub fn start(src: Source) -> Result<Audio, String> {
     let shared = Shared {
         playing: Arc::new(AtomicBool::new(true)),
         fade_out: Arc::new(AtomicBool::new(false)),
+        flushing: Arc::new(AtomicBool::new(false)),
         volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         transport_gen: Arc::new(AtomicU64::new(0)),
         flush_gen: Arc::new(AtomicU64::new(0)),
+        flush_ack: Arc::new(AtomicU64::new(0)),
         total_frames: Arc::new(AtomicU64::new(0)),
         frames_played: Arc::new(AtomicU64::new(0)),
         started: Arc::new(AtomicBool::new(false)),
+        loop_enabled: Arc::new(AtomicBool::new(false)),
         decoder_eof: Arc::new(AtomicBool::new(false)),
         track_ended: Arc::new(AtomicBool::new(false)),
         dsp_enabled: Arc::new(AtomicBool::new(false)),
@@ -427,14 +448,21 @@ pub fn start(src: Source) -> Result<Audio, String> {
             stream_config,
             move |data: &mut [f32], _| {
                 let out_req = sh.fade_out.load(Ordering::Relaxed);
-                let want = sh.playing.load(Ordering::Relaxed) && !out_req;
+                let is_flushing = sh.flushing.load(Ordering::Acquire);
+                let want = sh.playing.load(Ordering::Relaxed) && !out_req && !is_flushing;
                 let tgen = sh.transport_gen.load(Ordering::Relaxed);
-                let flush = sh.flush_gen.load(Ordering::Relaxed);
+                let flush = sh.flush_gen.load(Ordering::Acquire);
 
-                // A seek/load flushed the ring: drop stale audio.
+                // A seek/load flushed the ring: drop stale audio with a bounded pop
+                // and acknowledge so the decoder thread only pushes new audio AFTER
+                // the flush has completed.
                 if flush != local_flush {
+                    let avail = consumer.slots();
+                    for _ in 0..avail {
+                        let _ = consumer.pop();
+                    }
                     local_flush = flush;
-                    while consumer.pop().is_ok() {}
+                    sh.flush_ack.store(flush, Ordering::Release);
                 }
                 if want != last_playing || tgen != local_tgen {
                     last_playing = want;
@@ -443,7 +471,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
                 }
 
                 let target_vol = f32::from_bits(sh.volume.load(Ordering::Relaxed));
-                let pull = last_playing || matches!(fade, Fade::Out(_));
+                let pull = !is_flushing && (last_playing || matches!(fade, Fade::Out(_)));
                 // Fix #6: skip the tap entirely unless a consumer is attached.
                 let dsp_on = sh.dsp_enabled.load(Ordering::Relaxed);
                 let frames = data.len() / out_ch;
@@ -489,7 +517,9 @@ pub fn start(src: Source) -> Result<Audio, String> {
                                     // Fix #1/#2: the ring is drained *and* the
                                     // decoder signalled EOF — only now is the
                                     // track really over. Never cut buffered audio.
-                                    if sh.decoder_eof.load(Ordering::Acquire) {
+                                    if !sh.loop_enabled.load(Ordering::Relaxed)
+                                        && sh.decoder_eof.load(Ordering::Acquire)
+                                    {
                                         sh.decoder_eof.store(false, Ordering::Release);
                                         sh.playing.store(false, Ordering::Release);
                                         sh.track_ended.store(true, Ordering::Release);
@@ -542,6 +572,8 @@ pub fn start(src: Source) -> Result<Audio, String> {
         started: shared.started.clone(),
         playing: shared.playing.clone(),
         volume: shared.volume.clone(),
+        transport_gen: shared.transport_gen.clone(),
+        loop_enabled: shared.loop_enabled.clone(),
         track_ended: shared.track_ended.clone(),
         dsp_enabled: shared.dsp_enabled.clone(),
         cmd_tx,
@@ -801,7 +833,7 @@ fn close_engine(engine: &mut Engine) {
     *engine = Engine::None;
 }
 
-fn pre_load(sh: &Shared) {
+fn pre_load(sh: &Shared) -> u64 {
     // The 13 ms wait exists only so the output callback can run its 12 ms cosine
     // fade-out before the ring is flushed. From silence (startup) or with the
     // stream already armed, there is no audible tail to protect.
@@ -810,17 +842,86 @@ fn pre_load(sh: &Shared) {
     if was_playing {
         thread::sleep(Duration::from_millis(13));
     }
-    sh.flush_gen.fetch_add(1, Ordering::SeqCst);
+    sh.flushing.store(true, Ordering::SeqCst);
+    sh.flush_gen.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-fn post_load(sh: &Shared, total_frames: u64) {
+fn wait_flush_ack(sh: &Shared, target: u64) {
+    let deadline = Instant::now() + Duration::from_millis(15);
+    while sh.flush_ack.load(Ordering::Acquire) < target && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn post_load(sh: &Shared, total_frames: u64, flush_target: u64) {
+    wait_flush_ack(sh, flush_target);
     sh.total_frames.store(total_frames, Ordering::SeqCst);
     sh.frames_played.store(0, Ordering::SeqCst);
     sh.decoder_eof.store(false, Ordering::SeqCst);
     sh.track_ended.store(false, Ordering::SeqCst);
     sh.fade_out.store(false, Ordering::SeqCst);
+    sh.flushing.store(false, Ordering::SeqCst);
     sh.playing.store(true, Ordering::SeqCst);
     sh.transport_gen.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Trim trailing near-zero encoder padding frames from `in_buf` above `min_frames`
+/// (up to ~42 ms = 2048 stereo frames) before a gapless loop wrap.
+fn trim_trailing_loop_silence(in_buf: &mut Vec<f32>, min_frames: usize) {
+    let total_frames = in_buf.len() / 2;
+    let max_trim = 2048usize;
+    let floor = min_frames.max(total_frames.saturating_sub(max_trim));
+    let mut keep = total_frames;
+    while keep > floor {
+        let l = in_buf[(keep - 1) * 2].abs();
+        let r = in_buf[(keep - 1) * 2 + 1].abs();
+        if l < 5e-4 && r < 5e-4 {
+            keep -= 1;
+        } else {
+            break;
+        }
+    }
+    if keep < total_frames {
+        in_buf.truncate(keep * 2);
+    }
+}
+
+/// Append the first chunk after a loop rewind into `in_buf`, skipping leading
+/// encoder-delay silence frames (up to ~42 ms = 2048 frames) and applying a
+/// 64-frame (~1.3 ms) crossfade across the loop seam so MP3/AAC loops never click.
+fn append_loop_seam_chunk(in_buf: &mut Vec<f32>, chunk: &[f32], min_read_frame: usize) {
+    let chunk_frames = chunk.len() / 2;
+    if chunk_frames == 0 {
+        return;
+    }
+    let max_skip = 2048usize.min(chunk_frames);
+    let mut skip = 0usize;
+    while skip < max_skip {
+        let l = chunk[skip * 2].abs();
+        let r = chunk[skip * 2 + 1].abs();
+        if l < 5e-4 && r < 5e-4 {
+            skip += 1;
+        } else {
+            break;
+        }
+    }
+    let src = &chunk[skip * 2..];
+    let src_frames = src.len() / 2;
+    if src_frames == 0 {
+        return;
+    }
+    let tail_avail = (in_buf.len() / 2).saturating_sub(min_read_frame);
+    let xfade = 64usize.min(tail_avail).min(src_frames);
+    if xfade > 0 {
+        let tail_start = in_buf.len() / 2 - xfade;
+        for i in 0..xfade {
+            let t = (i + 1) as f32 / (xfade + 1) as f32;
+            let idx = (tail_start + i) * 2;
+            in_buf[idx] = in_buf[idx] * (1.0 - t) + src[i * 2] * t;
+            in_buf[idx + 1] = in_buf[idx + 1] * (1.0 - t) + src[i * 2 + 1] * t;
+        }
+    }
+    in_buf.extend_from_slice(&src[xfade * 2..]);
 }
 
 fn decoder_thread(
@@ -852,8 +953,9 @@ fn decoder_thread(
     // Latency instrumentation for `Cmd::Load`: `t0` is the moment the command was
     // dequeued, i.e. what the user waits for after clicking a track.
     let mut load_t0: Option<Instant> = None;
-    let mut load_path = String::new();
+    let mut load_path = PathBuf::new();
     let mut first_chunk_logged = true;
+    let mut meta_pending = false;
 
     // Load the initial source.
     match std::mem::replace(&mut src, Source::Silence) {
@@ -862,46 +964,61 @@ fn decoder_thread(
     }
 
     loop {
-        // --- Commands (non-blocking) -----------------------------------------
+        // --- Commands (coalesced non-blocking drain) --------------------------
+        let mut latest_load: Option<PathBuf> = None;
+        let mut latest_seek: Option<f64> = None;
+        let mut latest_params: Option<PlaybackParams> = None;
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
-                Cmd::Seek(secs) => {
-                    if let Engine::Ffmpeg(handle) = engine {
-                        if !handle.is_null() {
-                            pre_load(&sh);
-                            // Fix #4/#5: a seek invalidates every buffered stage.
-                            shifter.reset();
-                            sh.decoder_eof.store(false, Ordering::Release);
-                            sh.track_ended.store(false, Ordering::Release);
-                            let ok = unsafe { sa_ffmpeg_seek(handle, secs) };
-                            in_buf.clear();
-                            read_pos = 0.0;
-                            eof = false;
-                            // Only move the play head when FFmpeg actually seeked.
-                            if ok != 0 {
-                                sh.frames_played
-                                    .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
-                            }
-                            sh.fade_out.store(false, Ordering::SeqCst);
-                            sh.transport_gen.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                }
                 Cmd::Load(p) => {
-                    let t0 = Instant::now();
-                    load_path = p.display().to_string();
-                    load_t0 = Some(t0);
-                    first_chunk_logged = false;
-                    shifter.reset();
-                    // Leaving the tone/silence source: the new engine drives output.
-                    silence = false;
-                    tone_hz = None;
-                    open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh, t0);
-                    eof = false;
+                    latest_load = Some(p);
+                    latest_seek = None;
+                }
+                Cmd::Seek(secs) => {
+                    latest_seek = Some(secs);
                 }
                 Cmd::SetParams(p) => {
-                    params = p;
-                    step = compute_step(&params);
+                    latest_params = Some(p);
+                }
+            }
+        }
+        if let Some(p) = latest_params {
+            params = p;
+            step = compute_step(&params);
+        }
+        if let Some(p) = latest_load {
+            let t0 = Instant::now();
+            load_path = p.clone();
+            load_t0 = Some(t0);
+            first_chunk_logged = false;
+            meta_pending = true;
+            shifter.reset();
+            in_buf.clear();
+            read_pos = 0.0;
+            eof = false;
+            silence = false;
+            tone_hz = None;
+            open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh);
+        }
+        if let Some(secs) = latest_seek {
+            if let Engine::Ffmpeg(handle) = engine {
+                if !handle.is_null() {
+                    let flush_target = pre_load(&sh);
+                    shifter.reset();
+                    sh.decoder_eof.store(false, Ordering::Release);
+                    sh.track_ended.store(false, Ordering::Release);
+                    let ok = unsafe { sa_ffmpeg_seek(handle, secs) };
+                    in_buf.clear();
+                    read_pos = 0.0;
+                    eof = false;
+                    wait_flush_ack(&sh, flush_target);
+                    if ok != 0 {
+                        sh.frames_played
+                            .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
+                    }
+                    sh.fade_out.store(false, Ordering::SeqCst);
+                    sh.flushing.store(false, Ordering::SeqCst);
+                    sh.transport_gen.fetch_add(1, Ordering::SeqCst);
                 }
             }
         }
@@ -938,9 +1055,39 @@ fn decoder_thread(
                     continue;
                 }
                 let want_in = read_pos.ceil() as usize + LOOKAHEAD + 1;
+                // If the decoder already hit EOF while the 8s ring buffer was still
+                // draining and the user turned Loop ON, immediately rewind and
+                // resume seamless loop decoding.
+                if eof && sh.loop_enabled.load(Ordering::Relaxed) {
+                    sh.decoder_eof.store(false, Ordering::Release);
+                    trim_trailing_loop_silence(&mut in_buf, want_in);
+                    if unsafe { sa_ffmpeg_seek(h, 0.0) } != 0 {
+                        eof = false;
+                        let n = unsafe { sa_ffmpeg_read(h, tmp.as_mut_ptr(), tmp.len() as c_int) };
+                        if n > 0 {
+                            append_loop_seam_chunk(&mut in_buf, &tmp[..n as usize], want_in);
+                        }
+                    }
+                }
                 while !eof && in_buf.len() / 2 < want_in {
                     let n = unsafe { sa_ffmpeg_read(h, tmp.as_mut_ptr(), tmp.len() as c_int) };
                     if n <= 0 {
+                        if sh.loop_enabled.load(Ordering::Relaxed) {
+                            trim_trailing_loop_silence(&mut in_buf, read_pos.ceil() as usize + 1);
+                            if unsafe { sa_ffmpeg_seek(h, 0.0) } != 0 {
+                                let n2 = unsafe {
+                                    sa_ffmpeg_read(h, tmp.as_mut_ptr(), tmp.len() as c_int)
+                                };
+                                if n2 > 0 {
+                                    append_loop_seam_chunk(
+                                        &mut in_buf,
+                                        &tmp[..n2 as usize],
+                                        read_pos.ceil() as usize + 1,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         eof = true;
                         break;
                     }
@@ -950,7 +1097,7 @@ fn decoder_thread(
                             println!(
                                 "[audio] first samples decoded in {:.1} ms for {}",
                                 t0.elapsed().as_secs_f64() * 1000.0,
-                                load_path
+                                load_path.display()
                             );
                         }
                     }
@@ -984,6 +1131,27 @@ fn decoder_thread(
         }
 
         push_processed(&mut producer, &params, &mut shifter, &raw, out_ch, &mut post);
+
+        // Extract metadata + cover art from the ALREADY-OPEN FFmpegDecoder handle
+        // right after the first audio chunk is pushed into the ring buffer:
+        //   - first-audio latency is untouched (audio is already playing!)
+        //   - zero second SMB `avformat_open_input` / `avformat_find_stream_info`
+        //   - zero background thread spawn per track.
+        if meta_pending {
+            meta_pending = false;
+            if let Engine::Ffmpeg(h) = engine {
+                if let Some(m) = read_handle_metadata(h, &load_path) {
+                    if let Some(t0) = load_t0 {
+                        println!(
+                            "[audio] metadata+cover ready in {:.1} ms for {}",
+                            t0.elapsed().as_secs_f64() * 1000.0,
+                            load_path.display()
+                        );
+                    }
+                    *sh.meta.lock().unwrap() = Some(m);
+                }
+            }
+        }
     }
 }
 
@@ -1059,14 +1227,10 @@ fn open_ffmpeg(
     params: &PlaybackParams,
     step: &mut f64,
     sh: &Shared,
-    t0: Instant,
 ) {
     close_engine(engine);
-    pre_load(sh);
+    let flush_target = pre_load(sh);
 
-    // The decoder is opened FIRST. Everything needed to produce sound — the
-    // format open, the duration, the transport reset — happens before any tag or
-    // cover-art work, which now runs on its own thread.
     let mut handle: *mut c_void = std::ptr::null_mut();
     if let Some(c) = path_cstring(path) {
         handle = unsafe { sa_ffmpeg_open(c.as_ptr(), out_rate as c_int) };
@@ -1084,52 +1248,7 @@ fn open_ffmpeg(
     *sh.meta.lock().unwrap() = None;
     *step = compute_step(params);
     *engine = Engine::Ffmpeg(handle);
-    post_load(sh, total);
-
-    // Metadata + cover art are UI sugar only. Probing them here would put an
-    // SMB round-trip and a JPEG decode in front of the first audio chunk, so it
-    // runs detached. The generation check drops a stale result if the user has
-    // already skipped to another track.
-    let gen = sh.transport_gen.load(Ordering::SeqCst);
-    let probe_path = path.to_path_buf();
-    let probe_shared = sh.clone();
-    let spawned = thread::Builder::new()
-        .name("probe".into())
-        .spawn(move || match probe_metadata(&probe_path) {
-            Some(m) => {
-                println!(
-                    "[audio] metadata+cover ready in {:.1} ms for {}",
-                    t0.elapsed().as_secs_f64() * 1000.0,
-                    probe_path.display()
-                );
-                println!(
-                    "[audio] loaded {} — {} ({}) / {} ({}) — {} Hz, {} kbps, {:.2}s, {} ch, {}-bit{}",
-                    probe_path.display(),
-                    m.codec,
-                    m.codec_long_name,
-                    m.format,
-                    m.format_long_name,
-                    m.sample_rate,
-                    m.bitrate / 1000,
-                    m.duration,
-                    m.channels,
-                    m.bits_per_sample,
-                    if m.has_cover_art { ", cover art" } else { "" }
-                );
-                if probe_shared.transport_gen.load(Ordering::SeqCst) == gen {
-                    *probe_shared.meta.lock().unwrap() = Some(m);
-                }
-            }
-            None => {
-                println!(
-                    "[audio] metadata probe returned nothing for {}",
-                    probe_path.display()
-                );
-            }
-        });
-    if let Err(e) = spawned {
-        eprintln!("[audio] failed to spawn metadata probe thread: {e}");
-    }
+    post_load(sh, total, flush_target);
 }
 
 fn compute_step(p: &PlaybackParams) -> f64 {

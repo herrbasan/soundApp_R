@@ -1822,8 +1822,7 @@ impl<'a> Ui<'a> {
         let pad_x = t.space();
         self.state.register_focusable(id);
         let is_open = self.state.open_popup_id == Some(id);
-        let hovered = r.contains(self.state.cursor.0, self.state.cursor.1)
-            && (self.state.active_id.is_none() || self.state.active_id == Some(id));
+        let hovered = self.state.can_hover(id, r);
         let mut changed = false;
 
         if hovered {
@@ -1831,6 +1830,7 @@ impl<'a> Ui<'a> {
             if self.state.mouse_pressed {
                 self.state.active_id = Some(id);
                 self.state.focused_id = Some(id);
+                self.state.mouse_pressed = false;
                 if is_open {
                     self.state.open_popup_id = None;
                     self.state.popup_rect = None;
@@ -1962,6 +1962,8 @@ impl<'a> Ui<'a> {
                     self.state.hovered_id = Some(id);
                     if self.state.mouse_pressed {
                         *selected = i;
+                        self.state.active_id = Some(id);
+                        self.state.mouse_pressed = false;
                         self.state.open_popup_id = None;
                         self.state.popup_rect = None;
                         changed = true;

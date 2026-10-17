@@ -141,13 +141,28 @@ static int sa_decode_cover_rgba(const std::vector<uint8_t>& bytes,
     if (bytes.empty() || !out_rgba || target_side <= 0) return 0;
 
     AVCodecID id = AV_CODEC_ID_MJPEG;
-    if (mime == "image/png") id = AV_CODEC_ID_PNG;
-    else if (mime == "image/bmp") id = AV_CODEC_ID_BMP;
+    if (bytes.size() >= 8 &&
+        bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G') {
+        id = AV_CODEC_ID_PNG;
+    } else if (bytes.size() >= 2 && bytes[0] == 'B' && bytes[1] == 'M') {
+        id = AV_CODEC_ID_BMP;
+    } else if (bytes.size() >= 12 &&
+               bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F' &&
+               bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P') {
+        id = AV_CODEC_ID_WEBP;
+    } else if (mime == "image/png") {
+        id = AV_CODEC_ID_PNG;
+    } else if (mime == "image/bmp") {
+        id = AV_CODEC_ID_BMP;
+    }
 
     const AVCodec* dec = avcodec_find_decoder(id);
     if (!dec) return 0;
     AVCodecContext* ctx = avcodec_alloc_context3(dec);
     if (!ctx) return 0;
+    // Single-threaded cover decode: avoids 24-thread DLL_THREAD_ATTACH loader-lock
+    // contention with the UI thread's OpenGL context / swap_buffers.
+    ctx->thread_count = 1;
 
     int ok = 0;
     if (avcodec_open2(ctx, dec, nullptr) >= 0) {
@@ -209,6 +224,39 @@ int sa_ffmpeg_probe_metadata(const char* path_utf8, SaAudioMeta* out_meta,
     out_meta->cover_art_len = static_cast<int>(m.coverArt.size());
 
     if (out_cover_rgba && cover_side > 0) {
+        sa_decode_cover_rgba(m.coverArt, m.coverArtMimeType, out_cover_rgba, cover_side);
+    }
+
+    return (m.sampleRate > 0 || m.duration > 0.0) ? 1 : 0;
+}
+
+// Extract metadata + cover art directly from an already-open FFmpegDecoder handle
+// (zero extra avformat_open_input / avformat_find_stream_info over SMB).
+int sa_ffmpeg_read_handle_metadata(void* handle, SaAudioMeta* out_meta,
+                                   uint8_t* out_cover_rgba, int cover_side) {
+    if (!handle || !out_meta) return 0;
+    memset(out_meta, 0, sizeof(SaAudioMeta));
+
+    FFmpegDecoder::AudioMetadata m = static_cast<FFmpegDecoder*>(handle)->getMetadata();
+
+    sa_copy_str(out_meta->title, sizeof(out_meta->title), m.title);
+    sa_copy_str(out_meta->artist, sizeof(out_meta->artist), m.artist);
+    sa_copy_str(out_meta->album, sizeof(out_meta->album), m.album);
+    sa_copy_str(out_meta->genre, sizeof(out_meta->genre), m.genre);
+    sa_copy_str(out_meta->codec, sizeof(out_meta->codec), m.codec);
+    sa_copy_str(out_meta->format, sizeof(out_meta->format), m.format);
+    sa_copy_str(out_meta->codec_long_name, sizeof(out_meta->codec_long_name), m.codecLongName);
+    sa_copy_str(out_meta->format_long_name, sizeof(out_meta->format_long_name), m.formatLongName);
+
+    out_meta->duration = m.duration;
+    out_meta->bitrate = m.bitrate;
+    out_meta->sample_rate = m.sampleRate;
+    out_meta->channels = m.channels;
+    out_meta->bits_per_sample = m.bitsPerSample;
+    out_meta->has_cover_art = m.coverArt.empty() ? 0 : 1;
+    out_meta->cover_art_len = static_cast<int>(m.coverArt.size());
+
+    if (out_cover_rgba && cover_side > 0 && !m.coverArt.empty()) {
         sa_decode_cover_rgba(m.coverArt, m.coverArtMimeType, out_cover_rgba, cover_side);
     }
 

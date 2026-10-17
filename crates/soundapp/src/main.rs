@@ -101,8 +101,10 @@ struct App {
     playlist: Vec<PathBuf>,
     /// Metadata of the currently-loaded file (from FFmpeg).
     track_meta: Option<TrackMetadata>,
-    /// True once the current track's embedded cover has been pushed to the scene.
-    cover_uploaded: bool,
+    /// Background directory scanner so SMB `read_dir` / `is_dir` never touches the UI thread.
+    scan_tx: std::sync::mpsc::Sender<(u64, ScanJob)>,
+    scan_rx: std::sync::mpsc::Receiver<(u64, ScanOutcome)>,
+    scan_gen: u64,
 
     // Phase 3.3 — real-time DSP analysis tap + last snapshot for the Monitoring window.
     dsp: DspAnalyzer,
@@ -597,6 +599,32 @@ fn ribbon_color(ext: &str) -> (u8, u8, u8, u8) {
     }
 }
 
+/// Background directory-scan request so the UI thread never blocks on SMB I/O.
+enum ScanJob {
+    SingleFile(PathBuf),
+    Path {
+        path: PathBuf,
+        append: bool,
+        recursive: bool,
+    },
+    MixerPath {
+        path: PathBuf,
+        recursive: bool,
+    },
+}
+
+enum ScanOutcome {
+    SingleFile {
+        files: Vec<PathBuf>,
+        idx: usize,
+    },
+    Folder {
+        files: Vec<PathBuf>,
+        append: bool,
+    },
+    MixerStems(usize),
+}
+
 /// Which of the three drop zones the pointer is over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DropZone {
@@ -664,8 +692,8 @@ fn ghost_icon_btn(
     clicked
 }
 
-/// Flat dark square transport button (`rgb(52,52,52)` normal / `68` hover,
-/// blue when active).
+/// Flat square transport button (`rgb(52,52,52)` in dark / `rgb(180,180,180)` in light,
+/// blue when active — matching `SoundApp/css/main.css` `.controls .button`).
 fn player_icon_btn(
     ui: &mut Ui,
     id: u32,
@@ -674,6 +702,7 @@ fn player_icon_btn(
     active: bool,
     scale: f32,
 ) -> bool {
+    let dark = ui.theme.dark;
     ui.state.register_focusable(id);
     let hovered = ui.state.can_hover(id, r);
     if hovered {
@@ -686,10 +715,16 @@ fn player_icon_btn(
     let clicked = hovered && ui.state.mouse_released && ui.state.active_id == Some(id);
     let fill = if active {
         rgb(76, 132, 229)
+    } else if dark {
+        if hovered {
+            rgb(68, 68, 68)
+        } else {
+            rgb(52, 52, 52)
+        }
     } else if hovered {
-        rgb(68, 68, 68)
+        rgb(150, 150, 150)
     } else {
-        rgb(52, 52, 52)
+        rgb(180, 180, 180)
     };
     ui.scene.rounded_rect(
         r.x,
@@ -701,17 +736,20 @@ fn player_icon_btn(
         (0, 0, 0, 0),
         0.0,
     );
+    let fg = if active {
+        rgb(255, 255, 255)
+    } else if dark {
+        rgb(185, 185, 185)
+    } else {
+        rgb(30, 30, 30)
+    };
     ui.scene.icon_centered(
         ui.text_sys,
         icon,
         (r.x + r.w * 0.5).round(),
         (r.y + r.h * 0.5).round(),
         (14.0 * scale).round(),
-        if active {
-            rgb(255, 255, 255)
-        } else {
-            rgb(185, 185, 185)
-        },
+        fg,
     );
     clicked
 }
@@ -729,6 +767,17 @@ fn draw_meta_row(
     value: &str,
     value_w: f32,
 ) {
+    let dark = ui.theme.dark;
+    let lbl_col = if dark {
+        rgb(130, 130, 130)
+    } else {
+        rgb(105, 105, 105)
+    };
+    let val_col = if dark {
+        rgb(205, 205, 205)
+    } else {
+        rgb(25, 25, 25)
+    };
     if !label.is_empty() {
         let lw = ui
             .text_sys
@@ -741,7 +790,7 @@ fn draw_meta_row(
             (x + label_w - lw).round(),
             baseline,
             fs,
-            rgb(130, 130, 130),
+            lbl_col,
         );
     }
     ui.text_clipped(
@@ -752,7 +801,7 @@ fn draw_meta_row(
         baseline,
         fs,
         value_w,
-        rgb(205, 205, 205),
+        val_col,
     );
 }
 
@@ -824,6 +873,52 @@ impl App {
         config: UserConfig,
     ) -> Self {
         let mixer_stems = default_mixer_stems();
+        let (scan_tx, job_rx) = std::sync::mpsc::channel::<(u64, ScanJob)>();
+        let (res_tx, scan_rx) = std::sync::mpsc::channel::<(u64, ScanOutcome)>();
+        let _ = std::thread::Builder::new()
+            .name("playlist-scan".into())
+            .spawn(move || {
+                while let Ok((mut gen, mut job)) = job_rx.recv() {
+                    // Coalesce if newer non-append scans arrived while busy.
+                    while let Ok((g2, j2)) = job_rx.try_recv() {
+                        gen = g2;
+                        job = j2;
+                    }
+                    let out = match job {
+                        ScanJob::SingleFile(p) => {
+                            let (files, idx) = playlist_from_single_file(&p);
+                            ScanOutcome::SingleFile { files, idx }
+                        }
+                        ScanJob::Path {
+                            path,
+                            append,
+                            recursive,
+                        } => {
+                            if path.is_dir() {
+                                let files = playlist_from_folder(&path, recursive);
+                                ScanOutcome::Folder { files, append }
+                            } else if append {
+                                ScanOutcome::Folder {
+                                    files: vec![path],
+                                    append: true,
+                                }
+                            } else {
+                                let (files, idx) = playlist_from_single_file(&path);
+                                ScanOutcome::SingleFile { files, idx }
+                            }
+                        }
+                        ScanJob::MixerPath { path, recursive } => {
+                            let files = if path.is_dir() {
+                                playlist_from_folder(&path, recursive)
+                            } else {
+                                playlist_from_single_file(&path).0
+                            };
+                            ScanOutcome::MixerStems(files.len().min(20))
+                        }
+                    };
+                    let _ = res_tx.send((gen, out));
+                }
+            });
         Self {
             start: Instant::now(),
             reported: false,
@@ -874,7 +969,9 @@ impl App {
             shuffle_enabled: false,
             playlist: Vec::new(),
             track_meta: None,
-            cover_uploaded: false,
+            scan_tx,
+            scan_rx,
+            scan_gen: 0,
             dsp: DspAnalyzer::new(48_000),
             last_dsp_frames: 0,
             dsp_buf: Vec::new(),
@@ -989,45 +1086,105 @@ impl App {
         }
         self.scrub_frac = 0.0;
         self.track_meta = None;
-        self.cover_uploaded = false;
+        self.scene.clear_image();
         if let Some(a) = &self.audio {
             a.load_file(path);
         }
     }
 
-    /// Open a file or folder, replacing the implicit folder playlist or appending
-    /// to it. Folders recurse when `recursive_dirs` is set.
+    /// Open a file or folder without blocking the UI thread on SMB directory I/O.
     fn open_path(&mut self, path: PathBuf, append: bool, recursive_dirs: bool) {
-        if !is_supported_audio(&path) && path.is_dir() {
-            let files = playlist_from_folder(&path, recursive_dirs);
-            if files.is_empty() {
+        if is_supported_audio(&path) {
+            if append && !self.playlist.is_empty() {
+                self.playlist.push(path);
                 return;
             }
-            if append && !self.playlist.is_empty() {
-                self.playlist.extend(files);
-            } else {
-                self.playlist = files;
-                self.selected_track = 0;
-                self.load_playlist_index(0);
-            }
-        } else if append && !self.playlist.is_empty() {
-            self.playlist.push(path);
-        } else {
-            // Dispatch the file to the audio decoder immediately (0 SMB stat calls
-            // beforehand) so FFmpeg opens the stream in parallel with `read_dir`.
             if !self.chk_locked {
                 self.pitch_semitones = 0.0;
                 self.tempo_ratio = 1.0;
             }
             self.scrub_frac = 0.0;
             self.track_meta = None;
-            self.cover_uploaded = false;
+            self.scene.clear_image();
             if let Some(a) = &self.audio {
                 a.load_file(path.clone());
             }
-            let (list, idx) = playlist_from_single_file(&path);
-            self.playlist = list;
-            self.selected_track = idx;
+            self.playlist = vec![path.clone()];
+            self.selected_track = 0;
+            self.scan_gen = self.scan_gen.wrapping_add(1);
+            let _ = self
+                .scan_tx
+                .send((self.scan_gen, ScanJob::SingleFile(path)));
+        } else {
+            self.scan_gen = self.scan_gen.wrapping_add(1);
+            let _ = self.scan_tx.send((
+                self.scan_gen,
+                ScanJob::Path {
+                    path,
+                    append,
+                    recursive: recursive_dirs,
+                },
+            ));
+        }
+    }
+
+    /// Poll background directory-scan completions and end-of-track transitions.
+    fn poll_transport_and_scans(&mut self) {
+        let mut redraw = false;
+        while let Ok((gen, out)) = self.scan_rx.try_recv() {
+            match out {
+                ScanOutcome::SingleFile { files, idx } => {
+                    if gen == self.scan_gen && !files.is_empty() {
+                        self.playlist = files;
+                        self.selected_track = idx;
+                        redraw = true;
+                    }
+                }
+                ScanOutcome::Folder { files, append } => {
+                    if files.is_empty() {
+                        continue;
+                    }
+                    if append && !self.playlist.is_empty() {
+                        self.playlist.extend(files);
+                        redraw = true;
+                    } else if gen == self.scan_gen {
+                        self.playlist = files;
+                        self.selected_track = 0;
+                        self.load_playlist_index(0);
+                        redraw = true;
+                    }
+                }
+                ScanOutcome::MixerStems(n) => {
+                    if n > 0 {
+                        self.mixer_stems = (0..n)
+                            .map(|i| MixerStem {
+                                number: i + 1,
+                                gain: 1.0,
+                                pan: 0.0,
+                                muted: false,
+                                solo: false,
+                            })
+                            .collect();
+                        redraw = true;
+                    }
+                }
+            }
+        }
+        let ended = self
+            .audio
+            .as_ref()
+            .map(|a| a.take_track_ended())
+            .unwrap_or(false);
+        if ended {
+            if self.advance_track(true) {
+                self.animate = true;
+            }
+            redraw = true;
+        }
+        if redraw {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
 
@@ -1082,22 +1239,16 @@ impl App {
         let pw = w as f32;
         let ph = h as f32;
 
-        // Pull the real metadata published by the decoder thread.
+        // Pull the real metadata published by the decoder thread and sync cover art
+        // whenever the track metadata changes (including clearing when absent).
         let meta = self.audio.as_ref().and_then(|a| a.metadata());
         if meta != self.track_meta {
-            self.track_meta = meta;
-        }
-        // Push embedded cover art into the scene once per track (metadata arrives
-        // asynchronously from the decoder thread, hence the retry-until-found flag).
-        if !self.cover_uploaded {
-            if let Some((cw, ch, rgba)) = self
-                .track_meta
-                .as_ref()
-                .and_then(|m| m.cover_rgba.clone())
-            {
+            if let Some((cw, ch, rgba)) = meta.as_ref().and_then(|m| m.cover_rgba.clone()) {
                 self.scene.set_image(cw, ch, rgba);
-                self.cover_uploaded = true;
+            } else {
+                self.scene.clear_image();
             }
+            self.track_meta = meta;
         }
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         let (pos, dur) = self
@@ -1256,23 +1407,48 @@ impl App {
                 if theme.dark {
                     rgb(35, 35, 35)
                 } else {
-                    rgb(246, 246, 246)
+                    rgb(226, 226, 226)
                 },
             );
-            ui.scene.rect(0.0, top_h - 1.0, pw, 1.0, rgba(255, 255, 255, 20));
+            ui.scene.rect(
+                0.0,
+                top_h - 1.0,
+                pw,
+                1.0,
+                if theme.dark {
+                    rgba(255, 255, 255, 20)
+                } else {
+                    rgba(0, 0, 0, 35)
+                },
+            );
 
             let icon_px = 14.0 * scale;
-            let ghost_hover = rgba(255, 255, 255, 15);
+            let ghost_hover = if theme.dark {
+                rgba(255, 255, 255, 15)
+            } else {
+                rgba(0, 0, 0, 15)
+            };
+            let top_fg_active = if theme.dark {
+                rgb(255, 255, 255)
+            } else {
+                rgb(15, 15, 15)
+            };
+            let top_fg_mid = if theme.dark {
+                rgb(185, 185, 185)
+            } else {
+                rgb(55, 55, 55)
+            };
+            let top_fg_dim = if theme.dark {
+                rgb(115, 115, 115)
+            } else {
+                rgb(135, 135, 135)
+            };
             if ghost_icon_btn(
                 &mut ui,
                 601,
                 Rect::new(0.0, 0.0, top_h, top_h),
                 if playing { ICON_PAUSE } else { ICON_PLAY },
-                if playing {
-                    rgb(255, 255, 255)
-                } else {
-                    rgb(185, 185, 185)
-                },
+                if playing { top_fg_active } else { top_fg_mid },
                 icon_px,
                 ghost_hover,
             ) {
@@ -1284,9 +1460,9 @@ impl App {
                 Rect::new(top_h, 0.0, top_h, top_h),
                 ICON_LOOP,
                 if self.loop_enabled {
-                    rgb(255, 255, 255)
+                    top_fg_active
                 } else {
-                    rgb(115, 115, 115)
+                    top_fg_dim
                 },
                 icon_px,
                 ghost_hover,
@@ -1299,9 +1475,9 @@ impl App {
                 Rect::new(top_h * 2.0, 0.0, top_h, top_h),
                 ICON_SHUFFLE,
                 if self.shuffle_enabled {
-                    rgb(255, 255, 255)
+                    top_fg_active
                 } else {
-                    rgb(115, 115, 115)
+                    top_fg_dim
                 },
                 icon_px,
                 ghost_hover,
@@ -1318,7 +1494,11 @@ impl App {
                 (92.0 * scale).round(),
                 (top_h * 0.5 + counter_fs * 0.34).round(),
                 counter_fs,
-                rgb(210, 210, 210),
+                if theme.dark {
+                    rgb(210, 210, 210)
+                } else {
+                    rgb(25, 25, 25)
+                },
             );
 
             let right_btn_w = (34.0 * scale).round();
@@ -1327,7 +1507,7 @@ impl App {
                 604,
                 Rect::new(pw - right_btn_w * 2.0, 0.0, right_btn_w, top_h),
                 ICON_SETTINGS,
-                rgb(185, 185, 185),
+                top_fg_mid,
                 icon_px,
                 ghost_hover,
             ) {
@@ -1338,7 +1518,7 @@ impl App {
                 605,
                 Rect::new(pw - right_btn_w, 0.0, right_btn_w, top_h),
                 ICON_CLOSE,
-                rgb(185, 185, 185),
+                top_fg_mid,
                 icon_px,
                 rgb(145, 58, 7),
             ) {
@@ -1465,14 +1645,34 @@ impl App {
             if ui.state.active_id == Some(scrub_id) && ui.state.mouse_released && is_finite {
                 intents.seek_to = Some(self.scrub_frac as f64 * dur);
             }
-            ui.scene.rect(bar_x, bar_y, bar_w, bar_h, rgb(68, 68, 68));
+            let track_bar_bg = if theme.dark {
+                rgb(68, 68, 68)
+            } else {
+                rgb(180, 180, 180)
+            };
+            let track_bar_fill = if theme.dark {
+                rgb(180, 180, 180)
+            } else {
+                rgb(50, 50, 50)
+            };
+            ui.scene.rect(bar_x, bar_y, bar_w, bar_h, track_bar_bg);
             let fill_w = bar_w * self.scrub_frac.clamp(0.0, 1.0);
             if fill_w > 0.5 {
-                ui.scene.rect(bar_x, bar_y, fill_w, bar_h, rgb(180, 180, 180));
+                ui.scene.rect(bar_x, bar_y, fill_w, bar_h, track_bar_fill);
             }
 
             let sfs = (11.0 * scale).round();
             let sy = (bar_y + bar_h + 6.0 * scale + sfs).round();
+            let time_col = if theme.dark {
+                rgb(190, 190, 190)
+            } else {
+                rgb(35, 35, 35)
+            };
+            let vol_txt_col = if theme.dark {
+                rgb(130, 130, 130)
+            } else {
+                rgb(100, 100, 100)
+            };
             ui.scene.text(
                 ui.text_sys,
                 FontFace::Regular,
@@ -1481,7 +1681,7 @@ impl App {
                 bar_x,
                 sy,
                 sfs,
-                rgb(190, 190, 190),
+                time_col,
             );
             let vw = ui
                 .text_sys
@@ -1494,7 +1694,7 @@ impl App {
                 (pw * 0.5 - vw * 0.5).round(),
                 sy,
                 sfs,
-                rgb(130, 130, 130),
+                vol_txt_col,
             );
             let dur_lbl = fmt_time(dur);
             let dw = ui
@@ -1508,7 +1708,7 @@ impl App {
                 (bar_x + bar_w - dw).round(),
                 sy,
                 sfs,
-                rgb(190, 190, 190),
+                time_col,
             );
 
             // ---- Row 4: bottom controls bar (optional) ----
@@ -1523,10 +1723,20 @@ impl App {
                     if theme.dark {
                         rgb(37, 37, 37)
                     } else {
-                        rgb(240, 240, 240)
+                        rgb(220, 220, 220)
                     },
                 );
-                ui.scene.rect(0.0, bar_top, pw, 1.0, rgb(58, 58, 58));
+                ui.scene.rect(
+                    0.0,
+                    bar_top,
+                    pw,
+                    1.0,
+                    if theme.dark {
+                        rgb(58, 58, 58)
+                    } else {
+                        rgb(180, 180, 180)
+                    },
+                );
 
                 let bs = (28.0 * scale).round();
                 let by = (bar_top + (ctrl_h - bs) * 0.5).round();
@@ -1561,7 +1771,11 @@ impl App {
                     vx + 7.5 * scale,
                     by + bs * 0.5,
                     (15.0 * scale).round(),
-                    rgb(185, 185, 185),
+                    if theme.dark {
+                        rgb(185, 185, 185)
+                    } else {
+                        rgb(50, 50, 50)
+                    },
                 );
                 let vol_x = (vx + 22.0 * scale).round();
                 let vol_w = (96.0 * scale).round();
@@ -1581,10 +1795,10 @@ impl App {
                     self.master_vol = ((ui.state.cursor.0 - vol_x) / vol_w).clamp(0.0, 1.0);
                     intents.vol_changed = true;
                 }
-                ui.scene.rect(vol_x, vol_y, vol_w, vol_h, rgb(68, 68, 68));
+                ui.scene.rect(vol_x, vol_y, vol_w, vol_h, track_bar_bg);
                 let vfill = vol_w * self.master_vol.clamp(0.0, 1.0);
                 if vfill > 0.5 {
-                    ui.scene.rect(vol_x, vol_y, vfill, vol_h, rgb(185, 185, 185));
+                    ui.scene.rect(vol_x, vol_y, vfill, vol_h, track_bar_fill);
                 }
 
                 // Right transport group.
@@ -1622,6 +1836,9 @@ impl App {
         // --- Apply the main-window intents outside the render borrow.
         if intents.loop_toggled {
             self.loop_enabled = !self.loop_enabled;
+            if let Some(a) = &self.audio {
+                a.set_loop(self.loop_enabled);
+            }
         }
         if intents.shuffle_toggled {
             self.shuffle_enabled = !self.shuffle_enabled;
@@ -1646,11 +1863,12 @@ impl App {
         }
         if intents.prev || intents.next {
             if !self.playlist.is_empty() {
-                let cur = self.selected_track.min(self.playlist.len() - 1);
+                let len = self.playlist.len();
+                let cur = self.selected_track.min(len - 1);
                 let idx = if intents.prev {
-                    cur.saturating_sub(1)
+                    (cur + len - 1) % len
                 } else {
-                    (cur + 1).min(self.playlist.len() - 1)
+                    (cur + 1) % len
                 };
                 self.load_playlist_index(idx);
             }
@@ -1672,23 +1890,14 @@ impl App {
                 DropZone::Add => self.open_path(path, true, recursive),
                 DropZone::Replace => self.open_path(path, false, recursive),
                 DropZone::Mixer => {
-                    let files = if path.is_dir() {
-                        playlist_from_folder(&path, recursive)
-                    } else {
-                        playlist_from_single_file(&path).0
-                    };
-                    if !files.is_empty() {
-                        let n = files.len().min(20);
-                        self.mixer_stems = (0..n)
-                            .map(|i| MixerStem {
-                                number: i + 1,
-                                gain: 1.0,
-                                pan: 0.0,
-                                muted: false,
-                                solo: false,
-                            })
-                            .collect();
-                    }
+                    self.scan_gen = self.scan_gen.wrapping_add(1);
+                    let _ = self.scan_tx.send((
+                        self.scan_gen,
+                        ScanJob::MixerPath {
+                            path,
+                            recursive,
+                        },
+                    ));
                     if !self.secondary_windows.is_visible("mixer") {
                         self.pending_window_toggles.push("mixer");
                     }
@@ -1705,6 +1914,7 @@ impl App {
     }
 
     fn render(&mut self) {
+        self.poll_transport_and_scans();
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -1870,7 +2080,8 @@ impl App {
                                 if w.ui_state.cursor.1 < hdr_h
                                     && w.ui_state.cursor.0 < w.size.0 as f32 - rem * 2.9
                                 {
-                                    let _ = w.window.drag_window();
+                                    let win = w.window.clone();
+                                    nui::drag_window_live(&win);
                                 } else {
                                     w.ui_state.on_mouse_press();
                                     w.window.request_redraw();
@@ -2970,8 +3181,8 @@ impl ApplicationHandler for App {
                                 None
                             };
                             if let Some(dir) = dir {
-                                if let Some(w) = &self.window {
-                                    let _ = w.drag_resize_window(dir);
+                                if let Some(w) = self.window.clone() {
+                                    nui::drag_resize_window_live(&w, dir);
                                 }
                                 return;
                             }
@@ -2990,8 +3201,8 @@ impl ApplicationHandler for App {
                                 && self.ui_state.cursor.0 > 130.0 * scale
                                 && self.ui_state.cursor.0 < pw - 72.0 * scale;
                             if drag_zone {
-                                if let Some(w) = &self.window {
-                                    let _ = w.drag_window();
+                                if let Some(w) = self.window.clone() {
+                                    nui::drag_window_live(&w);
                                 }
                             } else {
                                 self.ui_state.on_mouse_press();
@@ -3125,6 +3336,9 @@ impl ApplicationHandler for App {
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("l") => {
                             self.loop_enabled = !self.loop_enabled;
+                            if let Some(a) = &self.audio {
+                                a.set_loop(self.loop_enabled);
+                            }
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("c") => {
                             self.show_controls = !self.show_controls;
@@ -3184,21 +3398,7 @@ impl ApplicationHandler for App {
                 return;
             }
         }
-        // Fix #2: the engine latches end-of-track after the ring is drained, so
-        // the playlist advances here — on the timer tick that is still scheduled.
-        let ended = self
-            .audio
-            .as_ref()
-            .map(|a| a.take_track_ended())
-            .unwrap_or(false);
-        if ended {
-            if self.advance_track(self.loop_enabled) {
-                self.animate = true;
-            }
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
-        }
+        self.poll_transport_and_scans();
 
         let playing = self
             .audio
