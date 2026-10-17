@@ -45,6 +45,12 @@ static int sa_snprintf(char* buf, size_t n, const char* fmt, ...) {
 #include "D:/Work/_GIT/SoundApp/libs/ffmpeg-napi-interface/src/decoder.cpp"
 #undef snprintf
 
+// swscale.h ships without an `extern "C"` guard, unlike the av* headers pulled in
+// by decoder.h — without this wrapper the linker sees C++-mangled sws_* symbols.
+extern "C" {
+#include <libswscale/swscale.h>
+}
+
 extern "C" {
 
 struct SaAudioMeta {
@@ -54,6 +60,8 @@ struct SaAudioMeta {
     char genre[64];
     char codec[64];
     char format[64];
+    char codec_long_name[128];
+    char format_long_name[128];
     double duration;
     int bitrate;
     int sample_rate;
@@ -72,7 +80,7 @@ static void sa_copy_str(char* dst, size_t cap, const std::string& src) {
 void* sa_ffmpeg_open(const char* path_utf8, int out_sample_rate) {
     if (!path_utf8) return nullptr;
     FFmpegDecoder* dec = new FFmpegDecoder();
-    if (!dec->open(path_utf8, out_sample_rate, 0)) {
+    if (!dec->open(path_utf8, out_sample_rate, 1)) {
         delete dec;
         return nullptr;
     }
@@ -123,7 +131,61 @@ int sa_ffmpeg_set_formant(void* handle, int preserve) {
     return 1;
 }
 
-int sa_ffmpeg_probe_metadata(const char* path_utf8, SaAudioMeta* out_meta) {
+// Decode an already-extracted cover-art payload (JPEG/PNG/BMP bytes from the
+// attached picture stream) and scale it to `target_side` x `target_side` RGBA.
+// No file I/O: the bytes come from the metadata probe's single format open.
+static int sa_decode_cover_rgba(const std::vector<uint8_t>& bytes,
+                                const std::string& mime,
+                                uint8_t* out_rgba,
+                                int target_side) {
+    if (bytes.empty() || !out_rgba || target_side <= 0) return 0;
+
+    AVCodecID id = AV_CODEC_ID_MJPEG;
+    if (mime == "image/png") id = AV_CODEC_ID_PNG;
+    else if (mime == "image/bmp") id = AV_CODEC_ID_BMP;
+
+    const AVCodec* dec = avcodec_find_decoder(id);
+    if (!dec) return 0;
+    AVCodecContext* ctx = avcodec_alloc_context3(dec);
+    if (!ctx) return 0;
+
+    int ok = 0;
+    if (avcodec_open2(ctx, dec, nullptr) >= 0) {
+        AVPacket* pkt = av_packet_alloc();
+        AVFrame* frame = av_frame_alloc();
+        if (pkt && frame && av_new_packet(pkt, static_cast<int>(bytes.size())) >= 0) {
+            memcpy(pkt->data, bytes.data(), bytes.size());
+            if (avcodec_send_packet(ctx, pkt) >= 0 &&
+                avcodec_receive_frame(ctx, frame) >= 0 &&
+                frame->width > 0 && frame->height > 0) {
+                SwsContext* sws = sws_getContext(
+                    frame->width, frame->height,
+                    static_cast<AVPixelFormat>(frame->format),
+                    target_side, target_side, AV_PIX_FMT_RGBA,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+                if (sws) {
+                    uint8_t* dst_data[4] = {out_rgba, nullptr, nullptr, nullptr};
+                    int dst_linesize[4] = {target_side * 4, 0, 0, 0};
+                    sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
+                              dst_data, dst_linesize);
+                    sws_freeContext(sws);
+                    ok = 1;
+                }
+            }
+        }
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+    }
+    avcodec_free_context(&ctx);
+    return ok;
+}
+
+// Probe metadata AND decode the embedded cover art from ONE format open.
+// `getFileMetadata` returns the attached picture bytes alongside the tags, so
+// the cover never costs a second `avformat_open_input` over the network.
+// Returns 1 when usable metadata was found.
+int sa_ffmpeg_probe_metadata(const char* path_utf8, SaAudioMeta* out_meta,
+                             uint8_t* out_cover_rgba, int cover_side) {
     if (!path_utf8 || !out_meta) return 0;
     memset(out_meta, 0, sizeof(SaAudioMeta));
 
@@ -135,6 +197,8 @@ int sa_ffmpeg_probe_metadata(const char* path_utf8, SaAudioMeta* out_meta) {
     sa_copy_str(out_meta->genre, sizeof(out_meta->genre), m.genre);
     sa_copy_str(out_meta->codec, sizeof(out_meta->codec), m.codec);
     sa_copy_str(out_meta->format, sizeof(out_meta->format), m.format);
+    sa_copy_str(out_meta->codec_long_name, sizeof(out_meta->codec_long_name), m.codecLongName);
+    sa_copy_str(out_meta->format_long_name, sizeof(out_meta->format_long_name), m.formatLongName);
 
     out_meta->duration = m.duration;
     out_meta->bitrate = m.bitrate;
@@ -143,6 +207,10 @@ int sa_ffmpeg_probe_metadata(const char* path_utf8, SaAudioMeta* out_meta) {
     out_meta->bits_per_sample = m.bitsPerSample;
     out_meta->has_cover_art = m.coverArt.empty() ? 0 : 1;
     out_meta->cover_art_len = static_cast<int>(m.coverArt.size());
+
+    if (out_cover_rgba && cover_side > 0) {
+        sa_decode_cover_rgba(m.coverArt, m.coverArtMimeType, out_cover_rgba, cover_side);
+    }
 
     return (m.sampleRate > 0 || m.duration > 0.0) ? 1 : 0;
 }

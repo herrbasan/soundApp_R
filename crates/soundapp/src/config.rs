@@ -12,6 +12,7 @@ pub struct UserConfig {
     pub dark_mode: bool,
     pub ui_zoom: f32,
     pub master_vol: f32,
+    pub show_controls: bool,
     pub chk_locked: bool,
     pub sw_hq_mode: bool,
     pub sw_keep_tray: bool,
@@ -26,6 +27,7 @@ impl Default for UserConfig {
             dark_mode: true,
             ui_zoom: 1.0,
             master_vol: 0.78,
+            show_controls: true,
             chk_locked: false,
             sw_hq_mode: true,
             sw_keep_tray: true,
@@ -69,11 +71,13 @@ impl UserConfig {
     fn to_json(&self) -> String {
         format!(
             "{{\n  \"dark_mode\": {},\n  \"ui_zoom\": {:.4},\n  \"master_vol\": {:.4},\n  \
-             \"chk_locked\": {},\n  \"sw_hq_mode\": {},\n  \"sw_keep_tray\": {},\n  \
-             \"selected_device\": {},\n  \"selected_rate\": {},\n  \"selected_soundfont\": {}\n}}\n",
+             \"show_controls\": {},\n  \"chk_locked\": {},\n  \"sw_hq_mode\": {},\n  \
+             \"sw_keep_tray\": {},\n  \"selected_device\": {},\n  \"selected_rate\": {},\n  \
+             \"selected_soundfont\": {}\n}}\n",
             self.dark_mode,
             self.ui_zoom,
             self.master_vol,
+            self.show_controls,
             self.chk_locked,
             self.sw_hq_mode,
             self.sw_keep_tray,
@@ -94,7 +98,10 @@ impl UserConfig {
             cfg.ui_zoom = v.clamp(0.75, 2.0);
         }
         if let Some(v) = json_f32(text, "master_vol") {
-            cfg.master_vol = v.clamp(0.0, 1.0);
+            cfg.master_vol = v.clamp(0.0, 2.0);
+        }
+        if let Some(v) = json_bool(text, "show_controls") {
+            cfg.show_controls = v;
         }
         if let Some(v) = json_bool(text, "chk_locked") {
             cfg.chk_locked = v;
@@ -157,6 +164,7 @@ mod tests {
             dark_mode: false,
             ui_zoom: 1.25,
             master_vol: 0.42,
+            show_controls: false,
             chk_locked: true,
             sw_hq_mode: false,
             sw_keep_tray: false,

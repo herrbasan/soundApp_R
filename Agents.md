@@ -38,7 +38,7 @@ soundApp_R/
     soundapp/             # SoundApp application crate (`soundapp_r` binary)
       build.rs            # Compiles ffmpeg_bridge.cpp against FFmpeg 7+ headers/libs and stages runtime DLLs
       src/
-        main.rs           # Winit ApplicationHandler, Main Player (compact & studio), Parameters, Monitoring, Mixer, Settings & Help windows
+        main.rs           # Winit ApplicationHandler, focused player window (header + track card + transport + window launchers), Parameters, Monitoring, Mixer, Settings & Help windows
         audio.rs          # Lock-free rtrb ring buffer + cpal output + cosine fades + 8-tap Lanczos + WSOLA pitch/tempo/formant
         ffmpeg_bridge.cpp # C ABI bridge over SoundApp's FFmpegDecoder (decoding, seeking, metadata, rubberband/atempo filter graph)
         midi.rs           # Pure-Rust SF2 SoundFont synthesizer & SMF sequencer (rustysynth + metronome + transpose/BPM)

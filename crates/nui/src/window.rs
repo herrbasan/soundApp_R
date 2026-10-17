@@ -58,7 +58,8 @@ impl WindowManager {
             .with_title(spec.title)
             .with_inner_size(LogicalSize::new(spec.width, spec.height))
             .with_min_inner_size(LogicalSize::new(spec.min_width, spec.min_height))
-            .with_decorations(!spec.undecorated);
+            .with_decorations(!spec.undecorated)
+            .with_theme(Some(winit::window::Theme::Dark));
 
         #[cfg(target_os = "windows")]
         {
@@ -85,7 +86,10 @@ impl WindowManager {
             return idx;
         }
         let attrs = Self::build_window_attrs(spec).with_visible(visible);
-        let (window, renderer) = Renderer::new(event_loop, attrs, prefer);
+        let (window, mut renderer) = Renderer::new(event_loop, attrs, prefer);
+        if visible {
+            renderer.request_reveal();
+        }
         let sz = window.inner_size();
         self.windows.push(ManagedWindow {
             key: spec.key,
@@ -101,13 +105,14 @@ impl WindowManager {
         self.windows.len() - 1
     }
 
-    /// Make sure the window exists, then show + focus + redraw it.
+    /// Make sure the window exists, then mark it for reveal + redraw. The actual
+    /// `set_visible(true)` happens at the end of its first `render()` — after the
+    /// frame is swapped — so the window never flashes white.
     pub fn show(&mut self, event_loop: &ActiveEventLoop, spec: &WindowSpec, prefer: BackendKind) {
         let idx = self.ensure_window(event_loop, spec, prefer, true);
         let w = &mut self.windows[idx];
         w.visible = true;
-        w.window.set_visible(true);
-        w.window.focus_window();
+        w.renderer.request_reveal();
         w.window.request_redraw();
     }
 

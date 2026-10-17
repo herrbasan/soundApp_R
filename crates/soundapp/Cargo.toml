@@ -14,5 +14,3 @@ nui = { path = "../nui" }
 winit.workspace = true
 cpal.workspace = true
 rtrb.workspace = true
-symphonia.workspace = true
-rustysynth.workspace = true

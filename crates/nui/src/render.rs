@@ -54,6 +54,10 @@ pub struct Scene {
     pub overlay_clip_stack: Vec<[f32; 4]>,
     pub static_count: usize,
     pub static_gen: u64,
+    /// Optional single RGBA8 image (cover art) drawn via `image_quad` (`kind = 5`).
+    pub image_rgba: Option<(u32, u32, Vec<u8>)>,
+    /// Bumped by every `set_image`, so backends re-upload on change.
+    pub image_gen: u64,
     glyph_scratch: Vec<PositionedGlyph>,
 }
 
@@ -68,8 +72,82 @@ impl Scene {
             overlay_clip_stack: Vec::with_capacity(8),
             static_count: 0,
             static_gen: 0,
+            image_rgba: None,
+            image_gen: 0,
             glyph_scratch: Vec::with_capacity(256),
         }
+    }
+
+    /// Replace the scene's RGBA image (e.g. embedded cover art).
+    pub fn set_image(&mut self, w: u32, h: u32, rgba: Vec<u8>) {
+        assert!(w > 0 && h > 0, "set_image: zero-sized image");
+        assert_eq!(
+            rgba.len(),
+            (w as usize) * (h as usize) * 4,
+            "set_image: RGBA buffer length does not match {w}x{h}"
+        );
+        self.image_rgba = Some((w, h, rgba));
+        self.image_gen = self.image_gen.wrapping_add(1);
+    }
+
+    /// Emit an image quad (`kind = 5`) sampling the scene image with 0..1 UVs.
+    pub fn image_quad(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if w <= 0.0 || h <= 0.0 || self.image_rgba.is_none() {
+            return;
+        }
+        let clip_rect = self.current_clip();
+        self.push_instance(QuadInstance {
+            rect: [x, y, w, h],
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            fill_color: [1.0; 4],
+            border_color: [0.0; 4],
+            params: [0.0, 0.0, 5.0, 0.0],
+            clip_rect,
+        });
+    }
+
+    /// Emit a pre-rotated (-45°) text run centered at `(center_x, center_y)` as a
+    /// single atlas glyph quad. Works identically on the GPU and CPU backends.
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_rotated_ccw45(
+        &mut self,
+        text_sys: &mut TextSystem,
+        face: FontFace,
+        engine: FontEngine,
+        text: &str,
+        center_x: f32,
+        center_y: f32,
+        px_size: f32,
+        color: (u8, u8, u8, u8),
+    ) {
+        let Some(ag) = text_sys.layout_rotated_ccw45(face, engine, text, px_size) else {
+            return;
+        };
+        let w = ag.w as f32;
+        let h = ag.h as f32;
+        let kind = match engine {
+            FontEngine::Swash => 1.0,
+            FontEngine::Fontdue => 2.0,
+        };
+        let clip_rect = self.current_clip();
+        self.push_instance(QuadInstance {
+            rect: [
+                (center_x - w * 0.5).round(),
+                (center_y - h * 0.5).round(),
+                w,
+                h,
+            ],
+            uv_rect: [ag.uv_x as f32, ag.uv_y as f32, w, h],
+            fill_color: [
+                color.0 as f32 / 255.0,
+                color.1 as f32 / 255.0,
+                color.2 as f32 / 255.0,
+                color.3 as f32 / 255.0,
+            ],
+            border_color: [0.0; 4],
+            params: [0.0, 0.0, kind, 0.0],
+            clip_rect,
+        });
     }
 
     pub fn clear_all(&mut self, bg: (u8, u8, u8)) {
@@ -376,9 +454,12 @@ struct GpuState {
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     atlas_tex: glow::Texture,
+    image_tex: glow::Texture,
     u_screen: glow::UniformLocation,
     vbo_capacity: usize,
     surface_size: (u32, u32),
+    /// `Scene::image_gen` this window's image texture was last uploaded from.
+    uploaded_image_gen: u64,
     /// `TextSystem::atlas_gen` this window's atlas texture was last uploaded from.
     /// Every window owns a private GL atlas copy; a drift against the shared
     /// `TextSystem` generation triggers a re-upload in `render_gpu`.
@@ -425,7 +506,12 @@ void main() {
     v_screen_px = px;
     v_local_px = corner * a_rect.zw;
     v_rect_size = a_rect.zw;
-    v_uv = (a_uv_rect.xy + corner * a_uv_rect.zw) / vec2(2048.0, 2048.0);
+    // kind 5 (image) carries normalized 0..1 UVs; every other kind indexes the atlas.
+    if (int(a_params.z + 0.5) == 5) {
+        v_uv = a_uv_rect.xy + corner * a_uv_rect.zw;
+    } else {
+        v_uv = (a_uv_rect.xy + corner * a_uv_rect.zw) / vec2(2048.0, 2048.0);
+    }
     v_fill = a_fill;
     v_border = a_border;
     v_params = a_params;
@@ -444,6 +530,7 @@ in vec4 v_params;
 in vec4 v_clip;
 
 uniform sampler2D u_atlas;
+uniform sampler2D u_image;
 
 out vec4 frag_color;
 
@@ -507,6 +594,11 @@ void main() {
         float a = t * t * (3.0 - 2.0 * t) * v_fill.a;
         if (a <= 0.002) discard;
         frag_color = vec4(v_fill.rgb * a, a);
+    } else if (kind == 5) {
+        // Premultiplied RGBA image quad (cover art), normalized UVs.
+        vec4 c = texture(u_image, v_uv);
+        if (c.a <= 0.002) discard;
+        frag_color = vec4(c.rgb * c.a, c.a);
     } else if (kind == 4) {
         // 2D capsule line segment from v_border.xy to v_border.zw with radius v_params.x
         vec2 pa = v_screen_px - v_border.xy;
@@ -539,6 +631,9 @@ pub struct Renderer {
     gpu: Option<GpuState>,
     cpu: Option<CpuState>,
     window: Arc<Window>,
+    /// Set by `request_reveal`; the next completed present maps the window and
+    /// focuses it, so the native surface is never shown unpainted (white flash).
+    pending_reveal: bool,
 }
 
 impl Renderer {
@@ -547,8 +642,16 @@ impl Renderer {
         attrs: WindowAttributes,
         prefer: BackendKind,
     ) -> (Arc<Window>, Self) {
+        // Ask DWM for a dark frame/surface from creation.
+        let attrs = attrs.with_theme(Some(winit::window::Theme::Dark));
+
         if prefer == BackendKind::Gpu {
             if let Some((win, gpu)) = Self::try_init_gpu(event_loop, attrs.clone()) {
+                #[cfg(target_os = "windows")]
+                {
+                    Self::set_win32_dark_background(&win);
+                    Self::set_win32_cloak(&win, true);
+                }
                 return (
                     win.clone(),
                     Self {
@@ -556,6 +659,7 @@ impl Renderer {
                         gpu: Some(gpu),
                         cpu: None,
                         window: win,
+                        pending_reveal: true,
                     },
                 );
             }
@@ -563,6 +667,11 @@ impl Renderer {
         }
 
         let win = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        #[cfg(target_os = "windows")]
+        {
+            Self::set_win32_dark_background(&win);
+            Self::set_win32_cloak(&win, true);
+        }
         let cpu = Self::init_cpu(&win);
         (
             win.clone(),
@@ -571,8 +680,92 @@ impl Renderer {
                 gpu: None,
                 cpu: Some(cpu),
                 window: win,
+                pending_reveal: true,
             },
         )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_win32_dark_background(win: &Window) {
+        use raw_window_handle::RawWindowHandle;
+        #[link(name = "gdi32")]
+        extern "system" {
+            fn CreateSolidBrush(color: u32) -> isize;
+            fn FillRect(hdc: isize, lprc: *const [i32; 4], hbr: isize) -> i32;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetClassLongPtrW(hwnd: isize, index: i32, new_long: isize) -> usize;
+            fn GetDC(hwnd: isize) -> isize;
+            fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+            fn GetClientRect(hwnd: isize, lprc: *mut [i32; 4]) -> i32;
+        }
+        const GCLP_HBRBACKGROUND: i32 = -10;
+        if let Ok(wh) = win.window_handle() {
+            if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                unsafe {
+                    let hwnd = h.hwnd.get();
+                    // COLORREF 0x00BBGGRR = rgb(19, 19, 19) (`Theme::dark` base)
+                    let brush = CreateSolidBrush(0x0013_1313);
+                    if brush != 0 {
+                        SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush);
+                        let hdc = GetDC(hwnd);
+                        if hdc != 0 {
+                            let mut rc = [0i32; 4];
+                            if GetClientRect(hwnd, &mut rc) != 0 {
+                                FillRect(hdc, &rc, brush);
+                            }
+                            ReleaseDC(hwnd, hdc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_win32_cloak(win: &Window, cloak: bool) {
+        use raw_window_handle::RawWindowHandle;
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: isize,
+                dw_attribute: u32,
+                pv_attribute: *const u32,
+                cb_attribute: u32,
+            ) -> i32;
+        }
+        const DWMWA_CLOAK: u32 = 13;
+        if let Ok(wh) = win.window_handle() {
+            if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                let val: u32 = if cloak { 1 } else { 0 };
+                unsafe {
+                    let _ = DwmSetWindowAttribute(
+                        h.hwnd.get(),
+                        DWMWA_CLOAK,
+                        &val as *const u32,
+                        std::mem::size_of::<u32>() as u32,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Request that the window be revealed and focused once the next frame is presented.
+    pub fn request_reveal(&mut self) {
+        self.pending_reveal = true;
+        self.window.request_redraw();
+    }
+
+    /// Uncloak + map + focus the window after the first completed present.
+    fn reveal_if_pending(&mut self) {
+        if self.pending_reveal {
+            self.pending_reveal = false;
+            #[cfg(target_os = "windows")]
+            Self::set_win32_cloak(&self.window, false);
+            self.window.set_visible(true);
+            self.window.focus_window();
+        }
     }
 
     fn init_cpu(win: &Arc<Window>) -> CpuState {
@@ -670,8 +863,10 @@ impl Renderer {
 
             let u_screen = gl.get_uniform_location(program, "u_screen")?;
             let u_atlas = gl.get_uniform_location(program, "u_atlas")?;
+            let u_image = gl.get_uniform_location(program, "u_image")?;
             gl.use_program(Some(program));
             gl.uniform_1_i32(Some(&u_atlas), 0);
+            gl.uniform_1_i32(Some(&u_image), 1);
 
             let vao = gl.create_vertex_array().ok()?;
             let vbo = gl.create_buffer().ok()?;
@@ -725,6 +920,43 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(None),
             );
 
+            // Texture unit 1: the optional single RGBA image (cover art).
+            let image_tex = gl.create_texture().ok()?;
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(image_tex));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                1,
+                1,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&[0u8, 0, 0, 0])),
+            );
+            gl.active_texture(glow::TEXTURE0);
+
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
 
@@ -738,9 +970,11 @@ impl Renderer {
                     vao,
                     vbo,
                     atlas_tex,
+                    image_tex,
                     u_screen,
                     vbo_capacity,
-                    surface_size: (w, h),
+                    surface_size: (0, 0),
+                    uploaded_image_gen: 0,
                     uploaded_atlas_gen: 0,
                 },
             ))
@@ -810,6 +1044,7 @@ impl Renderer {
                 }
             }
         }
+        self.reveal_if_pending();
     }
 
     pub fn render(
@@ -827,6 +1062,7 @@ impl Renderer {
             BackendKind::Gpu => self.render_gpu(w, h, scene, text_sys, screenshot_path),
             BackendKind::Cpu => self.render_cpu(w, h, scene, text_sys, screenshot_path),
         }
+        self.reveal_if_pending();
     }
 
     fn render_gpu(
@@ -851,6 +1087,27 @@ impl Renderer {
         }
 
         unsafe {
+            if gpu.uploaded_image_gen != scene.image_gen {
+                if let Some((iw, ih, rgba)) = &scene.image_rgba {
+                    gpu.gl.active_texture(glow::TEXTURE1);
+                    gpu.gl.bind_texture(glow::TEXTURE_2D, Some(gpu.image_tex));
+                    gpu.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                    gpu.gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA8 as i32,
+                        *iw as i32,
+                        *ih as i32,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(rgba)),
+                    );
+                    gpu.gl.active_texture(glow::TEXTURE0);
+                }
+                gpu.uploaded_image_gen = scene.image_gen;
+            }
+
             if gpu.uploaded_atlas_gen != text_sys.atlas_gen {
                 gpu.gl.bind_texture(glow::TEXTURE_2D, Some(gpu.atlas_tex));
                 gpu.gl.tex_sub_image_2d(
@@ -965,6 +1222,7 @@ impl Renderer {
                 h,
                 &scene.instances[..static_end],
                 text_sys,
+                scene.image_rgba.as_ref(),
             );
             cpu.cached_gen = scene.static_gen;
         }
@@ -976,7 +1234,14 @@ impl Renderer {
         buf.copy_from_slice(&cpu.static_cache);
 
         let static_end = scene.static_count.min(scene.instances.len());
-        Self::rasterize_slice(buf, w, h, &scene.instances[static_end..], text_sys);
+        Self::rasterize_slice(
+            buf,
+            w,
+            h,
+            &scene.instances[static_end..],
+            text_sys,
+            scene.image_rgba.as_ref(),
+        );
 
         if let Some(path) = screenshot_path {
             if let Some(mut pm) = tiny_skia::Pixmap::new(w, h) {
@@ -1000,6 +1265,7 @@ impl Renderer {
         h: u32,
         instances: &[QuadInstance],
         text_sys: &TextSystem,
+        image: Option<&(u32, u32, Vec<u8>)>,
     ) {
         let pw = w as i32;
         let ph = h as i32;
@@ -1208,6 +1474,56 @@ impl Renderer {
                         }
                     }
                 }
+            } else if kind == 5 {
+                // RGBA image quad, bilinearly sampled (matches the GPU kind==5 shader).
+                let Some((iw, ih, rgba)) = image else {
+                    continue;
+                };
+                let (iw, ih) = (*iw as usize, *ih as usize);
+                let x = inst.rect[0];
+                let y = inst.rect[1];
+                let rw = inst.rect[2];
+                let rh = inst.rect[3];
+                let x0 = (x.floor() as i32).clamp(cx0, cx1);
+                let y0 = (y.floor() as i32).clamp(cy0, cy1);
+                let x1 = ((x + rw).ceil() as i32).clamp(cx0, cx1);
+                let y1 = ((y + rh).ceil() as i32).clamp(cy0, cy1);
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                let sx_scale = (iw.saturating_sub(1)) as f32;
+                let sy_scale = (ih.saturating_sub(1)) as f32;
+                for py in y0..y1 {
+                    let v = ((py as f32 + 0.5 - y) / rh).clamp(0.0, 1.0) * sy_scale;
+                    let sy0 = v.floor() as usize;
+                    let sy1 = (sy0 + 1).min(ih - 1);
+                    let fy = v - sy0 as f32;
+                    let row_off = py as usize * stride;
+                    for px in x0..x1 {
+                        let u = ((px as f32 + 0.5 - x) / rw).clamp(0.0, 1.0) * sx_scale;
+                        let sx0 = u.floor() as usize;
+                        let sx1 = (sx0 + 1).min(iw - 1);
+                        let fx = u - sx0 as f32;
+                        let i00 = (sy0 * iw + sx0) * 4;
+                        let i10 = (sy0 * iw + sx1) * 4;
+                        let i01 = (sy1 * iw + sx0) * 4;
+                        let i11 = (sy1 * iw + sx1) * 4;
+                        let lerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+                            let top = a as f32 * (1.0 - fx) + b as f32 * fx;
+                            let bot = c as f32 * (1.0 - fx) + d as f32 * fx;
+                            (top * (1.0 - fy) + bot * fy).clamp(0.0, 255.0) as u8
+                        };
+                        let a = lerp(rgba[i00 + 3], rgba[i10 + 3], rgba[i01 + 3], rgba[i11 + 3]);
+                        if a == 0 {
+                            continue;
+                        }
+                        let cr = lerp(rgba[i00], rgba[i10], rgba[i01], rgba[i11]);
+                        let cg = lerp(rgba[i00 + 1], rgba[i10 + 1], rgba[i01 + 1], rgba[i11 + 1]);
+                        let cb = lerp(rgba[i00 + 2], rgba[i10 + 2], rgba[i01 + 2], rgba[i11 + 2]);
+                        let dst = &mut buf[row_off + px as usize];
+                        *dst = crate::text::GammaLut::blend_naive_srgb(*dst, cr, cg, cb, a);
+                    }
+                }
             } else {
                 // Atlas glyph (kind 1 = Swash gamma-corrected, kind 2 = Fontdue naive sRGB)
                 let gx = inst.rect[0] as i32;
@@ -1253,7 +1569,14 @@ impl Renderer {
         let bg_packed =
             ((scene.bg.0 as u32) << 16) | ((scene.bg.1 as u32) << 8) | (scene.bg.2 as u32);
         let mut pixels = vec![bg_packed; n_px];
-        Self::rasterize_slice(&mut pixels, w, h, &scene.instances, text_sys);
+        Self::rasterize_slice(
+            &mut pixels,
+            w,
+            h,
+            &scene.instances,
+            text_sys,
+            scene.image_rgba.as_ref(),
+        );
 
         if let Some(mut pm) = tiny_skia::Pixmap::new(w, h) {
             let dst = pm.data_mut();
@@ -1334,7 +1657,7 @@ mod tests {
         let (w, h) = (100u32, 40u32);
         let mut buf = vec![0u32; (w * h) as usize];
         let ts = TextSystem::new();
-        Renderer::rasterize_slice(&mut buf, w, h, &scene.instances, &ts);
+        Renderer::rasterize_slice(&mut buf, w, h, &scene.instances, &ts, scene.image_rgba.as_ref());
         let filled = buf.iter().filter(|&&p| p != 0).count();
         assert!(filled > 400, "kind4 band covers only {filled} px");
     }

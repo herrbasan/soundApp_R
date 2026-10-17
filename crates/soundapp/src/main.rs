@@ -1,11 +1,9 @@
-// SoundApp & NUI Rust Showcase — Dual-Backend Renderer (GPU Instanced SDF + CPU Softbuffer)
-// with nui_wc2 v3.0.0 "slate" theme & components and Swash browser-grade typography.
+// SoundApp — native audio player built on the NUI Rust dual-backend renderer
+// (GPU instanced SDF + CPU Softbuffer), nui_wc2 v3.0.0 "slate" theme and Swash typography.
 
 mod audio;
 mod config;
 mod dsp;
-mod midi;
-mod tracker;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,16 +13,16 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId};
 
-use audio::{Audio, PlaybackParams, Source, SourceKind};
+use audio::{Audio, PlaybackParams, Source};
 use audio::TrackMetadata;
 use config::UserConfig;
 use dsp::{DspAnalyzer, DspSnapshot, BANDS};
 use nui::{
-    rgb, rgba, BackendKind, BadgeVariant, ButtonVariant, FontEngine, FontFace, KeyCmd, Length,
+    rgb, rgba, BackendKind, ButtonVariant, FontEngine, FontFace, KeyCmd, Length,
     Rect, Renderer, Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_ADD,
-    ICON_CLOSE, ICON_DARK_MODE, ICON_EQ, ICON_LIGHT_MODE, ICON_LOOP, ICON_NEXT, ICON_PAUSE,
+    ICON_CLOSE, ICON_EQ, ICON_LOOP, ICON_NEXT, ICON_PAUSE,
     ICON_PLAY, ICON_PREV, ICON_RESTART, ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE,
     ICON_VOLUME,
 };
@@ -64,7 +62,6 @@ struct App {
     t: f32,
     frame_ms: u64,
     nopaint: bool,
-    extra_ops: usize,
     frames: u32,
     last_fps: u32,
     fps_at: Instant,
@@ -77,57 +74,35 @@ struct App {
     pending_window_toggles: Vec<&'static str>,
     open_window_spec: Option<&'static WindowSpec>,
 
-    // Interactive NUI component states
-    active_tab: usize,
+    // Interactive player states
     seg_pipeline: usize,
-    /// Previous pipeline selection, used to (re)load the right engine when the
-    /// segmented control switches to the MIDI synth.
+    /// Previous pipeline selection, used to re-apply the parameter set.
     last_pipeline: usize,
-    /// Previous SoundFont selection, used to switch the live SoundFont.
-    last_soundfont: usize,
-    search_text: String,
-    preset_name: String,
     selected_device: usize,
     selected_rate: usize,
-    selected_soundfont: usize,
     pitch_semitones: f32,
     tempo_ratio: f32,
     master_vol: f32,
-    stereo_sep: f32,
     chk_formant: bool,
     chk_locked: bool,
     sw_hq_mode: bool,
     sw_keep_tray: bool,
-    radio_interp: usize,
-    click_counter: u32,
     scrub_frac: f32,
     selected_track: usize,
-    /// Deterministic 96-bar synthetic waveform for the transport seekbar.
-    wave_peaks: Vec<f32>,
+    /// Master volume in `0.0..=2.0` (`1.0` = unity); persisted in `user.json`.
+    pub show_controls: bool,
 
-    // Phase 3.1 — player transport state (loop / shuffle / compact window).
+    // Phase 3.1 — player transport state (loop / shuffle).
     pub loop_enabled: bool,
     pub shuffle_enabled: bool,
-    /// `true` renders the 580x300 compact SoundApp Player; `false` the full
-    /// 1120x700 studio/showcase layout. Toggled with `C` or the header button.
-    pub compact_player_mode: bool,
-
-    // Phase 3.2 — adaptive Parameters window (Audio / MIDI / Tracker tabs).
-    /// Active Parameters tab: `0` = Audio, `1` = MIDI, `2` = Tracker.
-    pub params_tab: usize,
-    pub midi_transpose: f32,
-    pub midi_bpm: f32,
-    pub midi_metronome: bool,
-    /// Kind of the source the engine reported as loaded (drives `params_tab`).
-    loaded_kind: Option<SourceKind>,
 
     // Phase 2.1/2.2 — real playlist + FFmpeg metadata shown in the Left Card.
-    /// Real `.m4a` tracks discovered on disk (the first slice of the 10k playlist).
+    /// Tracks discovered on disk — the implicit folder playlist.
     playlist: Vec<PathBuf>,
     /// Metadata of the currently-loaded file (from FFmpeg).
     track_meta: Option<TrackMetadata>,
-    /// True while the waveform seekbar is being dragged (seek on release).
-    scrub_active: bool,
+    /// True once the current track's embedded cover has been pushed to the scene.
+    cover_uploaded: bool,
 
     // Phase 3.3 — real-time DSP analysis tap + last snapshot for the Monitoring window.
     dsp: DspAnalyzer,
@@ -148,6 +123,9 @@ struct App {
     /// Set true when the Settings "Save Configuration" button fires, flushed after
     /// the render borrow ends.
     save_config_req: bool,
+    /// Set true when the Settings "Show transport controls" checkbox fires; the
+    /// resize is applied after the render borrow ends.
+    apply_zoom_req: bool,
     /// Transient status text shown in the Settings footer after a save.
     config_status: String,
 }
@@ -164,26 +142,6 @@ const SAMPLE_RATES: &[&str] = &[
     "96,000 Hz (HQ Oversampled)",
     "192,000 Hz (Ultra HQ)",
 ];
-
-const SOUNDFONTS: &[&str] = &[
-    "TimGM6mb.sf2 (Default GM)",
-    "FluidR3_GM.sf2 (142 MB Studio)",
-    "CrisisGeneralMidi3.01.sf2",
-    "Arachno_SoundFont_v1.0.sf2",
-];
-
-/// Resolve a SoundFont list index to an on-disk `.sf2` path (best effort —
-/// non-existent files are reported by the engine when the switch is attempted).
-fn soundfont_path_for(idx: usize) -> Option<PathBuf> {
-    let dir = PathBuf::from(r"D:\Work\_GIT\SoundApp\bin\soundfonts");
-    match idx {
-        0 => Some(PathBuf::from(midi::DEFAULT_SOUNDFONT)),
-        1 => Some(dir.join("FluidR3_GM.sf2")),
-        2 => Some(dir.join("CrisisGeneralMidi3.01.sf2")),
-        3 => Some(dir.join("Arachno_SoundFont_v1.0.sf2")),
-        _ => None,
-    }
-}
 
 /// Phase 1.5 secondary windows (SoundApp `P` / `N` / `M` / `S` / `H`), all undecorated
 /// like the primary window and managed by `nui::WindowManager`.
@@ -248,15 +206,7 @@ fn window_spec_by_key(key: &str) -> Option<&'static WindowSpec> {
     }
 }
 
-/// (key, button label) pairs for the main window's window-toggle button row.
-const WINDOW_TOGGLES: &[(&'static str, &'static str)] = &[
-    ("parameters", "[P] Params"),
-    ("monitoring", "[N] Monitor"),
-    ("mixer", "[M] Mixer"),
-    ("settings", "[S] Settings"),
-    ("help", "[H] Help"),
-];
-
+/// Material icon shown in a secondary window's header.
 fn window_header_icon(key: &str) -> &'static str {
     match key {
         "parameters" => ICON_TUNE,
@@ -312,7 +262,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Left / Right", "Seek -5 s / +5 s"),
     ("Up / Down", "Master volume +5% / -5%"),
     ("L", "Toggle loop"),
-    ("C", "Toggle compact player mode"),
+    ("C", "Show / hide transport controls"),
     ("P", "Parameters window"),
     ("N", "Monitoring window"),
     ("M", "Mixer window"),
@@ -516,11 +466,11 @@ fn master_volume_pill(ui: &mut Ui, r: Rect, vol: &mut f32, id: u32) {
             ui.state.focused_id = Some(id);
         }
         if ui.state.wheel_y.abs() > 0.01 {
-            *vol = (*vol + 0.05 * ui.state.wheel_y.signum()).clamp(0.0, 1.0);
+            *vol = (*vol + 0.05 * ui.state.wheel_y.signum()).clamp(0.0, 2.0);
         }
     }
     if ui.state.active_id == Some(id) && ui.state.mouse_down {
-        *vol = ((ui.state.cursor.0 - track_x0) / track_w).clamp(0.0, 1.0);
+        *vol = ((ui.state.cursor.0 - track_x0) / track_w * 2.0).clamp(0.0, 2.0);
     }
 
     let cy = r.y + r.h * 0.5;
@@ -540,7 +490,7 @@ fn master_volume_pill(ui: &mut Ui, r: Rect, vol: &mut f32, id: u32) {
         (0, 0, 0, 0),
         0.0,
     );
-    let fill = track_w * vol.clamp(0.0, 1.0);
+    let fill = track_w * (vol.clamp(0.0, 2.0) * 0.5);
     if fill > 0.5 {
         ui.scene.rounded_rect(
             track_x0,
@@ -567,101 +517,97 @@ fn master_volume_pill(ui: &mut Ui, r: Rect, vol: &mut f32, id: u32) {
 }
 
 
-/// Synthetic library size for the virtualized playlist demos (Phase 1.2).
-const TRACK_COUNT: usize = 10_000;
-
-const TRACK_ARTISTS: &[&str] = &[
-    "Aurora Field",
-    "Kraftwerk Delta",
-    "Nova Ensemble",
-    "Blue Static",
-    "Echo Division",
-    "Sunset Array",
-    "Magnetic North",
-    "Pale Horizon",
-    "Liquid Chrome",
-    "Cascade Theory",
-    "Midnight Cartography",
-    "Signal Bloom",
+/// Every audio extension FFmpeg decodes that SoundApp treats as playable.
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "wav", "flac", "ogg", "opus", "m4a", "m4b", "aac", "mp4", "webm", "mpg", "mp2",
+    "aif", "aiff", "wma", "asf", "ape", "wv", "wvc", "tta", "mka", "amr", "3ga", "ac3",
+    "eac3", "dts", "dtshd", "caf", "au", "snd", "voc", "tak", "mpc",
 ];
 
-const TRACK_TITLES: &[&str] = &[
-    "Analog Sunrise",
-    "Chrome Cassette",
-    "Midnight Modulation",
-    "Vinyl Static",
-    "Pulse Width",
-    "Tape Hiss Serenade",
-    "Neon Riverbed",
-    "Slow Waveform",
-    "Crystal Oscillator",
-    "Deep Signal",
-    "Harmonic Drift",
-    "Sidechain Sunset",
-    "Quarter Note Sky",
-    "Ferric Dreams",
-    "Patch Bay Romance",
-    "Lowpass Meadow",
-];
-
-const TRACK_ALBUMS: &[&str] = &[
-    "Analog Drift",
-    "Neon Meridian",
-    "Deep Field",
-    "Rust & Glass",
-    "Slow Orbit",
-    "Static Bloom",
-];
-
-fn track_name(idx: usize) -> String {
-    TRACK_TITLES[idx % TRACK_TITLES.len()].to_string()
+fn is_supported_audio(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| AUDIO_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+        .unwrap_or(false)
 }
 
-fn track_credit(idx: usize) -> String {
-    let artist = TRACK_ARTISTS[idx % TRACK_ARTISTS.len()];
-    let album = TRACK_ALBUMS[(idx / 7) % TRACK_ALBUMS.len()];
-    format!("{artist} — {album}")
-}
-
-fn track_meta(idx: usize) -> String {
-    let mm = 2 + (idx * 7) % 8;
-    let ss = (idx * 13) % 60;
-    let lufs = 10.0 + ((idx * 17) % 80) as f32 / 10.0;
-    format!("48 kHz · 24-bit · -{lufs:.1} LUFS · {mm:02}:{ss:02}")
-}
-
-/// The real `.m4a` tracks in SoundApp's mixer media folder, if present on disk.
-/// These form the head of the virtual playlist; everything past them is synthetic.
-fn default_playlist() -> Vec<PathBuf> {
-    let dir = PathBuf::from(r"D:\Work\_GIT\SoundApp\_Material\mixer_media\Again");
-    let mut tracks: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+/// The implicit playlist of a single file: every supported audio file in its
+/// directory (flat `read_dir` order), plus the index of `file` in that list.
+fn playlist_from_single_file(file: &std::path::Path) -> (Vec<PathBuf>, usize) {
+    let Some(parent) = file.parent() else {
+        return (vec![file.to_path_buf()], 0);
+    };
+    let target_name = file.file_name();
+    let mut files = Vec::new();
+    let mut idx: Option<usize> = None;
+    if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("m4a"))
-                == Some(true)
-            {
-                tracks.push(path);
+            // `DirEntry::file_type` reuses the `WIN32_FIND_DATAW` that
+            // `FindNextFileW` already returned — no extra SMB round-trip, unlike
+            // `Path::is_file()` / `canonicalize()`, which stat every entry.
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_file() {
+                continue;
             }
+            let name = entry.file_name();
+            let path = entry.path();
+            if !is_supported_audio(&path) {
+                continue;
+            }
+            if idx.is_none() && target_name.is_some_and(|t| name.eq_ignore_ascii_case(t)) {
+                idx = Some(files.len());
+            }
+            files.push(path);
         }
     }
-    tracks.sort();
-    tracks
+    if files.is_empty() {
+        return (vec![file.to_path_buf()], 0);
+    }
+    (files, idx.unwrap_or(0))
 }
 
-/// Short label for the transport row: `mm:ss`, or `--:--` when unknown.
-fn fmt_meta_duration(secs: f64) -> String {
-    if secs > 0.0 {
-        fmt_time(secs)
-    } else {
-        "--:--".to_string()
+/// Collect every supported audio file under `dir`, descending when `recursive`.
+fn playlist_from_folder(dir: &std::path::Path, recursive: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            if recursive {
+                out.extend(playlist_from_folder(&path, true));
+            }
+        } else if ft.is_file() && is_supported_audio(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Format-ribbon colour by uppercase extension.
+fn ribbon_color(ext: &str) -> (u8, u8, u8, u8) {
+    match ext {
+        "MP3" => rgb(134, 14, 54),
+        "M4A" | "M4B" | "AAC" | "MP4" => rgb(7, 62, 145),
+        "FLAC" => rgb(15, 104, 23),
+        "OGG" | "OPUS" => rgb(145, 58, 7),
+        _ => rgb(100, 100, 100),
     }
 }
 
-/// Intents produced by the shared transport row (Phase 3.1), applied after the
-/// render borrow ends.
+/// Which of the three drop zones the pointer is over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropZone {
+    Add,
+    Replace,
+    Mixer,
+}
+
+/// Intents produced by the main window, applied after the render borrow ends.
 #[derive(Default)]
-struct TransportIntents {
+struct MainIntents {
     toggle_play: bool,
     prev: bool,
     next: bool,
@@ -669,6 +615,11 @@ struct TransportIntents {
     shuffle_toggled: bool,
     vol_changed: bool,
     seek_to: Option<f64>,
+    toggle_settings: bool,
+    toggle_monitoring: bool,
+    toggle_parameters: bool,
+    toggle_controls: bool,
+    close: bool,
 }
 
 /// Intents produced by the Phase 3.2 adaptive Parameters window.
@@ -677,307 +628,190 @@ struct ParamsWindowIntents {
     params_changed: bool,
     pipeline_changed: bool,
     reset_all: bool,
-    load_midi: bool,
-    load_tracker: bool,
 }
 
-/// Track header row: index pill badge + SemiBold title over dim format/codec info.
-fn draw_track_header(ui: &mut Ui, r: Rect, pill: &str, title: &str, meta: &str) {
-    let t = ui.theme;
-    let badge_h = (t.rem * 1.48).round();
-    let badge_w = ui.badge(r.x, r.y, pill, BadgeVariant::Primary, None);
-    let fs = t.font_small();
-    let title_x = r.x + badge_w + t.space_half();
-    ui.text_clipped(
-        FontFace::SemiBold,
-        ui.font_engine,
-        title,
-        title_x.round(),
-        (r.y + badge_h * 0.5 + fs * 0.34).round(),
-        fs,
-        (r.x + r.w - title_x).max(0.0),
-        t.text,
-    );
-    let fs2 = t.font_xsmall();
-    ui.text_clipped(
-        FontFace::Regular,
-        ui.font_engine,
-        meta,
-        r.x.round(),
-        (r.y + badge_h + fs2 * 1.1).round(),
-        fs2,
-        r.w,
-        t.text_dim,
-    );
-}
-
-/// Realtime 18-band spectrum analyzer with the stabilized `kind = 4` oscilloscope
-/// polyline across the center. Top-right overlay: speed/pitch badge + a compact
-/// `ICON_SETTINGS` button. Returns `true` when the settings button was clicked.
-fn draw_spec_panel(
+/// Small flat ghost icon button used by the minimalist top bar.
+fn ghost_icon_btn(
     ui: &mut Ui,
+    id: u32,
     r: Rect,
-    t: f32,
-    playing: bool,
-    vol: f32,
-    overlay_badge: &str,
+    icon: &str,
+    color: (u8, u8, u8, u8),
+    icon_px: f32,
+    hover_fill: (u8, u8, u8, u8),
 ) -> bool {
-    let th = ui.theme;
-    let rem = th.rem;
-    ui.scene
-        .rounded_rect(r.x, r.y, r.w, r.h, th.radius2(), th.base, th.border2, 1.0);
-    ui.scene.push_clip(
-        r.x + 1.0,
-        r.y + 1.0,
-        (r.w - 2.0).max(0.0),
-        (r.h - 2.0).max(0.0),
-    );
-    let bands = 18usize;
-    let inset = (rem * 0.4).round();
-    let g = (rem * 0.3).round().max(2.0);
-    let bar_w = ((r.w - inset * 2.0 - g * (bands as f32 - 1.0)) / bands as f32)
-        .floor()
-        .max(2.0);
-    for i in 0..bands {
-        let phase = t * 5.8 + i as f32 * 0.42;
-        let amp = if playing {
-            ((phase.sin() * 0.35 + (phase * 1.7).cos() * 0.25 + 0.45) * vol).clamp(0.06, 0.94)
-        } else {
-            (0.14 + 0.08 * (i as f32 * 0.5).sin()) * vol
-        };
-        let bh = ((r.h - rem * 1.0) * amp).max(2.0);
-        let bx = r.x + inset + i as f32 * (bar_w + g);
-        let by = r.y + r.h - rem * 0.5 - bh;
-        ui.scene
-            .rounded_rect(bx, by, bar_w, bh, 2.0, th.highlight, (0, 0, 0, 0), 0.0);
-    }
-
-    // Realtime oscilloscope / harmonic curve drawn ON TOP of the spectrum bars.
-    let osc_pts: Vec<(f32, f32)> = (0..=64)
-        .map(|i| {
-            let nx = i as f32 / 64.0;
-            let phase = t * 6.0 + nx * std::f32::consts::TAU * 2.0;
-            let amp = 0.42 * phase.sin() + 0.20 * (phase * 2.3).cos() + 0.12 * (phase * 4.1).sin();
-            let ny = (0.5 + amp * vol.max(0.2)).clamp(0.05, 0.95);
-            (nx, ny)
-        })
-        .collect();
-    ui.polyline(r, &osc_pts, 2.0, th.palette_mark);
-
-    // Top-right overlay: speed/pitch badge + compact Parameters toggle. The
-    // badge's left edge mirrors `Ui::badge` metrics so it can be right-anchored
-    // against the button without a two-pass draw.
-    let btn_h = (rem * 1.75).round();
-    let btn_r = Rect::new(r.x + r.w - inset - btn_h, r.y + inset, btn_h, btn_h);
-    let settings_clicked = ui.button(190, btn_r, "", ICON_SETTINGS, ButtonVariant::Ghost);
-    let b_fs = (rem * 0.72).round();
-    let b_w = (rem * 0.36).round().max(5.0)
-        + (rem * 0.55).round() * 2.0
-        + ui
-            .text_sys
-            .measure(FontFace::SemiBold, ui.font_engine, &overlay_badge.to_uppercase(), b_fs);
-    let b_h = (rem * 1.48).round();
-    let _ = ui.badge(
-        (btn_r.x - rem * 0.45 - b_w).round(),
-        r.y + inset + (btn_h - b_h) * 0.5,
-        overlay_badge,
-        BadgeVariant::Primary,
-        None,
-    );
-    ui.scene.pop_clip();
-    settings_clicked
-}
-
-/// Secondary-window launcher rows. One row per `rows` entry; five buttons split
-/// `3 + 2` across two rows, or all five on a single row. Returns the clicked
-/// window index (into `WINDOW_TOGGLES`), if any.
-fn draw_window_launcher(ui: &mut Ui, rows: &[Rect], vis: &[bool; 5]) -> Option<usize> {
-    let t = ui.theme;
-    let gap = t.space_quarter();
-    let per_row: &[usize] = if rows.len() >= 2 { &[3, 2] } else { &[5] };
-    let mut clicked = None;
-    let mut widx = 0usize;
-    for (ri, row) in rows.iter().enumerate() {
-        let n = per_row[ri];
-        let cw = ((row.w - gap * (n as f32 - 1.0)) / n as f32).floor();
-        for ci in 0..n {
-            let (key, label) = WINDOW_TOGGLES[widx];
-            let variant = if vis[widx] {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Outline
-            };
-            let cr = Rect::new(row.x + (cw + gap) * ci as f32, row.y, cw, row.h);
-            if ui.button(911 + widx as u32, cr, label, "", variant) {
-                let _ = key;
-                clicked = Some(widx);
-            }
-            widx += 1;
+    ui.state.register_focusable(id);
+    let hovered = ui.state.can_hover(id, r);
+    if hovered {
+        ui.state.hovered_id = Some(id);
+        if ui.state.mouse_pressed {
+            ui.state.active_id = Some(id);
+            ui.state.focused_id = Some(id);
         }
     }
+    let clicked = hovered && ui.state.mouse_released && ui.state.active_id == Some(id);
+    if hovered {
+        ui.scene.rect(r.x, r.y, r.w, r.h, hover_fill);
+    }
+    ui.scene.icon_centered(
+        ui.text_sys,
+        icon,
+        (r.x + r.w * 0.5).round(),
+        (r.y + r.h * 0.5).round(),
+        icon_px.round(),
+        color,
+    );
     clicked
 }
 
-/// Shared transport card interior (Phase 3.1): full-width interactive waveform
-/// seekbar over a control row — elapsed time left, a centered Prev · Play/Pause ·
-/// Next · Loop · Shuffle group, and remaining/total time + a compact master
-/// volume slider right.
-#[allow(clippy::too_many_arguments)]
-fn draw_transport(
+/// Flat dark square transport button (`rgb(52,52,52)` normal / `68` hover,
+/// blue when active).
+fn player_icon_btn(
     ui: &mut Ui,
-    interior: Rect,
-    wave_h: Length,
-    t: f32,
-    peaks: &[f32],
-    scrub_frac: &mut f32,
-    scrub_active: &mut bool,
-    pos: f64,
-    dur: f64,
-    playing: bool,
-    vol: &mut f32,
-    loop_on: bool,
-    shuffle_on: bool,
-) -> TransportIntents {
-    let mut it = TransportIntents::default();
-    let th = ui.theme;
-    let rem = th.rem;
-
-    // Seekbar: follows playback; while scrubbing it follows the pointer and the
-    // seek is committed on release.
-    let wave_r_h = wave_h.resolve(rem).round();
-    let wave_r = Rect::new(interior.x, interior.y, interior.w, wave_r_h);
-    let is_finite = dur > 0.0 && dur < 360_000.0;
-    if ui.state.active_id != Some(500) {
-        if is_finite {
-            *scrub_frac = (pos / dur).clamp(0.0, 1.0) as f32;
-        } else if playing {
-            *scrub_frac = (t * 0.12).fract();
+    id: u32,
+    r: Rect,
+    icon: &str,
+    active: bool,
+    scale: f32,
+) -> bool {
+    ui.state.register_focusable(id);
+    let hovered = ui.state.can_hover(id, r);
+    if hovered {
+        ui.state.hovered_id = Some(id);
+        if ui.state.mouse_pressed {
+            ui.state.active_id = Some(id);
+            ui.state.focused_id = Some(id);
         }
     }
-    let scrubbed = ui.waveform(500, wave_r, peaks, scrub_frac);
-    if scrubbed {
-        *scrub_active = true;
-    } else if *scrub_active {
-        *scrub_active = false;
-        if is_finite {
-            it.seek_to = Some(*scrub_frac as f64 * dur);
-        }
-    }
-
-    let gap = th.space_half();
-    let ctrl = Rect::new(
-        interior.x,
-        wave_r.y + wave_r.h + gap,
-        interior.w,
-        (interior.y + interior.h - wave_r.y - wave_r.h - gap).max(0.0),
-    );
-    let ctrl_cy = ctrl.y + ctrl.h * 0.5;
-    let fs = th.font_small();
-
-    // Elapsed — left.
-    ui.scene.text(
-        ui.text_sys,
-        FontFace::SemiBold,
-        ui.font_engine,
-        &fmt_time(pos),
-        ctrl.x.round(),
-        (ctrl_cy + fs * 0.34).round(),
-        fs,
-        th.text,
-    );
-
-    // Centered transport group: Prev · Play/Pause · Next · Loop · Shuffle.
-    let bw = (rem * 2.4).round();
-    let bh = (rem * 1.85).round();
-    let bgap = (rem * 0.35).round();
-    let group_w = bw * 5.0 + bgap * 4.0;
-    let mut bx = ctrl.x + (ctrl.w - group_w) * 0.5;
-    let by = ctrl_cy - bh * 0.5;
-    let defs = [
-        (501u32, ICON_PREV, ButtonVariant::Ghost),
-        (
-            502u32,
-            if playing { ICON_PAUSE } else { ICON_PLAY },
-            ButtonVariant::Primary,
-        ),
-        (503u32, ICON_NEXT, ButtonVariant::Ghost),
-        (
-            504u32,
-            ICON_LOOP,
-            if loop_on {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Ghost
-            },
-        ),
-        (
-            505u32,
-            ICON_SHUFFLE,
-            if shuffle_on {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Ghost
-            },
-        ),
-    ];
-    for (id, icon, var) in defs {
-        if ui.button(id, Rect::new(bx, by, bw, bh), "", icon, var) {
-            match id {
-                501 => it.prev = true,
-                502 => it.toggle_play = true,
-                503 => it.next = true,
-                504 => it.loop_toggled = true,
-                _ => it.shuffle_toggled = true,
-            }
-        }
-        bx += bw + bgap;
-    }
-
-    // Remaining / total time + compact master volume — right.
-    let remain = if is_finite {
-        format!("-{} / {}", fmt_time((dur - pos).max(0.0)), fmt_time(dur))
-    } else if playing {
-        "LIVE".to_string()
+    let clicked = hovered && ui.state.mouse_released && ui.state.active_id == Some(id);
+    let fill = if active {
+        rgb(76, 132, 229)
+    } else if hovered {
+        rgb(68, 68, 68)
     } else {
-        "-03:42 / 03:42".to_string()
+        rgb(52, 52, 52)
     };
-    let slider_w = Length::Rem(10.0).resolve(rem).round();
-    let slider_h = Length::Rem(2.9).resolve(rem).round();
-    let slider_r = Rect::new(
-        ctrl.x + ctrl.w - slider_w,
-        ctrl_cy - slider_h * 0.5,
-        slider_w,
-        slider_h,
+    ui.scene.rounded_rect(
+        r.x,
+        r.y,
+        r.w,
+        r.h,
+        2.0 * scale,
+        fill,
+        (0, 0, 0, 0),
+        0.0,
     );
-    let vol_str = format!("{:.0}%", *vol * 100.0);
-    if ui.slider(506, slider_r, "Master Volume", vol, 0.0, 1.0, 0.78, &vol_str) {
-        it.vol_changed = true;
-    }
-    let rw = ui
-        .text_sys
-        .measure(FontFace::SemiBold, ui.font_engine, &remain, fs);
-    ui.scene.text(
+    ui.scene.icon_centered(
         ui.text_sys,
-        FontFace::SemiBold,
-        ui.font_engine,
-        &remain,
-        (slider_r.x - rw - rem * 0.75).round(),
-        (ctrl_cy + fs * 0.34).round(),
-        fs,
-        th.text,
+        icon,
+        (r.x + r.w * 0.5).round(),
+        (r.y + r.h * 0.5).round(),
+        (14.0 * scale).round(),
+        if active {
+            rgb(255, 255, 255)
+        } else {
+            rgb(185, 185, 185)
+        },
     );
-    it
+    clicked
 }
 
-/// Caption lines for the Typography A/B cards, keyed by the CSS px size being shown.
-fn typo_sample(css_px: f32) -> &'static str {
-    if css_px <= 12.0 {
-        "To AV We Yo · -14.2 LUFS · 48,000 Hz · Pack my box with five dozen liquor jugs"
-    } else if css_px <= 15.0 {
-        "Waveform & Spectrum Analyzer · 00:42 / 03:18 · Crisp Stems & Even Kerning"
-    } else {
-        "Hamburgefonstiv · QWERTY UIOP · Excellent Kerning & Hinting · 01:23 / 04:56"
+/// Label/value row of the metadata block (right-aligned label column).
+#[allow(clippy::too_many_arguments)]
+fn draw_meta_row(
+    ui: &mut Ui,
+    x: f32,
+    label_w: f32,
+    gap: f32,
+    baseline: f32,
+    fs: f32,
+    label: &str,
+    value: &str,
+    value_w: f32,
+) {
+    if !label.is_empty() {
+        let lw = ui
+            .text_sys
+            .measure(FontFace::Regular, ui.font_engine, label, fs);
+        ui.scene.text(
+            ui.text_sys,
+            FontFace::Regular,
+            ui.font_engine,
+            label,
+            (x + label_w - lw).round(),
+            baseline,
+            fs,
+            rgb(130, 130, 130),
+        );
     }
+    ui.text_clipped(
+        FontFace::Regular,
+        ui.font_engine,
+        value,
+        (x + label_w + gap).round(),
+        baseline,
+        fs,
+        value_w,
+        rgb(205, 205, 205),
+    );
+}
+
+/// Three-zone drop overlay: add / replace / open-in-mixer. Returns the dropped
+/// path and the zone the pointer was over when it landed.
+fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathBuf, DropZone)> {
+    let hovering = ui.state.hovered_file.is_some();
+    if !hovering && ui.state.dropped_files.is_empty() {
+        return None;
+    }
+    let split_x = 0.78 * pw;
+    let mid_y = 0.5 * ph;
+    let cx = ui.state.cursor.0;
+    let cy = ui.state.cursor.1;
+    let zone = if cx >= split_x {
+        DropZone::Mixer
+    } else if cy >= mid_y {
+        DropZone::Replace
+    } else {
+        DropZone::Add
+    };
+
+    ui.scene.begin_overlay();
+    ui.scene.rect(0.0, 0.0, pw, ph, rgba(20, 20, 20, 225));
+
+    let zones = [
+        (Rect::new(6.0 * scale, 6.0 * scale, split_x - 12.0 * scale, mid_y - 12.0 * scale), DropZone::Add, "Add to current"),
+        (Rect::new(6.0 * scale, mid_y + 6.0 * scale, split_x - 12.0 * scale, ph - mid_y - 12.0 * scale), DropZone::Replace, "Replace playlist"),
+        (Rect::new(split_x + 6.0 * scale, 6.0 * scale, pw - split_x - 12.0 * scale, ph - 12.0 * scale), DropZone::Mixer, "Open in Mixer"),
+    ];
+    let fs = (13.0 * scale).round();
+    for (r, z, label) in zones {
+        let hot = z == zone;
+        ui.scene.rounded_rect(
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            (4.0 * scale).round(),
+            if hot { rgba(76, 132, 229, 70) } else { rgba(255, 255, 255, 10) },
+            if hot { rgb(76, 132, 229) } else { rgba(255, 255, 255, 30) },
+            1.0,
+        );
+        draw_centered_text(
+            ui,
+            r,
+            label,
+            FontFace::SemiBold,
+            fs,
+            if hot {
+                rgb(255, 255, 255)
+            } else {
+                rgb(165, 165, 165)
+            },
+        );
+    }
+    ui.scene.end_overlay();
+
+    ui.state.dropped_files.pop().map(|p| (p, zone))
 }
 
 impl App {
@@ -1006,13 +840,12 @@ impl App {
             text_sys: TextSystem::new(),
             ui_state: UiState::new(),
             modifiers: ModifiersState::empty(),
-            size: (1120, 700),
+            size: (580, 390),
             audio,
             audio_reported: false,
             t: 0.0,
             frame_ms: 16,
             nopaint: false,
-            extra_ops: 0,
             frames: 0,
             last_fps: 0,
             fps_at: Instant::now(),
@@ -1023,39 +856,25 @@ impl App {
             pending_window_toggles: Vec::new(),
             open_window_spec: None,
 
-            active_tab: 0,
             seg_pipeline: 1,
             last_pipeline: 1,
-            last_soundfont: 0,
-            search_text: "OpenSans + Swash Subpixel".to_string(),
-            preset_name: "Studio Mastering (-14 LUFS)".to_string(),
             selected_device: 0,
             selected_rate: 0,
-            selected_soundfont: 0,
-            pitch_semitones: 3.0,
-            tempo_ratio: 1.18,
-            master_vol: config.master_vol.clamp(0.0, 1.0),
-            stereo_sep: 100.0,
+            pitch_semitones: 0.0,
+            tempo_ratio: 1.0,
+            master_vol: config.master_vol.clamp(0.0, 2.0),
             chk_formant: true,
             chk_locked: config.chk_locked,
             sw_hq_mode: config.sw_hq_mode,
             sw_keep_tray: config.sw_keep_tray,
-            radio_interp: 1,
-            click_counter: 0,
-            scrub_frac: 0.35,
+            scrub_frac: 0.0,
             selected_track: 0,
-            wave_peaks: audio::synth_wave_peaks(96),
+            show_controls: config.show_controls,
             loop_enabled: false,
             shuffle_enabled: false,
-            compact_player_mode: false,
-            params_tab: 0,
-            midi_transpose: 0.0,
-            midi_bpm: 120.0,
-            midi_metronome: false,
-            loaded_kind: None,
-            playlist: default_playlist(),
+            playlist: Vec::new(),
             track_meta: None,
-            scrub_active: false,
+            cover_uploaded: false,
             dsp: DspAnalyzer::new(48_000),
             last_dsp_frames: 0,
             dsp_buf: Vec::new(),
@@ -1067,6 +886,7 @@ impl App {
             mixer_pos_frac: 0.74,
             config,
             save_config_req: false,
+            apply_zoom_req: false,
             config_status: String::new(),
         }
     }
@@ -1076,6 +896,7 @@ impl App {
         self.config.dark_mode = self.dark_mode;
         self.config.ui_zoom = self.ui_zoom;
         self.config.master_vol = self.master_vol;
+        self.config.show_controls = self.show_controls;
         self.config.chk_locked = self.chk_locked;
         self.config.sw_hq_mode = self.sw_hq_mode;
         self.config.sw_keep_tray = self.sw_keep_tray;
@@ -1089,13 +910,22 @@ impl App {
         }
     }
 
-    /// Logical base size of the main window for the active player mode.
-    fn base_window_size(&self) -> (f64, f64) {
-        if self.compact_player_mode {
-            (580.0, 300.0)
-        } else {
-            (1120.0, 700.0)
-        }
+    /// Logical dimensions of the minimalist player window.
+    const WIDTH: f64 = 480.0;
+    const HEIGHT_WITH_CONTROLS: f64 = 278.0;
+    const HEIGHT_WITHOUT_CONTROLS: f64 = 221.0;
+    /// Minimum window height while the transport bar is shown.
+    const MIN_HEIGHT_WITH_CONTROLS: f64 = 276.0;
+
+    fn base_size(&self) -> (f64, f64) {
+        (
+            Self::WIDTH,
+            if self.show_controls {
+                Self::HEIGHT_WITH_CONTROLS
+            } else {
+                Self::HEIGHT_WITHOUT_CONTROLS
+            },
+        )
     }
 
     fn set_zoom(&mut self, new_zoom: f32) {
@@ -1104,7 +934,7 @@ impl App {
             return;
         }
         self.ui_zoom = clamped;
-        self.apply_player_mode();
+        self.apply_zoom();
     }
 
     /// The current UI parameter state as an engine `PlaybackParams`.
@@ -1115,49 +945,124 @@ impl App {
             tempo_ratio: self.tempo_ratio,
             hq: self.sw_hq_mode,
             formant_preserve: self.chk_formant,
-            stereo_sep: self.stereo_sep,
-            interp: self.radio_interp,
-            midi_transpose: self.midi_transpose,
-            midi_bpm: self.midi_bpm,
-            metronome: self.midi_metronome,
         }
     }
 
     /// Re-apply the pipeline selection and push the full parameter set to the
-    /// engine. Switching into the MIDI synth pipeline loads the built-in GM
-    /// sequence; leaving it reloads the selected playlist track.
+    /// engine. Parameters are applied entirely in the Rust pipeline, so no
+    /// engine reload is needed.
     fn sync_pipeline_and_params(&mut self) {
         let params = self.playback_params();
-        let Some(a) = &self.audio else { return };
-        if self.seg_pipeline == 2 && self.last_pipeline != 2 {
-            a.load_midi_demo();
-        } else if self.seg_pipeline != 2 && self.last_pipeline == 2 && !self.playlist.is_empty() {
-            let idx = self.selected_track.min(self.playlist.len() - 1);
-            a.load_file(self.playlist[idx].clone());
-        }
         self.last_pipeline = self.seg_pipeline;
-        a.set_params(params);
+        if let Some(a) = &self.audio {
+            a.set_params(params);
+        }
     }
 
-    /// Apply the active player mode to the native window: compact mode resizes
-    /// to 580x300 (with a matching minimum size), studio mode to 1120x700.
-    fn apply_player_mode(&mut self) {
+    /// Load the next playlist entry (wrapping only when `wrap` is set).
+    /// Returns `true` when a track was loaded.
+    fn advance_track(&mut self, wrap: bool) -> bool {
+        if self.playlist.is_empty() {
+            return false;
+        }
+        let cur = self.selected_track.min(self.playlist.len() - 1);
+        let idx = if cur + 1 < self.playlist.len() {
+            cur + 1
+        } else if wrap {
+            0
+        } else {
+            return false;
+        };
+        self.load_playlist_index(idx);
+        true
+    }
+
+    /// Load `playlist[idx]` into the engine.
+    fn load_playlist_index(&mut self, idx: usize) {
+        let Some(path) = self.playlist.get(idx).cloned() else {
+            return;
+        };
+        self.selected_track = idx;
+        if !self.chk_locked {
+            self.pitch_semitones = 0.0;
+            self.tempo_ratio = 1.0;
+        }
+        self.scrub_frac = 0.0;
+        self.track_meta = None;
+        self.cover_uploaded = false;
+        if let Some(a) = &self.audio {
+            a.load_file(path);
+        }
+    }
+
+    /// Open a file or folder, replacing the implicit folder playlist or appending
+    /// to it. Folders recurse when `recursive_dirs` is set.
+    fn open_path(&mut self, path: PathBuf, append: bool, recursive_dirs: bool) {
+        if !is_supported_audio(&path) && path.is_dir() {
+            let files = playlist_from_folder(&path, recursive_dirs);
+            if files.is_empty() {
+                return;
+            }
+            if append && !self.playlist.is_empty() {
+                self.playlist.extend(files);
+            } else {
+                self.playlist = files;
+                self.selected_track = 0;
+                self.load_playlist_index(0);
+            }
+        } else if append && !self.playlist.is_empty() {
+            self.playlist.push(path);
+        } else {
+            // Dispatch the file to the audio decoder immediately (0 SMB stat calls
+            // beforehand) so FFmpeg opens the stream in parallel with `read_dir`.
+            if !self.chk_locked {
+                self.pitch_semitones = 0.0;
+                self.tempo_ratio = 1.0;
+            }
+            self.scrub_frac = 0.0;
+            self.track_meta = None;
+            self.cover_uploaded = false;
+            if let Some(a) = &self.audio {
+                a.load_file(path.clone());
+            }
+            let (list, idx) = playlist_from_single_file(&path);
+            self.playlist = list;
+            self.selected_track = idx;
+        }
+    }
+
+    /// Resize the native window to the minimalist base size scaled by the UI zoom.
+    fn apply_zoom(&mut self) {
         let Some(w) = &self.window else { return };
         let z = self.ui_zoom as f64;
-        let (min_w, min_h) = if self.compact_player_mode {
-            (420.0, 240.0)
-        } else {
-            (760.0, 480.0)
-        };
-        let (bw, bh) = self.base_window_size();
+        let (base_w, base_h) = self.base_size();
         // Lower the minimum first so the window is allowed to shrink.
-        let _ = w.set_min_inner_size(Some(winit::dpi::LogicalSize::new(min_w * z, min_h * z)));
-        let _ = w.request_inner_size(winit::dpi::LogicalSize::new(bw * z, bh * z));
+        let min_h = if self.show_controls {
+            Self::MIN_HEIGHT_WITH_CONTROLS
+        } else {
+            Self::HEIGHT_WITHOUT_CONTROLS
+        };
+        let _ = w.set_min_inner_size(Some(winit::dpi::LogicalSize::new(
+            Self::WIDTH * z,
+            min_h * z,
+        )));
+        let _ = w.request_inner_size(winit::dpi::LogicalSize::new(base_w * z, base_h * z));
         self.size = (w.inner_size().width, w.inner_size().height);
         w.request_redraw();
     }
 
-    fn build_scene(&mut self, w: u32, h: u32, scale: f32) {
+    fn build_scene(&mut self, w: u32, h: u32, _dpi_scale: f32) {
+        // The whole minimalist UI scales with the *actual* window size, so window
+        // border/corner drags, `+/-/0` and `Ctrl+Wheel` (which resizes the window)
+        // all produce the same smooth scaling.
+        let base_h = if self.show_controls {
+            Self::HEIGHT_WITH_CONTROLS as f32
+        } else {
+            Self::HEIGHT_WITHOUT_CONTROLS as f32
+        };
+        let scale = (w as f32 / Self::WIDTH as f32)
+            .min(h as f32 / base_h)
+            .max(0.5);
         let _ = self.text_sys.prepare_frame();
         // `--nui-rem-base: 16px` (nui-theme.css)
         let rem = (16.0 * scale).round();
@@ -1166,66 +1071,153 @@ impl App {
         } else {
             Theme::light(rem)
         };
-
-        // Page background (`body { background: light-dark(shade2, shade1) }` in nui-theme.css)
-        let page_bg = if theme.dark {
-            (theme.shade1.0, theme.shade1.1, theme.shade1.2)
+        let win_bg = if theme.dark {
+            rgb(44, 44, 44)
         } else {
-            (theme.shade2.0, theme.shade2.1, theme.shade2.2)
+            rgb(235, 235, 235)
         };
-        self.scene.clear_all(page_bg);
+        self.scene.clear_all((win_bg.0, win_bg.1, win_bg.2));
         self.ui_state.begin_frame();
 
         let pw = w as f32;
         let ph = h as f32;
-        let active_backend = self
-            .renderer
-            .as_ref()
-            .map(|r| r.active)
-            .unwrap_or(self.prefer_backend);
-        // Pull real metadata + waveform peaks from the decoder thread (it
-        // publishes them when a file is loaded) — dark-mode Left Card + seekbar.
-        let (peaks, meta) = match &self.audio {
-            Some(a) => (a.peaks(), a.metadata()),
-            None => (Vec::new(), None),
-        };
-        if !peaks.is_empty() && peaks != self.wave_peaks {
-            self.wave_peaks = peaks;
-        }
+
+        // Pull the real metadata published by the decoder thread.
+        let meta = self.audio.as_ref().and_then(|a| a.metadata());
         if meta != self.track_meta {
             self.track_meta = meta;
         }
-        // Phase 3.2 — the Parameters window's tab follows the loaded source kind
-        // (audio file -> Audio, MIDI -> MIDI, tracker module -> Tracker).
-        if let Some(k) = self.audio.as_ref().and_then(|a| a.source_kind()) {
-            if self.loaded_kind != Some(k) {
-                self.loaded_kind = Some(k);
-                self.params_tab = match k {
-                    SourceKind::Audio => 0,
-                    SourceKind::Midi => 1,
-                    SourceKind::Tracker => 2,
-                };
+        // Push embedded cover art into the scene once per track (metadata arrives
+        // asynchronously from the decoder thread, hence the retry-until-found flag).
+        if !self.cover_uploaded {
+            if let Some((cw, ch, rgba)) = self
+                .track_meta
+                .as_ref()
+                .and_then(|m| m.cover_rgba.clone())
+            {
+                self.scene.set_image(cw, ch, rgba);
+                self.cover_uploaded = true;
             }
         }
-
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         let (pos, dur) = self
             .audio
             .as_ref()
             .map(|a| (a.position_secs(), a.duration_secs()))
             .unwrap_or((0.0, 0.0));
+        let file = self.audio.as_ref().and_then(|a| a.current_file());
 
-        let mut toggle_backend_req = false;
-        let mut toggle_font_req = false;
-        let mut toggle_theme_req = false;
-        let mut zoom_delta: f32 = 0.0;
-        let mut close_req = false;
-        let mut compact_req = false;
-        // Phase 3.1 transport intents from the shared transport row, applied
-        // after the render borrow ends.
-        let mut transport_intents = TransportIntents::default();
-        let mut load_path: Option<PathBuf> = None;
-        let mut params_changed = false;
+        // Every string the metadata block shows, computed before the render borrow.
+        let ext_lbl = file
+            .as_ref()
+            .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_ascii_uppercase()))
+            .unwrap_or_default();
+        let folder_lbl = file
+            .as_ref()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".to_string());
+        let file_lbl = file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".to_string());
+        let md = self.track_meta.clone();
+        // Prefer FFmpeg's descriptive codec name; only prefix the extension when
+        // the name does not already lead with it ("MP3 (MPEG audio layer 3)").
+        let format_lbl = if ext_lbl.is_empty() {
+            "-".to_string()
+        } else if let Some(name) = md
+            .as_ref()
+            .map(|m| m.codec_long_name.clone())
+            .filter(|s| !s.is_empty())
+        {
+            if name.to_ascii_uppercase().starts_with(&ext_lbl) {
+                name
+            } else {
+                format!("{ext_lbl} ({name})")
+            }
+        } else if let Some(codec) = md
+            .as_ref()
+            .map(|m| m.codec.clone())
+            .filter(|s| !s.is_empty())
+        {
+            format!("{ext_lbl} ({codec})")
+        } else {
+            format!("{ext_lbl} (unknown codec)")
+        };
+        let (sr, ch) = md.as_ref().map(|m| (m.sample_rate, m.channels)).unwrap_or((0, 0));
+        let ch_str = match ch {
+            2 => "stereo".to_string(),
+            1 => "mono".to_string(),
+            n if n > 0 => format!("{n} ch"),
+            _ => "-".to_string(),
+        };
+        let kbps = match md.as_ref().map(|m| m.bitrate).unwrap_or(0) {
+            0 => {
+                // Approximate when FFmpeg reports no bitrate: file bytes over duration.
+                // The size was sampled once by the background metadata probe, so no
+                // SMB stat happens on the render path.
+                let bytes = md.as_ref().map(|m| m.file_size_bytes).unwrap_or(0);
+                if dur > 0.1 {
+                    (bytes as f64 * 8.0 / dur / 1000.0).round() as i32
+                } else {
+                    0
+                }
+            }
+            b => b / 1000,
+        };
+        let format2_lbl = if sr > 0 {
+            if kbps > 0 {
+                format!("{kbps} kbps / {ch_str} / {sr} Hz")
+            } else {
+                format!("{ch_str} / {sr} Hz")
+            }
+        } else {
+            String::new()
+        };
+        let artist_lbl = md
+            .as_ref()
+            .map(|m| m.artist.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        let album_lbl = md
+            .as_ref()
+            .map(|m| m.album.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        let title_lbl = md
+            .as_ref()
+            .map(|m| m.title.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                file.as_ref()
+                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let total_tracks = self.playlist.len().max(1);
+        let counter_lbl = format!(
+            "{} of {}",
+            (self.selected_track + 1).min(total_tracks),
+            total_tracks
+        );
+        let vol_pct = (self.master_vol * 100.0).round() as i32;
+        let db_str = if self.master_vol <= 0.0001 {
+            "-inf dB".to_string()
+        } else {
+            format!("{:+.1} dB", 20.0 * self.master_vol.log10())
+        };
+        let vol_lbl = format!("Volume: {vol_pct}% ({db_str})");
+
+        let monitoring_visible = self.secondary_windows.is_visible("monitoring");
+        let parameters_visible = self.secondary_windows.is_visible("parameters");
+        if let Some(a) = &self.audio {
+            a.set_dsp_enabled(monitoring_visible);
+        }
+
+        let mut intents = MainIntents::default();
+        let pending_drop: Option<(PathBuf, DropZone)>;
 
         {
             let mut ui = Ui::new(
@@ -1236,874 +1228,479 @@ impl App {
                 theme,
             );
 
-            // ================================================================
-            // 1. NUI App Header (`nui-app-header`, 3.25rem)
-            // ================================================================
-            let hdr_h = theme.header_height();
-            ui.scene.rect(0.0, 0.0, pw, hdr_h, theme.shade2);
-            ui.scene
-                .rect(0.0, hdr_h - 1.0, pw, 1.0, theme.border2);
-
-            // Clip header left zone (logo, title, badges) so it never collides with right-side buttons.
-            // The compact player keeps only Theme + Compact + Close (10.7rem);
-            // the studio layout shows the full button stack (26.5rem).
-            let right_zone_w = (rem * if self.compact_player_mode { 10.7 } else { 26.5 }).round();
-            ui.scene
-                .push_clip(0.0, 0.0, (pw - right_zone_w).max(0.0), hdr_h);
-
-            let icon_sz = (rem * 1.25).round();
-            ui.scene.icon_centered(
-                ui.text_sys,
-                ICON_EQ,
-                rem * 0.85 + icon_sz * 0.5,
-                hdr_h * 0.5,
-                icon_sz,
-                theme.highlight,
-            );
-            let title_fs = theme.font_base();
-            let title_w = ui.scene.text(
-                ui.text_sys,
-                FontFace::SemiBold,
-                ui.font_engine,
-                "SoundApp · NUI Rust",
-                (rem * 2.35).round(),
-                (hdr_h * 0.5 + title_fs * 0.34).round(),
-                title_fs,
-                theme.text,
+            // ---- Window surface: the window itself IS the flat player card ----
+            let border_col = if theme.dark {
+                rgb(60, 60, 60)
+            } else {
+                rgb(200, 200, 200)
+            };
+            ui.scene.rect(0.0, 0.0, pw, ph, win_bg);
+            ui.scene.rounded_rect(
+                0.5,
+                0.5,
+                (pw - 1.0).max(0.0),
+                (ph - 1.0).max(0.0),
+                0.0,
+                (0, 0, 0, 0),
+                border_col,
+                1.0,
             );
 
-            // Status badges (`nui-badge`)
-            let badge_y = (hdr_h - (rem * 1.45).round()) * 0.5;
-            let mut bx = rem * 2.35 + title_w + rem * 0.85;
-            let b_lbl = match active_backend {
-                BackendKind::Gpu => "GPU · GL 3.3 SDF",
-                BackendKind::Cpu => "CPU · Softbuffer",
-            };
-            let b_var = match active_backend {
-                BackendKind::Gpu => BadgeVariant::Primary,
-                BackendKind::Cpu => BadgeVariant::Warning,
-            };
-            bx += ui.badge(bx, badge_y, b_lbl, b_var, Some(true)) + rem * 0.45;
-
-            let fps_badge = if self.last_fps > 0 {
-                format!("{} FPS", self.last_fps)
-            } else {
-                "0% IDLE".to_string()
-            };
-            let _ = ui.badge(bx, badge_y, &fps_badge, BadgeVariant::Success, None);
-            ui.scene.pop_clip();
-
-            // Header right controls. Studio mode: Backend / Font / Theme / Zoom ± /
-            // Compact / Close. Compact player: Theme / Compact / Close only, so
-            // the 580px window keeps a usable title zone.
-            let btn_h = (rem * 1.75).round();
-            let btn_y = (hdr_h - btn_h) * 0.5;
-            let close_w = (rem * 2.1).round();
-            let mut rx = pw - rem * 0.6 - close_w;
-
-            if ui.button(
-                90,
-                Rect::new(rx, btn_y, close_w, btn_h),
-                "",
-                ICON_CLOSE,
-                ButtonVariant::Danger,
-            ) {
-                close_req = true;
-            }
-
-            let z_w = (rem * 1.75).round();
-            if !self.compact_player_mode {
-                rx -= z_w + rem * 0.3;
-                if ui.button(91, Rect::new(rx, btn_y, z_w, btn_h), "+", "", ButtonVariant::Outline) {
-                    zoom_delta = 0.1;
-                }
-                rx -= z_w + rem * 0.25;
-                if ui.button(92, Rect::new(rx, btn_y, z_w, btn_h), "-", "", ButtonVariant::Outline) {
-                    zoom_delta = -0.1;
-                }
-            }
-
-            let th_w = (rem * 2.1).round();
-            rx -= th_w + rem * 0.35;
-            let th_icon = if self.dark_mode {
-                ICON_LIGHT_MODE
-            } else {
-                ICON_DARK_MODE
-            };
-            if ui.button(
-                93,
-                Rect::new(rx, btn_y, th_w, btn_h),
-                "",
-                th_icon,
-                ButtonVariant::Ghost,
-            ) {
-                toggle_theme_req = true;
-            }
-
-            if !self.compact_player_mode {
-                let fn_w = (rem * 5.8).round();
-                rx -= fn_w + rem * 0.35;
-                let fn_lbl = match self.font_engine {
-                    FontEngine::Swash => "Swash [F]",
-                    FontEngine::Fontdue => "Fontdue [F]",
-                };
-                if ui.button(
-                    94,
-                    Rect::new(rx, btn_y, fn_w, btn_h),
-                    fn_lbl,
-                    "",
-                    ButtonVariant::Outline,
-                ) {
-                    toggle_font_req = true;
-                }
-
-                let bk_w = (rem * 5.2).round();
-                rx -= bk_w + rem * 0.35;
-                let bk_lbl = match active_backend {
-                    BackendKind::Gpu => "GPU [B]",
-                    BackendKind::Cpu => "CPU [B]",
-                };
-                if ui.button(
-                    95,
-                    Rect::new(rx, btn_y, bk_w, btn_h),
-                    bk_lbl,
-                    "",
-                    ButtonVariant::Primary,
-                ) {
-                    toggle_backend_req = true;
-                }
-            }
-
-            let cp_w = (rem * 5.2).round();
-            rx -= cp_w + rem * 0.35;
-            let cp_lbl = if self.compact_player_mode {
-                "Studio [C]"
-            } else {
-                "Compact [C]"
-            };
-            if ui.button(
-                96,
-                Rect::new(rx, btn_y, cp_w, btn_h),
-                cp_lbl,
-                "",
-                ButtonVariant::Outline,
-            ) {
-                compact_req = true;
-            }
-
-            // ================================================================
-            // 2. Main Layout Grid. Studio mode: Left Player Card + Right NUI
-            //    Tabs Card + Bottom Transport Card. Compact mode (`C`): the
-            //    580x300 SoundApp Player — the player card IS the whole body.
-            //    nui_wc2 proportions: 1.25rem window padding + inter-card gap.
-            // ================================================================
-            let m = Length::Rem(1.25).resolve(rem).round();
-            let top_y = hdr_h + m;
-
-            // Shared player-card data (both layouts): playlist pill, track
-            // title, format/codec line, speed/pitch overlay, window visibility.
-            let vis = [
-                self.secondary_windows.is_visible("parameters"),
-                self.secondary_windows.is_visible("monitoring"),
-                self.secondary_windows.is_visible("mixer"),
-                self.secondary_windows.is_visible("settings"),
-                self.secondary_windows.is_visible("help"),
-            ];
-            let (title_lbl, meta_lbl) = match &self.track_meta {
-                Some(m) => (
-                    self.audio
-                        .as_ref()
-                        .and_then(|a| a.current_file())
-                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                        .unwrap_or_else(|| "(loaded)".to_string()),
-                    format!(
-                        "{} · {} Hz · {} kbps · {}",
-                        if m.codec.is_empty() { "unknown" } else { &m.codec },
-                        m.sample_rate,
-                        m.bitrate / 1000,
-                        fmt_meta_duration(m.duration)
-                    ),
-                ),
-                None => (
-                    track_name(self.selected_track),
-                    track_meta(self.selected_track),
-                ),
-            };
-            let pill = format!(
-                "{:02}/{:02}",
-                (self.selected_track + 1).min(99),
-                self.playlist.len().max(13)
-            );
-            let overlay_badge =
-                format!("{:.2}x · {:+.0}st", self.tempo_ratio, self.pitch_semitones);
-
-            if self.compact_player_mode {
-                // ---- Phase 3.1 compact SoundApp Player (580x300) ----
-                let cm = Length::Rem(0.75).resolve(rem).round();
-                let body_r = Rect::new(cm, top_y, pw - cm * 2.0, (ph - top_y - cm).max(60.0));
-                ui.card(body_r, Length::rem(0.75), Length::rem(0.45), |ui| {
-                    let inner = ui.bounds();
-                    let [th_r, spec_r, launch_r, tp_r] = ui.rows(
-                        inner,
-                        Length::rem(0.45),
-                        [
-                            Length::rem(2.2),
-                            Length::fill(),
-                            Length::rem(1.6),
-                            Length::Rem(4.2),
-                        ],
-                    );
-                    draw_track_header(ui, th_r, &pill, &title_lbl, &meta_lbl);
-                    if draw_spec_panel(ui, spec_r, self.t, playing, self.master_vol, &overlay_badge)
-                    {
-                        self.pending_window_toggles.push("parameters");
-                    }
-                    if let Some(wi) = draw_window_launcher(ui, &[launch_r], &vis) {
-                        self.pending_window_toggles.push(WINDOW_TOGGLES[wi].0);
-                    }
-                    transport_intents = draw_transport(
-                        ui,
-                        tp_r,
-                        Length::rem(1.6),
-                        self.t,
-                        &self.wave_peaks,
-                        &mut self.scrub_frac,
-                        &mut self.scrub_active,
-                        pos,
-                        dur,
-                        playing,
-                        &mut self.master_vol,
-                        self.loop_enabled,
-                        self.shuffle_enabled,
-                    );
-                });
-            } else {
-                let bot_h = Length::Rem(6.4).resolve(rem).round();
-                let main_h = (ph - top_y - bot_h - m * 2.0).max(120.0);
-                let left_w = Length::Rem(20.0).resolve(rem).round();
-
-                // Left Card — Phase 3.1 player panel: track header row, realtime
-                // spectrum + oscilloscope with the speed/pitch overlay, then the
-                // secondary-window launcher rows.
-                let left_rect = Rect::new(m, top_y, left_w, main_h);
-                ui.nui_card(left_rect, |ui| {
-                    let inner = ui.bounds();
-                    let [th_r, spec_r, l1, l2] = ui.rows(
-                        inner,
-                        Length::rem(0.8),
-                        [
-                            Length::rem(3.0),
-                            Length::fill(),
-                            Length::rem(1.7),
-                            Length::rem(1.7),
-                        ],
-                    );
-                    draw_track_header(ui, th_r, &pill, &title_lbl, &meta_lbl);
-                    if draw_spec_panel(
-                        ui,
-                        spec_r,
-                        self.t,
-                        playing,
-                        self.master_vol,
-                        &overlay_badge,
-                    ) {
-                        self.pending_window_toggles.push("parameters");
-                    }
-                    if let Some(wi) = draw_window_launcher(ui, &[l1, l2], &vis) {
-                        self.pending_window_toggles.push(WINDOW_TOGGLES[wi].0);
-                    }
-                });
-
-            // ================================================================
-            // 3. Right Panel: NUI Component Gallery & SoundApp Parameters (`nui-tabs`)
-            //    Declarative: nui-card -> tabs row -> per-tab layout body.
-            // ================================================================
-            let right_x = m + left_w + m;
-            let right_w = (pw - right_x - m).max(200.0);
-            let right_rect = Rect::new(right_x, top_y, right_w, main_h);
-
-            ui.nui_card(right_rect, |ui| {
-                let tabs_r = ui.take(Length::rem(2.6));
-                ui.tabs(
-                    200,
-                    tabs_r,
-                    &[
-                        (ICON_TUNE, "NUI Components"),
-                        (ICON_SETTINGS, "Audio Parameters"),
-                        (ICON_SEARCH, "Typography A/B"),
-                        (ICON_EQ, "Virtual List (10k)"),
-                    ],
-                    &mut self.active_tab,
-                );
-                ui.spacer(Length::rem(0.5));
-
-                let body = ui.take_rest();
-
-                match self.active_tab {
-                0 => {
-                    // ---- TAB 0: NUI Components — spacious 2-column `nui-layout` grid ----
-                    let [col1, col2] =
-                        ui.cols(body, Length::rem(1.5), [Length::fill(), Length::fill()]);
-                    let mut sel1_r = Rect::new(0.0, 0.0, 0.0, 0.0);
-
-                    ui.with_column(col1, Length::rem(1.0), |ui| {
-                        // 1. nui-input-group + nui-input (standard 2.5rem control)
-                        let inp = ui.input_group("nui-input (click to edit, drag to select)");
-                        ui.text_input(
-                            301,
-                            inp,
-                            "Type filter or track title...",
-                            &mut self.search_text,
-                        );
-
-                        // 2. Segmented button container
-                        let seg = ui.input_group("nui-button-container [variant=segmented]");
-                        if ui.segmented(
-                            310,
-                            seg,
-                            &["Tape Speed", "Pitch / Time", "MIDI Synth"],
-                            &mut self.seg_pipeline,
-                        ) {
-                            params_changed = true;
-                        }
-
-                        // 3. Button variants (0.5rem gaps)
-                        let blabel =
-                            format!("nui-button variants (clicked: {})", self.click_counter);
-                        let btns = ui.form_field(&blabel, Length::rem(2.25));
-                        let b_gap = theme.space_half();
-                        let bw4 = ((btns.w - b_gap * 3.0) / 4.0).floor();
-                        let variants = [
-                            (320u32, "Primary", ButtonVariant::Primary),
-                            (321u32, "Outline", ButtonVariant::Outline),
-                            (322u32, "Success", ButtonVariant::Success),
-                            (323u32, "Danger", ButtonVariant::Danger),
-                        ];
-                        for (i, (bid, lab, var)) in variants.into_iter().enumerate() {
-                            let br =
-                                Rect::new(btns.x + (bw4 + b_gap) * i as f32, btns.y, bw4, btns.h);
-                            if ui.button(bid, br, lab, "", var) {
-                                self.click_counter += 1;
-                            }
-                        }
-
-                        // 4. Checkbox + switch on a shared 2rem form row
-                        ui.spacer(Length::rem(0.25));
-                        let [chk_r, sw_r] = ui.take_cols(
-                            Length::rem(2.0),
-                            Length::rem(1.0),
-                            [Length::fill(), Length::fill()],
-                        );
-                        ui.checkbox(330, chk_r, "Preserve Formants", &mut self.chk_formant);
-                        if ui.switch(331, sw_r, "HQ Oversampling", &mut self.sw_hq_mode) {
-                            params_changed = true;
-                        }
-                    });
-
-                    // ---- Right column: `nui-select`, `nui-slider`, `nui-radio` ----
-                    ui.with_column(col2, Length::rem(1.0), |ui| {
-                        sel1_r = ui.input_group("nui-select (audio output device)");
-
-                        let pitch_lbl = format!("{:+.1} st", self.pitch_semitones);
-                        let pr = ui.take(Length::rem(2.9));
-                        if ui.slider(
-                            340,
-                            pr,
-                            "Pitch Shift (dbl-click reset)",
-                            &mut self.pitch_semitones,
-                            -12.0,
-                            12.0,
-                            0.0,
-                            &pitch_lbl,
-                        ) {
-                            params_changed = true;
-                        }
-
-                        let tempo_lbl = format!("{:.2}x", self.tempo_ratio);
-                        let tr = ui.take(Length::rem(2.9));
-                        if ui.slider(
-                            341,
-                            tr,
-                            "Tempo / Speed (wheel fine-tune)",
-                            &mut self.tempo_ratio,
-                            0.5,
-                            2.0,
-                            1.0,
-                            &tempo_lbl,
-                        ) {
-                            params_changed = true;
-                        }
-
-                        let rr =
-                            ui.form_field("Interpolation Filter (nui-radio)", Length::rem(2.0));
-                        let r_w = (rr.w / 4.0).floor();
-                        for (ri, rlabel) in
-                            ["Nearest", "Linear", "Cubic", "Sinc 8-tap"].iter().enumerate()
-                        {
-                            if ui.radio(
-                                350 + ri as u32,
-                                Rect::new(rr.x + ri as f32 * r_w, rr.y, r_w, rr.h),
-                                rlabel,
-                                self.radio_interp == ri,
-                            ) && self.radio_interp != ri
-                            {
-                                self.radio_interp = ri;
-                                params_changed = true;
-                            }
-                        }
-                    });
-
-                    // Drawn after both columns so the open popup layers above every sibling.
-                    ui.select(360, sel1_r, DEVICES, &mut self.selected_device);
-                }
-                1 => {
-                    // ---- TAB 1: SoundApp Parameters — responsive `nui-layout` grid ----
-                    let grid = ui.layout_grid(body, 2, Length::rem(1.5));
-                    // `layout_grid` collapses to a single column below 30rem. Stack the two
-                    // parameter groups vertically in that case instead of indexing [1].
-                    let (col_a, col_b) = if grid.len() >= 2 {
-                        (grid[0], grid[1])
-                    } else {
-                        let g = grid[0];
-                        let [top, bottom] =
-                            ui.rows(g, Length::rem(1.5), [Length::fill(), Length::fill()]);
-                        (top, bottom)
-                    };
-
-                    ui.with_column(col_a, Length::rem(1.0), |ui| {
-                        let pn = ui.input_group("Preset Name (nui-input)");
-                        ui.text_input(401, pn, "Enter preset name...", &mut self.preset_name);
-
-                        let sf = ui.input_group("MIDI SoundFont (.sf2)");
-                        ui.select(430, sf, SOUNDFONTS, &mut self.selected_soundfont);
-
-                        let sr = ui.input_group("Target Sample Rate");
-                        ui.select(431, sr, SAMPLE_RATES, &mut self.selected_rate);
-                    });
-
-                    ui.with_column(col_b, Length::rem(1.0), |ui| {
-                        let sep_str = format!("{:.0}%", self.stereo_sep);
-                        let s1 = ui.take(Length::rem(2.9));
-                        ui.slider(
-                            410,
-                            s1,
-                            "Tracker Stereo Separation",
-                            &mut self.stereo_sep,
-                            0.0,
-                            200.0,
-                            100.0,
-                            &sep_str,
-                        );
-
-                        let c1 = ui.take(Length::rem(2.0));
-                        ui.checkbox(
-                            411,
-                            c1,
-                            "Lock Parameters Across Track Changes",
-                            &mut self.chk_locked,
-                        );
-
-                        let s2 = ui.take(Length::rem(2.0));
-                        ui.switch(
-                            412,
-                            s2,
-                            "Keep Running in System Tray (0% CPU Idle)",
-                            &mut self.sw_keep_tray,
-                        );
-
-                        let [reset_r, save_r] =
-                            ui.take_form_row(false, [Length::fill(), Length::fill()]);
-                        if ui.button(420, reset_r, "Reset Defaults", "", ButtonVariant::Outline)
-                        {
-                            self.pitch_semitones = 0.0;
-                            self.tempo_ratio = 1.0;
-                            self.stereo_sep = 100.0;
-                            self.master_vol = 0.78;
-                        }
-                        let _ = ui.button(421, save_r, "Save Preset", "", ButtonVariant::Primary);
-                    });
-                }
-                2 => {
-                    // ---- TAB 2: Side-by-Side Typography A/B at 12/15/18 px ----
-                    let [abox, bbox] =
-                        ui.rows(body, Length::rem(0.65), [Length::fill(), Length::fill()]);
-
-                    ui.inset_card(
-                        abox,
-                        Length::rem(1.25),
-                        Length::rem(0.65),
-                        theme.highlight_dim,
-                        |ui| {
-                            let b = ui.bounds();
-                            let tx = b.x.round();
-                            let fs_head = theme.font_xsmall();
-                            let mut sy = b.y + fs_head * 1.3;
-                            ui.text_clipped(
-                                FontFace::SemiBold,
-                                FontEngine::Swash,
-                                "A. SWASH — OpenType Kerning + Hinting + 4x Subpixel + Linear-Light Gamma",
-                                tx,
-                                sy.round(),
-                                fs_head,
-                                b.w,
-                                theme.highlight,
-                            );
-                            for (lbl, css_px) in [("12px", 12.0f32), ("15px", 15.0), ("18px", 18.0)]
-                            {
-                                sy += rem * 1.5;
-                                ui.text_clipped(
-                                    FontFace::Regular,
-                                    FontEngine::Swash,
-                                    &format!("{lbl}: {}", typo_sample(css_px)),
-                                    tx,
-                                    sy.round(),
-                                    rem * (css_px / 16.0),
-                                    b.w,
-                                    theme.text,
-                                );
-                            }
-                        },
-                    );
-
-                    ui.inset_card(
-                        bbox,
-                        Length::rem(1.25),
-                        Length::rem(0.65),
-                        theme.border2,
-                        |ui| {
-                            let b = ui.bounds();
-                            let tx = b.x.round();
-                            let fs_head = theme.font_xsmall();
-                            let mut fy = b.y + fs_head * 1.3;
-                            ui.text_clipped(
-                                FontFace::SemiBold,
-                                FontEngine::Fontdue,
-                                "B. FONTDUE (Legacy POC) — Unhinted + Integer-Snapped + Naive sRGB Alpha",
-                                tx,
-                                fy.round(),
-                                fs_head,
-                                b.w,
-                                theme.text_dim,
-                            );
-                            for (lbl, css_px) in [("12px", 12.0f32), ("15px", 15.0), ("18px", 18.0)]
-                            {
-                                fy += rem * 1.5;
-                                ui.text_clipped(
-                                    FontFace::Regular,
-                                    FontEngine::Fontdue,
-                                    &format!("{lbl}: {}", typo_sample(css_px)),
-                                    tx,
-                                    fy.round(),
-                                    rem * (css_px / 16.0),
-                                    b.w,
-                                    theme.text,
-                                );
-                            }
-                        },
-                    );
-                }
-                _ => {
-                    // ---- TAB 3: header bar + full-width 10,000-track virtual list ----
-                    // `body` is an already-consumed rect: split IT (never the card cursor,
-                    // which take_rest exhausted) into header + list rows.
-                    let [hdr_r, list_r] =
-                        ui.rows(body, Length::rem(0.5), [Length::rem(2.4), Length::fill()]);
-                    let badge_h = (rem * 1.45).round();
-                    let bx = hdr_r.x;
-                    let by = hdr_r.y + (hdr_r.h - badge_h) * 0.5;
-                    // `ui.badge` returns the badge's width, NOT `bx + w` — anchor the
-                    // description text at `bx + w + gap` so it never overlaps the badge.
-                    let info_x = bx
-                        + ui.badge(
-                            bx,
-                            by,
-                            &format!("{} TRACKS", TRACK_COUNT),
-                            BadgeVariant::Primary,
-                            None,
-                        )
-                        + theme.space();
-                    let fs_info = theme.font_small();
-                    ui.text_clipped(
-                        FontFace::Regular,
-                        ui.font_engine,
-                        "All Genres · no filter · sorted by Artist — click a row to load",
-                        info_x.round(),
-                        (hdr_r.y + hdr_r.h * 0.5 + fs_info * 0.33).round(),
-                        fs_info,
-                        (hdr_r.x + hdr_r.w - info_x).max(0.0),
-                        theme.text_muted,
-                    );
-
-                    let row_h = (rem * 2.25).round();
-                    ui.virtual_list(600, list_r, TRACK_COUNT, row_h, |ui, idx, rr| {
-                        let row_id = 20_000u32.wrapping_add(idx as u32);
-                        let hovered = ui.state.can_hover(row_id, rr);
-                        if hovered {
-                            ui.state.hovered_id = Some(row_id);
-                            if ui.state.mouse_pressed {
-                                ui.state.active_id = Some(row_id);
-                            }
-                        }
-                        let active = ui.state.active_id == Some(row_id);
-                        if hovered && ui.state.mouse_released && active {
-                            self.selected_track = idx;
-                            if idx < self.playlist.len() {
-                                load_path = Some(self.playlist[idx].clone());
-                            }
-                        }
-                        let selected = idx == self.selected_track;
-
-                        if selected {
-                            ui.scene.rect(rr.x, rr.y, rr.w, rr.h, theme.shade3);
-                            ui.scene.rect(rr.x, rr.y, 3.0, rr.h, theme.highlight);
-                        } else if hovered {
-                            ui.scene.rect(rr.x, rr.y, rr.w, rr.h, theme.shade2);
-                        }
-                        ui.scene.rect(rr.x, rr.y + rr.h - 1.0, rr.w, 1.0, theme.border1);
-
-                        // Generous fixed columns: #index | title | artist — album | tech meta.
-                        let fs = theme.font_small();
-                        let fs2 = theme.font_xsmall();
-                        let baseline = (rr.y + rr.h * 0.5 + fs * 0.355).round();
-                        let face = if selected {
-                            FontFace::SemiBold
-                        } else {
-                            FontFace::Regular
-                        };
-
-                        let index_str = format!("#{:05}", idx + 1);
-                        let idx_x = rr.x + rem * 0.75;
-                        let title_x = rr.x + rem * 5.0;
-                        let credit_x = rr.x + rr.w * 0.42;
-                        // Real files head the playlist; everything past them is synthetic.
-                        let (title, credit, meta) = if idx < self.playlist.len() {
-                            let name = self.playlist[idx]
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| format!("track {}", idx + 1));
-                            let meta = if idx == self.selected_track {
-                                match &self.track_meta {
-                                    Some(m) => format!(
-                                        "{} · {} Hz · {} kbps · {}",
-                                        m.codec,
-                                        m.sample_rate,
-                                        m.bitrate / 1000,
-                                        fmt_meta_duration(m.duration)
-                                    ),
-                                    None => "FFmpeg · probing…".to_string(),
-                                }
-                            } else {
-                                "FFmpeg · m4a".to_string()
-                            };
-                            (name, "Local File".to_string(), meta)
-                        } else {
-                            (track_name(idx), track_credit(idx), track_meta(idx))
-                        };
-                        let mw = ui
-                            .text_sys
-                            .measure(FontFace::Regular, ui.font_engine, &meta, fs2);
-                        let meta_w = mw + rem * 0.75;
-                        let meta_x = rr.x + rr.w - meta_w;
-
-                        ui.text_clipped(
-                            FontFace::Regular,
-                            ui.font_engine,
-                            &index_str,
-                            idx_x.round(),
-                            baseline,
-                            fs,
-                            (title_x - idx_x - rem * 0.4).max(0.0),
-                            theme.text_muted,
-                        );
-                        ui.text_clipped(
-                            face,
-                            ui.font_engine,
-                            &title,
-                            title_x.round(),
-                            baseline,
-                            fs,
-                            (credit_x - title_x - rem * 0.4).max(0.0),
-                            if selected { theme.highlight } else { theme.text },
-                        );
-                        ui.text_clipped(
-                            FontFace::Regular,
-                            ui.font_engine,
-                            &credit,
-                            credit_x.round(),
-                            baseline,
-                            fs2,
-                            (meta_x - credit_x - rem * 0.4).max(0.0),
-                            theme.text_dim,
-                        );
-                        ui.text_clipped(
-                            FontFace::Regular,
-                            ui.font_engine,
-                            &meta,
-                            meta_x.round(),
-                            baseline,
-                            fs2,
-                            meta_w.max(0.0),
-                            theme.text_muted,
-                        );
-                    });
-                }
-                }
-            });
-
-            // ================================================================
-            // 4. Bottom Transport Card (Phase 3.1): full-width waveform seekbar
-            //    over Prev/Play/Next/Loop/Shuffle — elapsed left, remaining/total
-            //    and a compact master volume slider right.
-            // ================================================================
-            let bot_y = ph - bot_h - m;
-            ui.card(
-                Rect::new(m, bot_y, pw - m * 2.0, bot_h),
-                Length::rem(1.0),
-                Length::rem(0.5),
-                |ui| {
-                    let inner = ui.bounds();
-                    transport_intents = draw_transport(
-                        ui,
-                        inner,
-                        Length::rem(1.85),
-                        self.t,
-                        &self.wave_peaks,
-                        &mut self.scrub_frac,
-                        &mut self.scrub_active,
-                        pos,
-                        dur,
-                        playing,
-                        &mut self.master_vol,
-                        self.loop_enabled,
-                        self.shuffle_enabled,
-                    );
+            // ---- Row 1: minimalist top bar ----
+            let top_h = (28.0 * scale).round();
+            ui.scene.rect(
+                0.0,
+                0.0,
+                pw,
+                top_h,
+                if theme.dark {
+                    rgb(35, 35, 35)
+                } else {
+                    rgb(246, 246, 246)
                 },
             );
-            } // studio-only layout (player card + gallery + transport)
+            ui.scene.rect(0.0, top_h - 1.0, pw, 1.0, rgba(255, 255, 255, 20));
 
-            // Synthetic UI complexity stress test (--ops N)
-            let iw = (pw as usize).max(1);
-            let ih = (ph as usize).max(1);
-            for i in 0..self.extra_ops {
-                let x = ((i * 37) % iw) as f32;
-                let y = ((i * 53) % ih) as f32;
+            let icon_px = 14.0 * scale;
+            let ghost_hover = rgba(255, 255, 255, 15);
+            if ghost_icon_btn(
+                &mut ui,
+                601,
+                Rect::new(0.0, 0.0, top_h, top_h),
+                if playing { ICON_PAUSE } else { ICON_PLAY },
+                if playing {
+                    rgb(255, 255, 255)
+                } else {
+                    rgb(185, 185, 185)
+                },
+                icon_px,
+                ghost_hover,
+            ) {
+                intents.toggle_play = true;
+            }
+            if ghost_icon_btn(
+                &mut ui,
+                602,
+                Rect::new(top_h, 0.0, top_h, top_h),
+                ICON_LOOP,
+                if self.loop_enabled {
+                    rgb(255, 255, 255)
+                } else {
+                    rgb(115, 115, 115)
+                },
+                icon_px,
+                ghost_hover,
+            ) {
+                intents.loop_toggled = true;
+            }
+            if ghost_icon_btn(
+                &mut ui,
+                603,
+                Rect::new(top_h * 2.0, 0.0, top_h, top_h),
+                ICON_SHUFFLE,
+                if self.shuffle_enabled {
+                    rgb(255, 255, 255)
+                } else {
+                    rgb(115, 115, 115)
+                },
+                icon_px,
+                ghost_hover,
+            ) {
+                intents.shuffle_toggled = true;
+            }
+
+            let counter_fs = (12.5 * scale).round();
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &counter_lbl,
+                (92.0 * scale).round(),
+                (top_h * 0.5 + counter_fs * 0.34).round(),
+                counter_fs,
+                rgb(210, 210, 210),
+            );
+
+            let right_btn_w = (34.0 * scale).round();
+            if ghost_icon_btn(
+                &mut ui,
+                604,
+                Rect::new(pw - right_btn_w * 2.0, 0.0, right_btn_w, top_h),
+                ICON_SETTINGS,
+                rgb(185, 185, 185),
+                icon_px,
+                ghost_hover,
+            ) {
+                intents.toggle_settings = true;
+            }
+            if ghost_icon_btn(
+                &mut ui,
+                605,
+                Rect::new(pw - right_btn_w, 0.0, right_btn_w, top_h),
+                ICON_CLOSE,
+                rgb(185, 185, 185),
+                icon_px,
+                rgb(145, 58, 7),
+            ) {
+                intents.close = true;
+            }
+
+            // ---- Row 2: cover tile + metadata rows ----
+            let cover_s = 126.0 * scale;
+            let cover = Rect::new(
+                (14.0 * scale).round(),
+                (42.0 * scale).round(),
+                cover_s,
+                cover_s,
+            );
+            let has_track = file.is_some();
+            let has_cover = self
+                .track_meta
+                .as_ref()
+                .map(|m| m.cover_rgba.is_some())
+                .unwrap_or(false);
+            ui.scene.push_clip(cover.x, cover.y, cover.w, cover.h);
+            if has_cover {
+                ui.scene.image_quad(cover.x, cover.y, cover.w, cover.h);
+            } else {
                 ui.scene.rect(
-                    x,
-                    y,
-                    9.0 * scale,
-                    7.0 * scale,
-                    ((i % 200) as u8, 120, 160, 255),
+                    cover.x,
+                    cover.y,
+                    cover.w,
+                    cover.h,
+                    if has_track {
+                        rgb(34, 150, 195)
+                    } else {
+                        rgb(60, 60, 60)
+                    },
+                );
+                ui.scene.icon_centered(
+                    ui.text_sys,
+                    ICON_VOLUME,
+                    (cover.x + cover.w * 0.5).round(),
+                    (cover.y + cover.h * 0.5).round(),
+                    (58.0 * scale).round(),
+                    if has_track {
+                        rgba(0, 0, 0, 140)
+                    } else {
+                        rgba(255, 255, 255, 55)
+                    },
                 );
             }
-
-            // Full-window `nui-dropzone` overlay (OS drag-and-drop). A dropped file
-            // is loaded into the search field.
-            if let Some(path) =
-                ui.dropzone_overlay(Rect::new(0.0, 0.0, pw, ph), "Drop audio file to load")
-            {
-                self.search_text = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                load_path = Some(path);
+            // Diagonal -45° format ribbon, hidden while the cursor is on the cover.
+            // The endpoints sit well outside the clipped square so the capsule caps
+            // are cut off and the sash runs edge-to-edge.
+            if !ext_lbl.is_empty() && !cover.contains(ui.state.cursor.0, ui.state.cursor.1) {
+                let x1 = cover.x + cover.w;
+                let y1 = cover.y + cover.h;
+                let d = cover.w * 0.42;
+                let ext = 32.0 * scale;
+                ui.scene.line(
+                    x1 - d - ext,
+                    y1 + ext,
+                    x1 + ext,
+                    y1 - d - ext,
+                    22.0 * scale,
+                    ribbon_color(&ext_lbl),
+                );
+                ui.scene.text_rotated_ccw45(
+                    ui.text_sys,
+                    FontFace::SemiBold,
+                    ui.font_engine,
+                    &ext_lbl,
+                    x1 - d * 0.5,
+                    y1 - d * 0.5,
+                    (11.0 * scale).round(),
+                    rgb(255, 255, 255),
+                );
             }
+            ui.scene.pop_clip();
+
+            let rows_x = (156.0 * scale).round();
+            let label_w = 48.0 * scale;
+            let row_gap = 10.0 * scale;
+            let value_w = (pw - 14.0 * scale - (rows_x + label_w + row_gap)).max(10.0);
+            let mfs = (11.5 * scale).round();
+            let step = 15.5 * scale;
+            let gap_v = 7.0 * scale;
+            let mut ry = 42.0 * scale;
+            let baseline = |y: f32| (y + mfs * 0.95).round();
+            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Folder:", &folder_lbl, value_w);
+            ry += step;
+            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "File:", &file_lbl, value_w);
+            ry += step + gap_v;
+            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Format:", &format_lbl, value_w);
+            ry += step;
+            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "", &format2_lbl, value_w);
+            ry += step + gap_v;
+            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Artist:", &artist_lbl, value_w);
+            ry += step;
+            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Album:", &album_lbl, value_w);
+            ry += step;
+            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Title:", &title_lbl, value_w);
+
+            // ---- Row 3: flat progress bar + status line ----
+            let bar_x = (14.0 * scale).round();
+            let bar_w = (pw - 28.0 * scale).max(1.0);
+            let bar_y = (182.0 * scale).round();
+            let bar_h = (5.0 * scale).round().max(4.0);
+            let is_finite = dur > 0.0 && dur < 360_000.0;
+            let scrub_id = 610u32;
+            if ui.state.active_id != Some(scrub_id) && is_finite {
+                self.scrub_frac = (pos / dur).clamp(0.0, 1.0) as f32;
+            }
+            let hit = Rect::new(bar_x, bar_y - 6.0 * scale, bar_w, bar_h + 12.0 * scale);
+            ui.state.register_focusable(scrub_id);
+            let scrub_hover = ui.state.can_hover(scrub_id, hit);
+            if scrub_hover {
+                ui.state.hovered_id = Some(scrub_id);
+                if ui.state.mouse_pressed {
+                    ui.state.active_id = Some(scrub_id);
+                    ui.state.focused_id = Some(scrub_id);
+                }
+            }
+            if ui.state.active_id == Some(scrub_id) && ui.state.mouse_down {
+                self.scrub_frac = ((ui.state.cursor.0 - bar_x) / bar_w).clamp(0.0, 1.0);
+            }
+            if ui.state.active_id == Some(scrub_id) && ui.state.mouse_released && is_finite {
+                intents.seek_to = Some(self.scrub_frac as f64 * dur);
+            }
+            ui.scene.rect(bar_x, bar_y, bar_w, bar_h, rgb(68, 68, 68));
+            let fill_w = bar_w * self.scrub_frac.clamp(0.0, 1.0);
+            if fill_w > 0.5 {
+                ui.scene.rect(bar_x, bar_y, fill_w, bar_h, rgb(180, 180, 180));
+            }
+
+            let sfs = (11.0 * scale).round();
+            let sy = (bar_y + bar_h + 6.0 * scale + sfs).round();
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &fmt_time(pos),
+                bar_x,
+                sy,
+                sfs,
+                rgb(190, 190, 190),
+            );
+            let vw = ui
+                .text_sys
+                .measure(FontFace::Regular, ui.font_engine, &vol_lbl, sfs);
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &vol_lbl,
+                (pw * 0.5 - vw * 0.5).round(),
+                sy,
+                sfs,
+                rgb(130, 130, 130),
+            );
+            let dur_lbl = fmt_time(dur);
+            let dw = ui
+                .text_sys
+                .measure(FontFace::Regular, ui.font_engine, &dur_lbl, sfs);
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &dur_lbl,
+                (bar_x + bar_w - dw).round(),
+                sy,
+                sfs,
+                rgb(190, 190, 190),
+            );
+
+            // ---- Row 4: bottom controls bar (optional) ----
+            if self.show_controls {
+                let ctrl_h = 55.0 * scale;
+                let bar_top = ph - ctrl_h;
+                ui.scene.rect(
+                    0.0,
+                    bar_top,
+                    pw,
+                    ctrl_h,
+                    if theme.dark {
+                        rgb(37, 37, 37)
+                    } else {
+                        rgb(240, 240, 240)
+                    },
+                );
+                ui.scene.rect(0.0, bar_top, pw, 1.0, rgb(58, 58, 58));
+
+                let bs = (28.0 * scale).round();
+                let by = (bar_top + (ctrl_h - bs) * 0.5).round();
+                let bgap = (6.0 * scale).round();
+                let bleft = (14.0 * scale).round();
+                if player_icon_btn(
+                    &mut ui,
+                    620,
+                    Rect::new(bleft, by, bs, bs),
+                    ICON_EQ,
+                    monitoring_visible,
+                    scale,
+                ) {
+                    intents.toggle_monitoring = true;
+                }
+                if player_icon_btn(
+                    &mut ui,
+                    621,
+                    Rect::new(bleft + bs + bgap, by, bs, bs),
+                    ICON_TUNE,
+                    parameters_visible,
+                    scale,
+                ) {
+                    intents.toggle_parameters = true;
+                }
+
+                // Volume: speaker glyph + flat horizontal bar.
+                let vx = (14.0 * scale + bs * 2.0 + bgap + 18.0 * scale).round();
+                ui.scene.icon_centered(
+                    ui.text_sys,
+                    ICON_VOLUME,
+                    vx + 7.5 * scale,
+                    by + bs * 0.5,
+                    (15.0 * scale).round(),
+                    rgb(185, 185, 185),
+                );
+                let vol_x = (vx + 22.0 * scale).round();
+                let vol_w = (96.0 * scale).round();
+                let vol_h = (5.0 * scale).round().max(4.0);
+                let vol_y = by + bs * 0.5 - vol_h * 0.5;
+                let vol_id = 640u32;
+                let vol_hit = Rect::new(vol_x, vol_y - 6.0 * scale, vol_w, vol_h + 12.0 * scale);
+                ui.state.register_focusable(vol_id);
+                if ui.state.can_hover(vol_id, vol_hit) {
+                    ui.state.hovered_id = Some(vol_id);
+                    if ui.state.mouse_pressed {
+                        ui.state.active_id = Some(vol_id);
+                        ui.state.focused_id = Some(vol_id);
+                    }
+                }
+                if ui.state.active_id == Some(vol_id) && ui.state.mouse_down {
+                    self.master_vol = ((ui.state.cursor.0 - vol_x) / vol_w).clamp(0.0, 1.0);
+                    intents.vol_changed = true;
+                }
+                ui.scene.rect(vol_x, vol_y, vol_w, vol_h, rgb(68, 68, 68));
+                let vfill = vol_w * self.master_vol.clamp(0.0, 1.0);
+                if vfill > 0.5 {
+                    ui.scene.rect(vol_x, vol_y, vfill, vol_h, rgb(185, 185, 185));
+                }
+
+                // Right transport group.
+                let group_w = bs * 5.0 + bgap * 4.0;
+                let mut tx = pw - 14.0 * scale - group_w;
+                let defs = [
+                    (630u32, ICON_LOOP, self.loop_enabled),
+                    (631u32, ICON_SHUFFLE, self.shuffle_enabled),
+                    (632u32, ICON_PREV, false),
+                    (633u32, if playing { ICON_PAUSE } else { ICON_PLAY }, false),
+                    (634u32, ICON_NEXT, false),
+                ];
+                for (id, icon, active) in defs {
+                    if player_icon_btn(&mut ui, id, Rect::new(tx.round(), by, bs, bs), icon, active, scale) {
+                        match id {
+                            630 => intents.loop_toggled = true,
+                            631 => intents.shuffle_toggled = true,
+                            632 => intents.prev = true,
+                            633 => intents.toggle_play = true,
+                            _ => intents.next = true,
+                        }
+                    }
+                    tx += bs + bgap;
+                }
+            }
+
+            // ---- Multi-zone OS drag-and-drop overlay ----
+            pending_drop = draw_drop_overlay(&mut ui, pw, ph, scale);
 
             // Append any open dropdown popups onto the top of the draw list!
             ui.scene.finish_frame();
             ui.state.end_frame();
         }
 
-        // --- Phase 2/3 transport + player intents, applied outside the render borrow
-        if transport_intents.loop_toggled {
+        // --- Apply the main-window intents outside the render borrow.
+        if intents.loop_toggled {
             self.loop_enabled = !self.loop_enabled;
         }
-        if transport_intents.shuffle_toggled {
+        if intents.shuffle_toggled {
             self.shuffle_enabled = !self.shuffle_enabled;
         }
-        if let Some(a) = &self.audio {
-            if transport_intents.toggle_play {
+        if intents.toggle_controls {
+            self.show_controls = !self.show_controls;
+            self.apply_zoom();
+        }
+        if intents.toggle_settings {
+            self.pending_window_toggles.push("settings");
+        }
+        if intents.toggle_monitoring {
+            self.pending_window_toggles.push("monitoring");
+        }
+        if intents.toggle_parameters {
+            self.pending_window_toggles.push("parameters");
+        }
+        if intents.toggle_play {
+            if let Some(a) = &self.audio {
                 self.animate = a.toggle_play();
             }
-            if transport_intents.prev || transport_intents.next {
-                if !self.playlist.is_empty() {
-                    let cur = self.selected_track.min(self.playlist.len() - 1);
-                    let idx = if transport_intents.prev {
-                        cur.saturating_sub(1)
-                    } else {
-                        (cur + 1).min(self.playlist.len() - 1)
-                    };
-                    self.selected_track = idx;
-                    if !self.chk_locked {
-                        self.pitch_semitones = 0.0;
-                        self.tempo_ratio = 1.0;
-                        self.stereo_sep = 100.0;
-                    }
-                    a.load_file(self.playlist[idx].clone());
-                }
+        }
+        if intents.prev || intents.next {
+            if !self.playlist.is_empty() {
+                let cur = self.selected_track.min(self.playlist.len() - 1);
+                let idx = if intents.prev {
+                    cur.saturating_sub(1)
+                } else {
+                    (cur + 1).min(self.playlist.len() - 1)
+                };
+                self.load_playlist_index(idx);
             }
-            if let Some(secs) = transport_intents.seek_to {
+        }
+        if let Some(secs) = intents.seek_to {
+            if let Some(a) = &self.audio {
                 a.seek(secs);
             }
-            if transport_intents.vol_changed {
+        }
+        if intents.vol_changed {
+            if let Some(a) = &self.audio {
                 a.set_volume(self.master_vol);
             }
-            if self.selected_soundfont != self.last_soundfont {
-                self.last_soundfont = self.selected_soundfont;
-                if let Some(p) = soundfont_path_for(self.selected_soundfont) {
-                    a.set_soundfont(p);
+        }
+        if let Some((path, zone)) = pending_drop {
+            // Ctrl held → flat (non-recursive) folder collection.
+            let recursive = !self.modifiers.control_key();
+            match zone {
+                DropZone::Add => self.open_path(path, true, recursive),
+                DropZone::Replace => self.open_path(path, false, recursive),
+                DropZone::Mixer => {
+                    let files = if path.is_dir() {
+                        playlist_from_folder(&path, recursive)
+                    } else {
+                        playlist_from_single_file(&path).0
+                    };
+                    if !files.is_empty() {
+                        let n = files.len().min(20);
+                        self.mixer_stems = (0..n)
+                            .map(|i| MixerStem {
+                                number: i + 1,
+                                gain: 1.0,
+                                pan: 0.0,
+                                muted: false,
+                                solo: false,
+                            })
+                            .collect();
+                    }
+                    if !self.secondary_windows.is_visible("mixer") {
+                        self.pending_window_toggles.push("mixer");
+                    }
                 }
             }
         }
-        if let Some(path) = load_path.take() {
-            if !self.chk_locked {
-                self.pitch_semitones = 0.0;
-                self.tempo_ratio = 1.0;
-                self.stereo_sep = 100.0;
-            }
-            if let Some(a) = &self.audio {
-                a.load_file(path);
-            }
-        }
-        if params_changed {
-            self.sync_pipeline_and_params();
-        }
-
-        if toggle_backend_req {
-            if let Some(r) = &mut self.renderer {
-                r.toggle_backend();
-            }
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
-        }
-        if toggle_font_req {
-            self.font_engine = match self.font_engine {
-                FontEngine::Swash => FontEngine::Fontdue,
-                FontEngine::Fontdue => FontEngine::Swash,
-            };
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
-        }
-        if toggle_theme_req {
-            self.dark_mode = !self.dark_mode;
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
-        }
-        if zoom_delta.abs() > 0.001 {
-            self.set_zoom(self.ui_zoom + zoom_delta);
-        }
-        if close_req {
+        if intents.close {
             self.quitting = true;
             self.quit_at = Some(Instant::now());
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
-        }
-        if compact_req {
-            self.compact_player_mode = !self.compact_player_mode;
-            self.apply_player_mode();
         }
     }
 
@@ -2115,7 +1712,7 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
-        let scale = (window.scale_factor() as f32) * self.ui_zoom;
+        let scale = window.scale_factor() as f32;
 
         if self.nopaint {
             if let Some(renderer) = &mut self.renderer {
@@ -2133,7 +1730,14 @@ impl App {
 
         self.build_scene(w, h, scale);
         if let Some(renderer) = &mut self.renderer {
-            let shot = self.screenshot_path.take();
+            // With --open-window the screenshot belongs to that secondary window.
+            let waiting_for_meta =
+                self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
+            let shot = if self.open_window_spec.is_some() || waiting_for_meta {
+                None
+            } else {
+                self.screenshot_path.take()
+            };
             renderer.render(w, h, &self.scene, &mut self.text_sys, shot.as_deref());
             if let Some(path) = shot {
                 println!("[poc] saved screenshot to {}", path);
@@ -2192,6 +1796,7 @@ impl App {
             let Some(spec) = window_spec_by_key(key) else {
                 continue;
             };
+            // `show()` requests reveal + redraw itself, so no synchronous paint here.
             self.secondary_windows
                 .toggle(event_loop, spec, self.prefer_backend);
         }
@@ -2385,18 +1990,10 @@ impl App {
                 let mut ui =
                     Ui::new(ui_state, scene, &mut self.text_sys, self.font_engine, theme);
 
-                // The Parameters window's header badge follows its active tab.
+                // The Parameters window is audio-pipeline only now.
                 let mixer_badge = format!("{} STEMS", self.mixer_stems.len());
                 let (hdr_icon, hdr_title, hdr_badge): (&str, &str, &str) = if key == "parameters" {
-                    (
-                        ICON_TUNE,
-                        "PARAMETERS",
-                        match self.params_tab {
-                            0 => "AUDIO",
-                            1 => "MIDI",
-                            _ => "TRACKER",
-                        },
-                    )
+                    (ICON_TUNE, "PARAMETERS", "AUDIO")
                 } else if key == "monitoring" {
                     (ICON_EQ, "AUDIO MONITORING", "REALTIME DSP")
                 } else if key == "mixer" {
@@ -2411,33 +2008,16 @@ impl App {
 
                 if key == "parameters" {
                     // ========================================================
-                    // Phase 3.2 — adaptive Parameters window: header badge follows
-                    // the tab, tab bar above the card, footer bar (3.0rem) below.
+                    // Phase 3.2 — Parameters window: one audio card, footer below.
                     // ========================================================
-                    let gap = theme.space_half();
-                    let tabs_h = Length::Rem(2.6).resolve(rem).round();
                     let footer_h = Length::Rem(3.0).resolve(rem).round();
-                    let tabs_r = Rect::new(m, hdr_h + m, (pw - m * 2.0).max(0.0), tabs_h);
-                    ui.tabs(
-                        1100,
-                        tabs_r,
-                        &[
-                            (ICON_EQ, "Audio"),
-                            (ICON_TUNE, "MIDI"),
-                            (ICON_SETTINGS, "Tracker"),
-                        ],
-                        &mut self.params_tab,
-                    );
-
-                    // Main parameters card — leaves 3.2rem at the bottom for the footer.
-                    let card_y = tabs_r.y + tabs_h + gap;
+                    let card_y = hdr_h + m;
                     let card_h = (ph - Length::Rem(3.2).resolve(rem) - card_y).max(80.0);
                     ui.nui_card(
                         Rect::new(m, card_y, (pw - m * 2.0).max(0.0), card_h),
                         |ui| {
-                            match self.params_tab {
-                                0 => {
-                                    // ---- AUDIO tab: pipeline mode + speed/pitch/formants ----
+                            {
+                                    // ---- pipeline mode + speed/pitch/formants ----
                                     let [lbl_r, ctl_r] = ui.take_cols(
                                         Length::rem(2.0),
                                         Length::rem(1.0),
@@ -2520,149 +2100,6 @@ impl App {
                                     ) {
                                         params_intents.params_changed = true;
                                     }
-                                }
-                                1 => {
-                                    // ---- MIDI tab: SoundFont / transpose / BPM / metronome ----
-                                    let sf_r = ui.input_group("SoundFont (.sf2)");
-                                    let tr_lbl = format!("{:+.0} st", self.midi_transpose);
-                                    let tr = ui.take(Length::rem(2.7));
-                                    if ui.slider(
-                                        1121,
-                                        tr,
-                                        "Transpose",
-                                        &mut self.midi_transpose,
-                                        -12.0,
-                                        12.0,
-                                        0.0,
-                                        &tr_lbl,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    let bpm_lbl = format!("{:.0} BPM", self.midi_bpm);
-                                    let bp = ui.take(Length::rem(2.7));
-                                    if ui.slider(
-                                        1122,
-                                        bp,
-                                        "BPM Tempo",
-                                        &mut self.midi_bpm,
-                                        40.0,
-                                        240.0,
-                                        120.0,
-                                        &bpm_lbl,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    let [sw_r, btn_r] = ui.take_cols(
-                                        Length::rem(2.0),
-                                        Length::rem(1.0),
-                                        [Length::fill(), Length::rem(10.5)],
-                                    );
-                                    if ui.switch(
-                                        1123,
-                                        sw_r,
-                                        "Metronome Click Track",
-                                        &mut self.midi_metronome,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    if ui.button(
-                                        1124,
-                                        btn_r,
-                                        "Load GM MIDI Demo",
-                                        ICON_PLAY,
-                                        ButtonVariant::Primary,
-                                    ) {
-                                        params_intents.load_midi = true;
-                                    }
-                                    // Drawn last so an open dropdown layers above the tab body.
-                                    ui.select(1120, sf_r, SOUNDFONTS, &mut self.selected_soundfont);
-                                }
-                                _ => {
-                                    // ---- TRACKER tab: separation / pitch / tempo / interp ----
-                                    let sep_lbl = format!("{:.0}%", self.stereo_sep);
-                                    let sp = ui.take(Length::rem(2.5));
-                                    if ui.slider(
-                                        1130,
-                                        sp,
-                                        "Stereo Separation",
-                                        &mut self.stereo_sep,
-                                        0.0,
-                                        200.0,
-                                        100.0,
-                                        &sep_lbl,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    let pitch_lbl = format!("{:+.1} st", self.pitch_semitones);
-                                    let pt = ui.take(Length::rem(2.5));
-                                    if ui.slider(
-                                        1131,
-                                        pt,
-                                        "Pitch",
-                                        &mut self.pitch_semitones,
-                                        -12.0,
-                                        12.0,
-                                        0.0,
-                                        &pitch_lbl,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    let tempo_lbl = format!("{:.2}x", self.tempo_ratio);
-                                    let tp = ui.take(Length::rem(2.5));
-                                    if ui.slider(
-                                        1132,
-                                        tp,
-                                        "Tempo",
-                                        &mut self.tempo_ratio,
-                                        0.5,
-                                        2.0,
-                                        1.0,
-                                        &tempo_lbl,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    // Interpolation filter (widget ids 1133..1137) with
-                                    // the demo loader sharing the control row.
-                                    let ir = ui.form_field("Interpolation", Length::rem(2.0));
-                                    let btn_w = Length::Rem(8.0).resolve(rem).round();
-                                    let rad_w =
-                                        ((ir.w - btn_w - theme.space_half() * 4.0) / 4.0).floor();
-                                    for (i, lbl) in
-                                        ["Nearest", "Linear", "Cubic", "Sinc 8-tap"]
-                                            .iter()
-                                            .enumerate()
-                                    {
-                                        if ui.radio(
-                                            1133 + i as u32,
-                                            Rect::new(
-                                                ir.x + (rad_w + theme.space_half()) * i as f32,
-                                                ir.y,
-                                                rad_w,
-                                                ir.h,
-                                            ),
-                                            lbl,
-                                            self.radio_interp == i,
-                                        ) && self.radio_interp != i
-                                        {
-                                            self.radio_interp = i;
-                                            params_intents.params_changed = true;
-                                        }
-                                    }
-                                    if ui.button(
-                                        1138,
-                                        Rect::new(
-                                            ir.x + ir.w - btn_w,
-                                            ir.y,
-                                            btn_w,
-                                            ir.h,
-                                        ),
-                                        "Load Tracker Demo",
-                                        ICON_PLAY,
-                                        ButtonVariant::Primary,
-                                    ) {
-                                        params_intents.load_tracker = true;
-                                    }
-                                }
                             }
                         },
                     );
@@ -3228,7 +2665,6 @@ impl App {
                             ui.nui_card(body, |ui| {
                                 let sel_dev = ui.input_group("Default Output Device");
                                 let sel_rate = ui.input_group("Default Sample Rate");
-                                let sel_sf = ui.input_group("MIDI SoundFont (.sf2)");
                                 let [c1, c2] = ui.take_cols(
                                     Length::rem(1.8), Length::rem(1.0),
                                     [Length::fill(), Length::fill()],
@@ -3241,6 +2677,13 @@ impl App {
                                 );
                                 ui.checkbox(754, c3, "Lock Parameters Across Tracks", &mut self.chk_locked);
                                 ui.checkbox(755, c4, "Dark Mode (Accessibility Default)", &mut self.dark_mode);
+                                let [c5] = ui.take_cols(
+                                    Length::rem(1.8), Length::rem(1.0),
+                                    [Length::fill()],
+                                );
+                                if ui.checkbox(757, c5, "Show transport controls [C]", &mut self.show_controls) {
+                                    self.apply_zoom_req = true;
+                                }
                                 let [apply_r] = ui.take_form_row(true, [Length::fill()]);
                                 if ui.button(756, apply_r, "Save Configuration", ICON_SETTINGS, ButtonVariant::Primary) {
                                     self.save_config_req = true;
@@ -3254,7 +2697,6 @@ impl App {
                                 // Render selects last so open popups layer above siblings
                                 ui.select(760, sel_dev, DEVICES, &mut self.selected_device);
                                 ui.select(750, sel_rate, SAMPLE_RATES, &mut self.selected_rate);
-                                ui.select(751, sel_sf, SOUNDFONTS, &mut self.selected_soundfont);
                             });
                         }
 
@@ -3311,6 +2753,10 @@ impl App {
                 mw.window.request_redraw();
             }
         }
+        if self.apply_zoom_req {
+            self.apply_zoom_req = false;
+            self.apply_zoom();
+        }
 
         // --- Phase 3.2 Parameters-window intents: forward every change to the
         // engine immediately (same frame), then refresh the main window's
@@ -3318,39 +2764,12 @@ impl App {
         if params_intents.reset_all {
             self.pitch_semitones = 0.0;
             self.tempo_ratio = 1.0;
-            self.midi_transpose = 0.0;
-            self.midi_bpm = 120.0;
-            self.stereo_sep = 100.0;
             self.sync_pipeline_and_params();
-        }
-        if params_intents.load_midi {
-            self.params_tab = 1;
-            if let Some(a) = &self.audio {
-                a.load_midi_demo();
-            }
-        }
-        if params_intents.load_tracker {
-            self.params_tab = 2;
-            if let Some(a) = &self.audio {
-                a.load_tracker_demo();
-            }
         }
         if params_intents.params_changed || params_intents.pipeline_changed {
             self.sync_pipeline_and_params();
         }
-        if self.selected_soundfont != self.last_soundfont {
-            self.last_soundfont = self.selected_soundfont;
-            if let Some(a) = &self.audio {
-                if let Some(p) = soundfont_path_for(self.selected_soundfont) {
-                    a.set_soundfont(p);
-                }
-            }
-        }
-        if params_intents.params_changed
-            || params_intents.pipeline_changed
-            || params_intents.reset_all
-            || params_intents.load_midi
-            || params_intents.load_tracker
+        if params_intents.params_changed || params_intents.pipeline_changed || params_intents.reset_all
         {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -3378,7 +2797,7 @@ impl App {
 
 fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
-    format!("{:02}:{:02}", s / 60, s % 60)
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 impl ApplicationHandler for App {
@@ -3386,10 +2805,22 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        let min_h = if self.show_controls {
+            Self::MIN_HEIGHT_WITH_CONTROLS
+        } else {
+            Self::HEIGHT_WITHOUT_CONTROLS
+        };
         let mut attrs = Window::default_attributes()
-            .with_title("SoundApp POC — NUI Rust")
-            .with_inner_size(winit::dpi::LogicalSize::new(1120.0, 700.0))
-            .with_min_inner_size(winit::dpi::LogicalSize::new(760.0, 480.0))
+            .with_title("SoundApp")
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.base_size().0 * self.ui_zoom as f64,
+                self.base_size().1 * self.ui_zoom as f64,
+            ))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(
+                Self::WIDTH * self.ui_zoom as f64,
+                min_h * self.ui_zoom as f64,
+            ))
+            .with_resizable(true)
             .with_decorations(false);
 
         #[cfg(target_os = "windows")]
@@ -3401,12 +2832,13 @@ impl ApplicationHandler for App {
                 .with_border_color(Some(Color::from_rgb(55, 55, 55)));
         }
 
-        let (window, renderer) = Renderer::new(event_loop, attrs, self.prefer_backend);
+        let (window, mut renderer) = Renderer::new(event_loop, attrs, self.prefer_backend);
         let sz = window.inner_size();
         self.size = (sz.width, sz.height);
         self.window = Some(window.clone());
+        renderer.request_reveal();
         self.renderer = Some(renderer);
-        window.request_redraw();
+        self.render();
 
         // Phase 1.5: `--open-window <key>` pops the requested secondary window at
         // startup; a `--screenshot` alongside it captures THAT window, not the primary.
@@ -3492,7 +2924,12 @@ impl ApplicationHandler for App {
                         let step = if dy > 0.0 { 0.1 } else { -0.1 };
                         self.set_zoom(self.ui_zoom + step);
                     } else {
-                        self.ui_state.wheel_y += dy;
+                        // Wheel anywhere in the main window trims the master volume.
+                        self.master_vol =
+                            (self.master_vol + 0.05 * dy.signum()).clamp(0.0, 2.0);
+                        if let Some(a) = &self.audio {
+                            a.set_volume(self.master_vol);
+                        }
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -3503,18 +2940,56 @@ impl ApplicationHandler for App {
                 match button {
                     MouseButton::Left => match state {
                         ElementState::Pressed => {
-                            let scale = self
+                            let dpi = self
                                 .window
                                 .as_ref()
-                                .map(|w| w.scale_factor() as f32 * self.ui_zoom)
+                                .map(|w| w.scale_factor() as f32)
                                 .unwrap_or(1.0);
-                            let rem = (16.0 * scale).round();
-                            let hdr_h = (rem * 3.25).round();
-                            // Drag window if clicking the empty header area (left of right-side buttons).
-                            // Matches the header's right-zone width per player mode.
-                            let right_btns_x = self.size.0 as f32
-                                - rem * if self.compact_player_mode { 10.7 } else { 26.5 };
-                            if self.ui_state.cursor.1 < hdr_h && self.ui_state.cursor.0 < right_btns_x {
+                            let (cw, ch) = (self.size.0 as f32, self.size.1 as f32);
+                            let (mx, my) = self.ui_state.cursor;
+                            let edge = 6.0 * dpi;
+                            // Undecorated window: dragging within 6 px of an edge or
+                            // corner resizes, like a native frame.
+                            let dir = if mx <= edge && my <= edge {
+                                Some(ResizeDirection::NorthWest)
+                            } else if mx >= cw - edge && my <= edge {
+                                Some(ResizeDirection::NorthEast)
+                            } else if mx <= edge && my >= ch - edge {
+                                Some(ResizeDirection::SouthWest)
+                            } else if mx >= cw - edge && my >= ch - edge {
+                                Some(ResizeDirection::SouthEast)
+                            } else if mx <= edge {
+                                Some(ResizeDirection::West)
+                            } else if mx >= cw - edge {
+                                Some(ResizeDirection::East)
+                            } else if my <= edge {
+                                Some(ResizeDirection::North)
+                            } else if my >= ch - edge {
+                                Some(ResizeDirection::South)
+                            } else {
+                                None
+                            };
+                            if let Some(dir) = dir {
+                                if let Some(w) = &self.window {
+                                    let _ = w.drag_resize_window(dir);
+                                }
+                                return;
+                            }
+                            let scale = (cw / Self::WIDTH as f32)
+                                .min(ch / if self.show_controls {
+                                    Self::HEIGHT_WITH_CONTROLS as f32
+                                } else {
+                                    Self::HEIGHT_WITHOUT_CONTROLS as f32
+                                })
+                                .max(0.5);
+                            let top_h = (28.0 * scale).round();
+                            let pw = self.size.0 as f32;
+                            // Drag by the empty middle of the top bar (between the
+                            // track counter and the right-side settings/close pair).
+                            let drag_zone = self.ui_state.cursor.1 < top_h
+                                && self.ui_state.cursor.0 > 130.0 * scale
+                                && self.ui_state.cursor.0 < pw - 72.0 * scale;
+                            if drag_zone {
                                 if let Some(w) = &self.window {
                                     let _ = w.drag_window();
                                 }
@@ -3581,13 +3056,13 @@ impl ApplicationHandler for App {
                             }
                         }
                         Key::Named(NamedKey::ArrowUp) if !focused_text => {
-                            self.master_vol = (self.master_vol + 0.05).clamp(0.0, 1.0);
+                            self.master_vol = (self.master_vol + 0.05).clamp(0.0, 2.0);
                             if let Some(a) = &self.audio {
                                 a.set_volume(self.master_vol);
                             }
                         }
                         Key::Named(NamedKey::ArrowDown) if !focused_text => {
-                            self.master_vol = (self.master_vol - 0.05).clamp(0.0, 1.0);
+                            self.master_vol = (self.master_vol - 0.05).clamp(0.0, 2.0);
                             if let Some(a) = &self.audio {
                                 a.set_volume(self.master_vol);
                             }
@@ -3652,8 +3127,8 @@ impl ApplicationHandler for App {
                             self.loop_enabled = !self.loop_enabled;
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("c") => {
-                            self.compact_player_mode = !self.compact_player_mode;
-                            self.apply_player_mode();
+                            self.show_controls = !self.show_controls;
+                            self.apply_zoom();
                         }
                         Key::Character(ch)
                             if !focused_text
@@ -3709,17 +3184,44 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        // Fix #2: the engine latches end-of-track after the ring is drained, so
+        // the playlist advances here — on the timer tick that is still scheduled.
+        let ended = self
+            .audio
+            .as_ref()
+            .map(|a| a.take_track_ended())
+            .unwrap_or(false);
+        if ended {
+            if self.advance_track(self.loop_enabled) {
+                self.animate = true;
+            }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
         let playing = self
             .audio
             .as_ref()
             .map(|a| a.is_playing())
             .unwrap_or(false);
-        let animating = playing && self.animate;
+        let pending_meta =
+            self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
+        let animating = (playing && self.animate) || pending_meta;
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
-            self.next_frame = now + Duration::from_millis(self.frame_ms);
-            self.t += self.frame_ms as f32 / 1000.0;
+            // Low-footprint cadence: the base player only needs ~15 fps for its
+            // progress bar and MM:SS text; full-rate only while a DSP window is up.
+            let dsp_open = self.secondary_windows.is_visible("monitoring")
+                || self.secondary_windows.is_visible("mixer");
+            let frame_ms = if pending_meta || dsp_open {
+                self.frame_ms
+            } else {
+                66
+            };
+            self.next_frame = now + Duration::from_millis(frame_ms);
+            self.t += frame_ms as f32 / 1000.0;
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -3745,6 +3247,7 @@ impl ApplicationHandler for App {
         self.config.dark_mode = self.dark_mode;
         self.config.ui_zoom = self.ui_zoom;
         self.config.master_vol = self.master_vol;
+        self.config.show_controls = self.show_controls;
         self.config.chk_locked = self.chk_locked;
         self.config.sw_hq_mode = self.sw_hq_mode;
         self.config.sw_keep_tray = self.sw_keep_tray;
@@ -3758,20 +3261,13 @@ fn main() {
     let mut file: Option<String> = None;
     let mut tone = false;
     let mut silence = false;
-    let mut midi_demo = false;
-    let mut tracker_demo = false;
     let mut animate = true;
     let mut nopaint = false;
-    let mut extra_ops: usize = 0;
     let mut seconds: Option<f64> = None;
     let mut fps: f64 = 60.0;
     let mut backend = BackendKind::Gpu;
     let mut font_engine = FontEngine::Swash;
     let mut app_screenshot: Option<String> = None;
-    let mut open_select_demo = false;
-    let mut initial_tab: usize = 0;
-    let mut drop_preview = false;
-    let mut focus_preview = false;
     let mut open_window: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
@@ -3779,14 +3275,8 @@ fn main() {
         match a.as_str() {
             "--tone" => tone = true,
             "--silence" => silence = true,
-            "--midi-demo" => midi_demo = true,
-            "--tracker-demo" => tracker_demo = true,
             "--static" => animate = false,
             "--nopaint" => nopaint = true,
-            "--open-select" => open_select_demo = true,
-            "--drop-preview" => drop_preview = true,
-            "--focus-preview" => focus_preview = true,
-            "--tab" => initial_tab = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--open-window" => open_window = args.next(),
             "--backend" => {
                 if let Some(b) = args.next() {
@@ -3806,35 +3296,37 @@ fn main() {
                     }
                 }
             }
-            "--ops" => extra_ops = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()),
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).unwrap_or(60.0),
             "--screenshot" => app_screenshot = args.next(),
             other => file = Some(other.to_string()),
         }
     }
+    const DEFAULT_MURR: &str = r"Y:\Test Files\Murr_01.mp3";
+    const DEFAULT_START: &str =
+        r"D:\Work\_GIT\SoundApp\_Material\mixer_media\Again\01.m4a";
+    // No file given → prefer the reference test track; its implicit folder
+    // playlist then collects every playable file beside it. `--tone` / `--silence`
+    // skip the startup path entirely.
+    let default_start = if std::path::Path::new(DEFAULT_MURR).exists() {
+        DEFAULT_MURR
+    } else {
+        DEFAULT_START
+    };
+    let startup_path: Option<PathBuf> = if tone || silence {
+        None
+    } else {
+        Some(
+            file.as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(default_start)),
+        )
+    };
     let source = if tone {
         Source::Tone { hz: 440.0 }
-    } else if silence {
-        Source::Silence
-    } else if midi_demo {
-        Source::MidiDemo
-    } else if tracker_demo {
-        Source::TrackerDemo
-    } else if let Some(p) = file {
-        let pb = PathBuf::from(p);
-        let ext = pb
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase());
-        match ext.as_deref() {
-            Some("mid") | Some("midi") => Source::MidiFile(pb),
-            Some("mod") | Some("xm") | Some("s3m") | Some("it") => Source::TrackerFile(pb),
-            _ => Source::File(pb),
-        }
     } else {
-        // No file given: start the engine on silence so the UI can still load
-        // tracks from the playlist / dropzone and drive the transport.
+        // The startup playlist (file or folder) is loaded by `open_path` below;
+        // the engine starts on silence so nothing is decoded twice.
         Source::Silence
     };
 
@@ -3860,13 +3352,16 @@ fn main() {
         a.set_volume(initial_vol);
         a.set_params(initial_params);
     }
+    // Collect the startup playlist: a folder recurses (recursive=true), a file
+    // collects its sibling folder and starts at the matched index.
+    if let Some(path) = startup_path {
+        app.open_path(path, false, true);
+    }
     if fps > 0.0 {
         app.frame_ms = (1000.0 / fps).round().max(1.0) as u64;
     }
     app.nopaint = nopaint;
-    app.extra_ops = extra_ops;
     app.screenshot_path = app_screenshot;
-    app.active_tab = initial_tab.min(3);
     // Phase 1.5: pop a secondary window at startup. With `--screenshot` alongside it,
     // the capture is taken from THAT window (handled in `resumed`).
     app.open_window_spec = open_window.as_deref().and_then(window_spec_by_key);
@@ -3875,16 +3370,69 @@ fn main() {
             eprintln!("[poc] --open-window: unknown key '{k}' (parameters|monitoring|mixer|settings|help)");
         }
     }
-    if open_select_demo {
-        app.ui_state.open_popup_id = Some(360);
-    }
-    if drop_preview {
-        app.ui_state.hovered_file =
-            Some(std::path::PathBuf::from("D:\\Work\\_GIT\\SoundApp\\_Material\\test_track.flac"));
-    }
-    if focus_preview {
-        app.ui_state.focused_id = Some(301);
-        app.ui_state.focus_visible = true;
-    }
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod playlist_tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "soundapp_playlist_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn supported_audio_extensions_are_case_insensitive() {
+        assert!(is_supported_audio(std::path::Path::new("a.MP3")));
+        assert!(is_supported_audio(std::path::Path::new("b.FlAc")));
+        assert!(!is_supported_audio(std::path::Path::new("c.txt")));
+        assert!(!is_supported_audio(std::path::Path::new("noext")));
+    }
+
+    #[test]
+    fn single_file_collects_siblings_and_finds_index() {
+        let dir = temp_dir("single");
+        for name in ["01.m4a", "02.m4a", "notes.txt"] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        let (list, idx) = playlist_from_single_file(&dir.join("02.m4a"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[idx].file_name().unwrap(), "02.m4a");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_collection_respects_recursion() {
+        let dir = temp_dir("folder");
+        let sub = dir.join("disc2");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("a.mp3"), b"x").unwrap();
+        fs::write(dir.join("b.txt"), b"x").unwrap();
+        fs::write(sub.join("c.flac"), b"x").unwrap();
+        assert_eq!(playlist_from_folder(&dir, false).len(), 1);
+        assert_eq!(playlist_from_folder(&dir, true).len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_file_with_empty_folder_returns_itself() {
+        let dir = temp_dir("empty");
+        let file = dir.join("only.ogg");
+        fs::write(&file, b"x").unwrap();
+        let (list, idx) = playlist_from_single_file(&file);
+        assert_eq!(list, vec![file]);
+        assert_eq!(idx, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

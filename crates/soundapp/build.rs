@@ -19,7 +19,14 @@ const FFMPEG_LIB_DIR: &str = r"D:\Work\_GIT\SoundApp\libs\ffmpeg-napi-interface\
 const FFMPEG_BIN_DIR: &str = r"D:\Work\_GIT\SoundApp\bin\win_bin";
 
 /// Import libs the bridge links against (order matters: dependents first).
-const LINK_LIBS: [&str; 5] = ["avformat", "avcodec", "avutil", "swresample", "avfilter"];
+const LINK_LIBS: [&str; 6] = [
+    "avformat",
+    "avcodec",
+    "avutil",
+    "swresample",
+    "swscale",
+    "avfilter",
+];
 
 /// FFmpeg runtime DLLs that must sit beside the executable.
 const RUNTIME_DLLS: [&str; 7] = [

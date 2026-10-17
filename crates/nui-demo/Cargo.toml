@@ -1,0 +1,13 @@
+[package]
+name = "nui-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "nui_demo"
+path = "src/main.rs"
+
+[dependencies]
+nui = { path = "../nui" }
+winit.workspace = true

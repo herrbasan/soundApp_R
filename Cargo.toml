@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/nui",
     "crates/soundapp",
+    "crates/nui-demo",
 ]
 
 [workspace.dependencies]

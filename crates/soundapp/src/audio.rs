@@ -1,10 +1,9 @@
 // Audio engine: transport control + a cpal callback that drains a lock-free
 // rtrb ring buffer, fed by a decoder thread.
 //
-// Three playback engines feed the same pipeline:
-//   * FFmpeg (universal formats + metadata) via the native `sa_ffmpeg_*` bridge.
-//   * MIDI / SoundFont synthesis (`midi.rs`, rustysynth).
-//   * ProTracker modules (`tracker.rs`, native Paula synth).
+// FFmpeg (universal formats + metadata) via the native `sa_ffmpeg_*` bridge is
+// the only playback engine. MIDI / SoundFont synthesis and ProTracker modules
+// are parked (the source files remain on disk; their modules are not built).
 //
 // Pitch / tempo / formant are applied in the pipeline itself, so they work
 // identically on every source:
@@ -27,13 +26,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::RingBuffer;
-
-use crate::midi::MidiEngine;
-use crate::tracker::TrackerPlayer;
 
 // ---------------------------------------------------------------------------
 // FFmpeg bridge FFI
@@ -47,6 +43,8 @@ struct SaAudioMeta {
     genre: [c_char; 64],
     codec: [c_char; 64],
     format: [c_char; 64],
+    codec_long_name: [c_char; 128],
+    format_long_name: [c_char; 128],
     duration: c_double,
     bitrate: c_int,
     sample_rate: c_int,
@@ -62,10 +60,12 @@ extern "C" {
     fn sa_ffmpeg_read(handle: *mut c_void, out_buf: *mut f32, num_samples: c_int) -> c_int;
     fn sa_ffmpeg_seek(handle: *mut c_void, seconds: c_double) -> c_int;
     fn sa_ffmpeg_duration(handle: *mut c_void) -> c_double;
-    fn sa_ffmpeg_set_pitch_semitones(handle: *mut c_void, semitones: c_double) -> c_int;
-    fn sa_ffmpeg_set_tempo(handle: *mut c_void, tempo: c_double) -> c_int;
-    fn sa_ffmpeg_set_formant(handle: *mut c_void, preserve: c_int) -> c_int;
-    fn sa_ffmpeg_probe_metadata(path: *const c_char, out_meta: *mut SaAudioMeta) -> c_int;
+    fn sa_ffmpeg_probe_metadata(
+        path: *const c_char,
+        out_meta: *mut SaAudioMeta,
+        out_cover_rgba: *mut u8,
+        cover_side: c_int,
+    ) -> c_int;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,13 +81,23 @@ pub struct TrackMetadata {
     pub genre: String,
     pub codec: String,
     pub format: String,
+    pub codec_long_name: String,
+    pub format_long_name: String,
     pub duration: f64,
     pub bitrate: i32,
     pub sample_rate: i32,
     pub channels: i32,
     pub bits_per_sample: i32,
     pub has_cover_art: bool,
+    /// Embedded cover art decoded by FFmpeg and scaled to `128x128` RGBA.
+    pub cover_rgba: Option<(u32, u32, Vec<u8>)>,
+    /// File size in bytes, sampled once by the background probe so the UI never
+    /// has to stat the file per frame just to derive a bitrate.
+    pub file_size_bytes: u64,
 }
+
+/// Side length of the decoded cover-art thumbnail pushed to the UI.
+pub const COVER_SIDE: u32 = 128;
 
 fn cstr(buf: &[c_char]) -> String {
     let bytes: Vec<u8> = buf
@@ -102,15 +112,40 @@ fn path_cstring(path: &Path) -> Option<CString> {
     CString::new(path.to_string_lossy().as_bytes()).ok()
 }
 
-/// Probe a file's metadata via FFmpeg (no decode). `None` when the file cannot
-/// be opened or has no audio stream.
+/// Probe a file's metadata via FFmpeg (one format open, no decode). The same
+/// open also yields the attached-picture bytes, which are decoded to the 128x128
+/// RGBA thumbnail here — so metadata + cover art never touch the file twice.
+/// `None` when the file cannot be opened or has no audio stream.
 pub fn probe_metadata(path: &Path) -> Option<TrackMetadata> {
     let c = path_cstring(path)?;
     let mut m: SaAudioMeta = unsafe { std::mem::zeroed() };
-    let ok = unsafe { sa_ffmpeg_probe_metadata(c.as_ptr(), &mut m) };
+    let mut cover_buf = vec![0u8; (COVER_SIDE * COVER_SIDE * 4) as usize];
+    let ok = unsafe {
+        sa_ffmpeg_probe_metadata(
+            c.as_ptr(),
+            &mut m,
+            cover_buf.as_mut_ptr(),
+            COVER_SIDE as c_int,
+        )
+    };
     if ok == 0 {
         return None;
     }
+    // `cover_buf` is zero-filled when the file has no art (or it failed to
+    // decode), which is indistinguishable from real black art — only trust it
+    // when FFmpeg reported an attached picture.
+    let cover_rgba = if m.has_cover_art != 0 && cover_buf.iter().any(|&b| b != 0) {
+        Some((COVER_SIDE, COVER_SIDE, cover_buf))
+    } else {
+        if m.has_cover_art != 0 {
+            eprintln!(
+                "[audio] cover art present but did not decode for {}",
+                path.display()
+            );
+        }
+        None
+    };
+    let file_size_bytes = std::fs::metadata(path).map(|s| s.len()).unwrap_or(0);
     Some(TrackMetadata {
         title: cstr(&m.title),
         artist: cstr(&m.artist),
@@ -118,106 +153,31 @@ pub fn probe_metadata(path: &Path) -> Option<TrackMetadata> {
         genre: cstr(&m.genre),
         codec: cstr(&m.codec),
         format: cstr(&m.format),
+        codec_long_name: cstr(&m.codec_long_name),
+        format_long_name: cstr(&m.format_long_name),
         duration: m.duration,
         bitrate: m.bitrate,
         sample_rate: m.sample_rate,
         channels: m.channels,
         bits_per_sample: m.bits_per_sample,
         has_cover_art: m.has_cover_art != 0,
+        cover_rgba,
+        file_size_bytes,
     })
-}
-
-/// Deterministic synthetic waveform peaks — the fallback when a real file
-/// cannot be decoded (or for the tone/silence/MIDI/tracker sources).
-pub fn synth_wave_peaks(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let x = i as f32 / (n - 1).max(1) as f32;
-            let envelope = (x * std::f32::consts::PI).sin();
-            let detail = (x * 37.0).sin() * 0.35 + (x * 91.0).cos() * 0.22;
-            (envelope * (0.55 + detail)).abs().clamp(0.05, 1.0)
-        })
-        .collect()
-}
-
-/// Read the whole file through a second decoder at 8 kHz and reduce it to
-/// `num_bins` normalized peak bars in `0.05..=1.0`. Falls back to
-/// [`synth_wave_peaks`] when the file cannot be opened.
-pub fn extract_waveform_peaks(path: &Path, num_bins: usize) -> Vec<f32> {
-    const PEAK_RATE: c_int = 8000;
-    let num_bins = num_bins.max(1);
-
-    let Some(c) = path_cstring(path) else {
-        return synth_wave_peaks(num_bins);
-    };
-    let handle = unsafe { sa_ffmpeg_open(c.as_ptr(), PEAK_RATE) };
-    if handle.is_null() {
-        return synth_wave_peaks(num_bins);
-    }
-
-    let duration = unsafe { sa_ffmpeg_duration(handle) };
-    let total_frames = ((duration * PEAK_RATE as f64).max(1.0)) as u64;
-    let frames_per_bin = (total_frames / num_bins as u64).max(1);
-
-    let mut peaks = vec![0.0f32; num_bins];
-    let mut buf = vec![0.0f32; 8192 * 2];
-    let mut frame_idx: u64 = 0;
-    loop {
-        let n = unsafe { sa_ffmpeg_read(handle, buf.as_mut_ptr(), buf.len() as c_int) };
-        if n <= 0 {
-            break;
-        }
-        let frames = n as usize / 2;
-        for f in 0..frames {
-            let peak = buf[f * 2].abs().max(buf[f * 2 + 1].abs());
-            let bin = (frame_idx / frames_per_bin) as usize;
-            if bin < num_bins && peak > peaks[bin] {
-                peaks[bin] = peak;
-            }
-            frame_idx += 1;
-        }
-    }
-    unsafe { sa_ffmpeg_close(handle) };
-
-    if frame_idx == 0 {
-        return synth_wave_peaks(num_bins);
-    }
-
-    let max = peaks.iter().cloned().fold(0.0f32, f32::max);
-    let scale = if max > 1e-6 { 1.0 / max } else { 1.0 };
-    for p in &mut peaks {
-        *p = (*p * scale).clamp(0.05, 1.0);
-    }
-    peaks
 }
 
 // ---------------------------------------------------------------------------
 // Sources, parameters & commands
 // ---------------------------------------------------------------------------
 
-/// What kind of source the engine currently has loaded. Published alongside the
-/// metadata so the UI can adapt (Parameters window tab auto-selection).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceKind {
-    Audio,
-    Midi,
-    Tracker,
-}
-
 /// What the engine should play.
 #[derive(Clone, Debug)]
 pub enum Source {
     Silence,
     Tone { hz: f32 },
-    File(PathBuf),
-    MidiFile(PathBuf),
-    MidiDemo,
-    TrackerFile(PathBuf),
-    TrackerDemo,
 }
 
-/// The full playback parameter set driving the pitch/tempo/formant pipeline and
-/// the MIDI/tracker engines.
+/// The full playback parameter set driving the pitch/tempo/formant pipeline.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlaybackParams {
     /// `true` = Tape mode (pitch & tempo coupled); `false` = PitchTime mode.
@@ -226,13 +186,6 @@ pub struct PlaybackParams {
     pub tempo_ratio: f32,
     pub hq: bool,
     pub formant_preserve: bool,
-    pub stereo_sep: f32,
-    pub interp: usize,
-    /// MIDI transpose in semitones (`-12..=12`, forwarded to the SF2 engine).
-    pub midi_transpose: f32,
-    /// MIDI tempo override in BPM (`40..=240`).
-    pub midi_bpm: f32,
-    pub metronome: bool,
 }
 
 impl Default for PlaybackParams {
@@ -243,11 +196,6 @@ impl Default for PlaybackParams {
             tempo_ratio: 1.0,
             hq: true,
             formant_preserve: true,
-            stereo_sep: 100.0,
-            interp: 1,
-            midi_transpose: 0.0,
-            midi_bpm: 120.0,
-            metronome: false,
         }
     }
 }
@@ -255,31 +203,7 @@ impl Default for PlaybackParams {
 enum Cmd {
     Seek(f64),
     Load(PathBuf),
-    LoadMidiDemo,
-    LoadTrackerDemo,
-    SetSoundfont(PathBuf),
     SetParams(PlaybackParams),
-}
-
-/// File-kind classification by extension.
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    Audio,
-    Midi,
-    Tracker,
-}
-
-fn classify(path: &Path) -> Kind {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("mid") | Some("midi") => Kind::Midi,
-        Some("mod") | Some("xm") | Some("s3m") | Some("it") => Kind::Tracker,
-        _ => Kind::Audio,
-    }
 }
 
 /// Shared atomics + mutex-guarded results, cloned into the callback and the
@@ -294,10 +218,14 @@ struct Shared {
     total_frames: Arc<AtomicU64>,
     frames_played: Arc<AtomicU64>,
     started: Arc<AtomicBool>,
-    peaks: Arc<Mutex<Vec<f32>>>,
+    /// The decoder has pushed its last sample; the ring may still hold audio.
+    decoder_eof: Arc<AtomicBool>,
+    /// The callback drained the ring after `decoder_eof` — one-shot for the UI.
+    track_ended: Arc<AtomicBool>,
+    /// When false the callback skips the DSP tap entirely (Monitoring closed).
+    dsp_enabled: Arc<AtomicBool>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
-    kind: Arc<Mutex<Option<SourceKind>>>,
     dsp: Arc<Mutex<DspTap>>,
 }
 
@@ -351,11 +279,11 @@ pub struct Audio {
     pub started: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
+    track_ended: Arc<AtomicBool>,
+    dsp_enabled: Arc<AtomicBool>,
     cmd_tx: mpsc::Sender<Cmd>,
-    peaks: Arc<Mutex<Vec<f32>>>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
-    kind: Arc<Mutex<Option<SourceKind>>>,
     dsp: Arc<Mutex<DspTap>>,
 }
 
@@ -369,7 +297,17 @@ impl Audio {
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::SeqCst)
     }
+    /// True when the play head has reached the end of the loaded file.
+    fn at_track_end(&self) -> bool {
+        let dur = self.duration_secs();
+        dur > 0.0 && self.position_secs() >= dur - 0.05
+    }
     pub fn play(&self) {
+        // Pressing Play after a finished track restarts it instead of silently
+        // pushing an empty ring buffer.
+        if self.at_track_end() {
+            self.seek(0.0);
+        }
         self.playing.store(true, Ordering::SeqCst);
     }
     pub fn pause(&self) {
@@ -385,44 +323,34 @@ impl Audio {
             true
         }
     }
+    /// One-shot: did the current track just play to its end? Used by the UI to
+    /// auto-advance the folder playlist (or loop / stop).
+    pub fn take_track_ended(&self) -> bool {
+        self.track_ended.swap(false, Ordering::AcqRel)
+    }
+    /// Enable the DSP tap only while a consumer (Monitoring window) is visible.
+    pub fn set_dsp_enabled(&self, enabled: bool) {
+        self.dsp_enabled.store(enabled, Ordering::Relaxed);
+    }
     pub fn seek(&self, seconds: f64) {
         let _ = self.cmd_tx.send(Cmd::Seek(seconds.max(0.0)));
     }
-    /// Load any supported source by path (audio, MIDI or tracker).
+    /// Load any supported source by path.
     pub fn load_file(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::Load(path));
     }
-    /// Load the built-in General MIDI demo sequence.
-    pub fn load_midi_demo(&self) {
-        let _ = self.cmd_tx.send(Cmd::LoadMidiDemo);
-    }
-    /// Load the built-in tracker demo module.
-    pub fn load_tracker_demo(&self) {
-        let _ = self.cmd_tx.send(Cmd::LoadTrackerDemo);
-    }
-    /// Switch the MIDI engine's SoundFont at runtime.
-    pub fn set_soundfont(&self, path: PathBuf) {
-        let _ = self.cmd_tx.send(Cmd::SetSoundfont(path));
-    }
     pub fn set_volume(&self, vol: f32) {
         self.volume
-            .store(vol.clamp(0.0, 4.0).to_bits(), Ordering::SeqCst);
+            .store(vol.clamp(0.0, 2.0).to_bits(), Ordering::SeqCst);
     }
     pub fn set_params(&self, params: PlaybackParams) {
         let _ = self.cmd_tx.send(Cmd::SetParams(params));
-    }
-    pub fn peaks(&self) -> Vec<f32> {
-        self.peaks.lock().unwrap().clone()
     }
     pub fn metadata(&self) -> Option<TrackMetadata> {
         self.meta.lock().unwrap().clone()
     }
     pub fn current_file(&self) -> Option<PathBuf> {
         self.current.lock().unwrap().clone()
-    }
-    /// Kind of the currently-loaded source (`None` before the first load).
-    pub fn source_kind(&self) -> Option<SourceKind> {
-        *self.kind.lock().unwrap()
     }
     /// Shared rolling stereo tap feeding the real-time DSP analyzer (Phase 3.3).
     pub fn dsp_tap(&self) -> Arc<Mutex<DspTap>> {
@@ -461,11 +389,12 @@ pub fn start(src: Source) -> Result<Audio, String> {
         total_frames: Arc::new(AtomicU64::new(0)),
         frames_played: Arc::new(AtomicU64::new(0)),
         started: Arc::new(AtomicBool::new(false)),
+        decoder_eof: Arc::new(AtomicBool::new(false)),
+        track_ended: Arc::new(AtomicBool::new(false)),
+        dsp_enabled: Arc::new(AtomicBool::new(false)),
         dsp: Arc::new(Mutex::new(DspTap::new(rate))),
-        peaks: Arc::new(Mutex::new(Vec::new())),
         meta: Arc::new(Mutex::new(None)),
         current: Arc::new(Mutex::new(None)),
-        kind: Arc::new(Mutex::new(None)),
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -515,6 +444,8 @@ pub fn start(src: Source) -> Result<Audio, String> {
 
                 let target_vol = f32::from_bits(sh.volume.load(Ordering::Relaxed));
                 let pull = last_playing || matches!(fade, Fade::Out(_));
+                // Fix #6: skip the tap entirely unless a consumer is attached.
+                let dsp_on = sh.dsp_enabled.load(Ordering::Relaxed);
                 let frames = data.len() / out_ch;
                 let mut advanced: u64 = 0;
                 for f in 0..frames {
@@ -554,17 +485,29 @@ pub fn start(src: Source) -> Result<Audio, String> {
                                     sh.started.store(true, Ordering::Relaxed);
                                     v
                                 }
-                                Err(_) => 0.0,
+                                Err(_) => {
+                                    // Fix #1/#2: the ring is drained *and* the
+                                    // decoder signalled EOF — only now is the
+                                    // track really over. Never cut buffered audio.
+                                    if sh.decoder_eof.load(Ordering::Acquire) {
+                                        sh.decoder_eof.store(false, Ordering::Release);
+                                        sh.playing.store(false, Ordering::Release);
+                                        sh.track_ended.store(true, Ordering::Release);
+                                    }
+                                    0.0
+                                }
                             }
                         } else {
                             0.0
                         };
-                        data[f * out_ch + c] = s * vol_smooth * gain;
+                        // Boost up to 200% (+6 dB) must never wrap or hard-clip.
+                        data[f * out_ch + c] = (s * vol_smooth * gain).clamp(-1.0, 1.0);
                     }
-                    // Publish the final post-fader stereo frame to the DSP tap.
-                    let l = data[f * out_ch];
-                    let r = if out_ch > 1 { data[f * out_ch + 1] } else { l };
-                    dsp_frames.push((l, r));
+                    if dsp_on {
+                        let l = data[f * out_ch];
+                        let r = if out_ch > 1 { data[f * out_ch + 1] } else { l };
+                        dsp_frames.push((l, r));
+                    }
                     if last_playing {
                         advanced += 1;
                     }
@@ -573,7 +516,9 @@ pub fn start(src: Source) -> Result<Audio, String> {
                     sh.frames_played.fetch_add(advanced, Ordering::Relaxed);
                 }
                 if !dsp_frames.is_empty() {
-                    if let Ok(mut tap) = dsp.lock() {
+                    // Fix #7: `try_lock` — the real-time thread never waits on
+                    // the analyzer; a missed buffer is cheaper than a glitch.
+                    if let Ok(mut tap) = dsp.try_lock() {
                         for &(l, r) in &dsp_frames {
                             tap.push(l, r);
                         }
@@ -597,12 +542,12 @@ pub fn start(src: Source) -> Result<Audio, String> {
         started: shared.started.clone(),
         playing: shared.playing.clone(),
         volume: shared.volume.clone(),
+        track_ended: shared.track_ended.clone(),
+        dsp_enabled: shared.dsp_enabled.clone(),
         cmd_tx,
-        peaks: shared.peaks.clone(),
         meta: shared.meta.clone(),
         current: shared.current.clone(),
         dsp: shared.dsp.clone(),
-        kind: shared.kind.clone(),
     })
 }
 
@@ -845,8 +790,6 @@ fn cubic_q(q: &VecDeque<f32>, i0: usize, frac: f32, c: usize) -> f32 {
 enum Engine {
     None,
     Ffmpeg(*mut c_void),
-    Midi(Box<MidiEngine>),
-    Tracker(Box<TrackerPlayer>),
 }
 
 fn close_engine(engine: &mut Engine) {
@@ -859,14 +802,22 @@ fn close_engine(engine: &mut Engine) {
 }
 
 fn pre_load(sh: &Shared) {
+    // The 13 ms wait exists only so the output callback can run its 12 ms cosine
+    // fade-out before the ring is flushed. From silence (startup) or with the
+    // stream already armed, there is no audible tail to protect.
+    let was_playing = sh.playing.load(Ordering::SeqCst) && sh.started.load(Ordering::SeqCst);
     sh.fade_out.store(true, Ordering::SeqCst);
-    thread::sleep(Duration::from_millis(13));
+    if was_playing {
+        thread::sleep(Duration::from_millis(13));
+    }
     sh.flush_gen.fetch_add(1, Ordering::SeqCst);
 }
 
 fn post_load(sh: &Shared, total_frames: u64) {
     sh.total_frames.store(total_frames, Ordering::SeqCst);
     sh.frames_played.store(0, Ordering::SeqCst);
+    sh.decoder_eof.store(false, Ordering::SeqCst);
+    sh.track_ended.store(false, Ordering::SeqCst);
     sh.fade_out.store(false, Ordering::SeqCst);
     sh.playing.store(true, Ordering::SeqCst);
     sh.transport_gen.fetch_add(1, Ordering::SeqCst);
@@ -894,21 +845,20 @@ fn decoder_thread(
     // Scratch buffers reused across iterations.
     let mut raw: Vec<f32> = Vec::new();
     let mut post: Vec<f32> = Vec::new();
-    let mut m_left: Vec<f32> = Vec::new();
-    let mut m_right: Vec<f32> = Vec::new();
 
     let mut tone_hz: Option<f32> = None;
     let mut silence = false;
+
+    // Latency instrumentation for `Cmd::Load`: `t0` is the moment the command was
+    // dequeued, i.e. what the user waits for after clicking a track.
+    let mut load_t0: Option<Instant> = None;
+    let mut load_path = String::new();
+    let mut first_chunk_logged = true;
 
     // Load the initial source.
     match std::mem::replace(&mut src, Source::Silence) {
         Source::Silence => silence = true,
         Source::Tone { hz } => tone_hz = Some(hz),
-        Source::File(p) => open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh),
-        Source::MidiFile(p) => open_midi(&mut engine, Some(&p), out_rate, &sh),
-        Source::MidiDemo => open_midi(&mut engine, None, out_rate, &sh),
-        Source::TrackerFile(p) => open_tracker(&mut engine, Some(&p), out_rate, &sh),
-        Source::TrackerDemo => open_tracker(&mut engine, None, out_rate, &sh),
     }
 
     loop {
@@ -916,60 +866,41 @@ fn decoder_thread(
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Cmd::Seek(secs) => {
-                    // Only the FFmpeg path is seekable; MIDI/tracker restart is a
-                    // non-destructive no-op here.
                     if let Engine::Ffmpeg(handle) = engine {
                         if !handle.is_null() {
                             pre_load(&sh);
-                            unsafe { sa_ffmpeg_seek(handle, secs) };
+                            // Fix #4/#5: a seek invalidates every buffered stage.
+                            shifter.reset();
+                            sh.decoder_eof.store(false, Ordering::Release);
+                            sh.track_ended.store(false, Ordering::Release);
+                            let ok = unsafe { sa_ffmpeg_seek(handle, secs) };
                             in_buf.clear();
                             read_pos = 0.0;
                             eof = false;
-                            sh.frames_played
-                                .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
+                            // Only move the play head when FFmpeg actually seeked.
+                            if ok != 0 {
+                                sh.frames_played
+                                    .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
+                            }
                             sh.fade_out.store(false, Ordering::SeqCst);
                             sh.transport_gen.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                 }
                 Cmd::Load(p) => {
+                    let t0 = Instant::now();
+                    load_path = p.display().to_string();
+                    load_t0 = Some(t0);
+                    first_chunk_logged = false;
                     shifter.reset();
                     // Leaving the tone/silence source: the new engine drives output.
                     silence = false;
                     tone_hz = None;
-                    match classify(&p) {
-                        Kind::Audio => {
-                            open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh)
-                        }
-                        Kind::Midi => open_midi(&mut engine, Some(&p), out_rate, &sh),
-                        Kind::Tracker => open_tracker(&mut engine, Some(&p), out_rate, &sh),
-                    }
+                    open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh, t0);
                     eof = false;
-                }
-                Cmd::LoadMidiDemo => {
-                    shifter.reset();
-                    silence = false;
-                    tone_hz = None;
-                    open_midi(&mut engine, None, out_rate, &sh);
-                }
-                Cmd::LoadTrackerDemo => {
-                    shifter.reset();
-                    silence = false;
-                    tone_hz = None;
-                    open_tracker(&mut engine, None, out_rate, &sh);
-                }
-                Cmd::SetSoundfont(path) => {
-                    if let Engine::Midi(m) = &mut engine {
-                        if let Err(e) = m.set_soundfont(&path) {
-                            eprintln!("[audio] SoundFont switch failed: {e}");
-                        } else {
-                            println!("[audio] SoundFont switched to {}", path.display());
-                        }
-                    }
                 }
                 Cmd::SetParams(p) => {
                     params = p;
-                    apply_engine_params(&mut engine, &params);
                     step = compute_step(&params);
                 }
             }
@@ -1013,6 +944,16 @@ fn decoder_thread(
                         eof = true;
                         break;
                     }
+                    if !first_chunk_logged {
+                        first_chunk_logged = true;
+                        if let Some(t0) = load_t0 {
+                            println!(
+                                "[audio] first samples decoded in {:.1} ms for {}",
+                                t0.elapsed().as_secs_f64() * 1000.0,
+                                load_path
+                            );
+                        }
+                    }
                     in_buf.extend_from_slice(&tmp[..n as usize]);
                 }
 
@@ -1025,34 +966,13 @@ fn decoder_thread(
                     read_pos -= consumed as f64;
                 }
                 if produced == 0 && eof {
-                    sh.playing.store(false, Ordering::SeqCst);
+                    // Fix #1: do NOT stop playback here — the ring may still hold
+                    // up to RING_SECONDS of audio. Signal the callback, which owns
+                    // the real end-of-track transition.
+                    sh.decoder_eof.store(true, Ordering::Release);
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 }
-            }
-            Engine::Midi(m) => {
-                if m_left.len() < cap {
-                    m_left.resize(cap, 0.0);
-                    m_right.resize(cap, 0.0);
-                }
-                m.render(&mut m_left[..cap], &mut m_right[..cap]);
-                for i in 0..cap {
-                    raw.push(m_left[i]);
-                    raw.push(m_right[i]);
-                }
-                produced = cap;
-            }
-            Engine::Tracker(t) => {
-                if m_left.len() < cap {
-                    m_left.resize(cap, 0.0);
-                    m_right.resize(cap, 0.0);
-                }
-                t.render(&mut m_left[..cap], &mut m_right[..cap]);
-                for i in 0..cap {
-                    raw.push(m_left[i]);
-                    raw.push(m_right[i]);
-                }
-                produced = cap;
             }
             Engine::None => {
                 produced = 0;
@@ -1139,36 +1059,14 @@ fn open_ffmpeg(
     params: &PlaybackParams,
     step: &mut f64,
     sh: &Shared,
+    t0: Instant,
 ) {
     close_engine(engine);
     pre_load(sh);
 
-    match probe_metadata(path) {
-        Some(m) => {
-            println!(
-                "[audio] loaded {} — codec {}, {} Hz, {} kbps, {:.2}s, {} ch, {}-bit{}",
-                path.display(),
-                m.codec,
-                m.sample_rate,
-                m.bitrate / 1000,
-                m.duration,
-                m.channels,
-                m.bits_per_sample,
-                if m.has_cover_art { ", cover art" } else { "" }
-            );
-            *sh.meta.lock().unwrap() = Some(m);
-        }
-        None => {
-            println!("[audio] metadata probe returned nothing for {}", path.display());
-            *sh.meta.lock().unwrap() = None;
-        }
-    }
-
-    let peaks = extract_waveform_peaks(path, 96);
-    *sh.peaks.lock().unwrap() = peaks;
-    *sh.current.lock().unwrap() = Some(path.to_path_buf());
-    *sh.kind.lock().unwrap() = Some(SourceKind::Audio);
-
+    // The decoder is opened FIRST. Everything needed to produce sound — the
+    // format open, the duration, the transport reset — happens before any tag or
+    // cover-art work, which now runs on its own thread.
     let mut handle: *mut c_void = std::ptr::null_mut();
     if let Some(c) = path_cstring(path) {
         handle = unsafe { sa_ffmpeg_open(c.as_ptr(), out_rate as c_int) };
@@ -1182,97 +1080,55 @@ fn open_ffmpeg(
         (dur * out_rate as f64) as u64
     };
 
-    apply_params_ffmpeg(handle, params);
+    *sh.current.lock().unwrap() = Some(path.to_path_buf());
+    *sh.meta.lock().unwrap() = None;
     *step = compute_step(params);
     *engine = Engine::Ffmpeg(handle);
     post_load(sh, total);
-}
 
-fn open_midi(engine: &mut Engine, path: Option<&Path>, out_rate: u32, sh: &Shared) {
-    close_engine(engine);
-    pre_load(sh);
-    match MidiEngine::new(out_rate) {
-        Ok(mut m) => {
-            if let Some(p) = path {
-                if let Err(e) = m.load_file(p) {
-                    eprintln!("[audio] {e}");
+    // Metadata + cover art are UI sugar only. Probing them here would put an
+    // SMB round-trip and a JPEG decode in front of the first audio chunk, so it
+    // runs detached. The generation check drops a stale result if the user has
+    // already skipped to another track.
+    let gen = sh.transport_gen.load(Ordering::SeqCst);
+    let probe_path = path.to_path_buf();
+    let probe_shared = sh.clone();
+    let spawned = thread::Builder::new()
+        .name("probe".into())
+        .spawn(move || match probe_metadata(&probe_path) {
+            Some(m) => {
+                println!(
+                    "[audio] metadata+cover ready in {:.1} ms for {}",
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    probe_path.display()
+                );
+                println!(
+                    "[audio] loaded {} — {} ({}) / {} ({}) — {} Hz, {} kbps, {:.2}s, {} ch, {}-bit{}",
+                    probe_path.display(),
+                    m.codec,
+                    m.codec_long_name,
+                    m.format,
+                    m.format_long_name,
+                    m.sample_rate,
+                    m.bitrate / 1000,
+                    m.duration,
+                    m.channels,
+                    m.bits_per_sample,
+                    if m.has_cover_art { ", cover art" } else { "" }
+                );
+                if probe_shared.transport_gen.load(Ordering::SeqCst) == gen {
+                    *probe_shared.meta.lock().unwrap() = Some(m);
                 }
-            } else {
-                m.load_demo();
             }
-            let dur = m.duration();
-            if m.using_soundfont() {
-                if let Some(p) = m.soundfont_path() {
-                    println!("[audio] MIDI SoundFont: {}", p.display());
-                }
+            None => {
+                println!(
+                    "[audio] metadata probe returned nothing for {}",
+                    probe_path.display()
+                );
             }
-            *sh.meta.lock().unwrap() = None;
-            *sh.peaks.lock().unwrap() = synth_wave_peaks(96);
-            *sh.current.lock().unwrap() = path.map(|p| p.to_path_buf());
-            *sh.kind.lock().unwrap() = Some(SourceKind::Midi);
-            *engine = Engine::Midi(Box::new(m));
-            post_load(sh, (dur * out_rate as f64) as u64);
-        }
-        Err(e) => {
-            eprintln!("[audio] MIDI engine init failed: {e}");
-            post_load(sh, 0);
-        }
-    }
-}
-
-fn open_tracker(engine: &mut Engine, path: Option<&Path>, out_rate: u32, sh: &Shared) {
-    close_engine(engine);
-    pre_load(sh);
-    let mut t = TrackerPlayer::new(out_rate);
-    if let Some(p) = path {
-        if let Err(e) = t.load_file(p) {
-            eprintln!("[audio] {e} — falling back to built-in module");
-            t.load_builtin();
-        }
-    } else {
-        t.load_builtin();
-    }
-    println!("[audio] tracker module: {}", t.title());
-    *sh.meta.lock().unwrap() = None;
-    *sh.peaks.lock().unwrap() = synth_wave_peaks(96);
-    *sh.current.lock().unwrap() = path.map(|p| p.to_path_buf());
-    *sh.kind.lock().unwrap() = Some(SourceKind::Tracker);
-    *engine = Engine::Tracker(Box::new(t));
-    post_load(sh, 0);
-}
-
-fn apply_params_ffmpeg(handle: *mut c_void, p: &PlaybackParams) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        // FFmpeg always outputs the raw stream; pitch/tempo are handled by the
-        // Rust pipeline (PitchTime shifter or the Tape-mode variable resampler).
-        sa_ffmpeg_set_pitch_semitones(handle, 0.0);
-        sa_ffmpeg_set_tempo(handle, 1.0);
-        sa_ffmpeg_set_formant(handle, if p.formant_preserve { 1 } else { 0 });
-    }
-}
-
-fn apply_engine_params(engine: &mut Engine, p: &PlaybackParams) {
-    match engine {
-        Engine::Ffmpeg(h) => apply_params_ffmpeg(*h, p),
-        Engine::Tracker(t) => {
-            // The shared pitch shifter owns pitch/tempo (kept neutral here); the
-            // tracker engine owns stereo separation and interpolation.
-            t.set_pitch(0.0);
-            t.set_tempo(1.0);
-            t.set_stereo_separation(p.stereo_sep);
-            t.set_interp(p.interp);
-        }
-        Engine::Midi(m) => {
-            // Pitch/tempo of the rendered stream are applied by the pipeline; the
-            // MIDI engine owns its own transpose, BPM override and metronome.
-            m.set_transpose(p.midi_transpose.round().clamp(-12.0, 12.0) as i32);
-            m.set_bpm(Some(p.midi_bpm.clamp(40.0, 240.0)));
-            m.set_metronome(p.metronome);
-        }
-        Engine::None => {}
+        });
+    if let Err(e) = spawned {
+        eprintln!("[audio] failed to spawn metadata probe thread: {e}");
     }
 }
 
@@ -1398,13 +1254,6 @@ mod tests {
         let s = sinc8(&buf, 16, 0.5, 0);
         let c = cubic(&buf, 16, 0.5, 0);
         assert!((s - c).abs() < 0.02, "sinc {s} vs cubic {c}");
-    }
-
-    #[test]
-    fn waveform_peak_fallback_is_bounded() {
-        let peaks = synth_wave_peaks(96);
-        assert_eq!(peaks.len(), 96);
-        assert!(peaks.iter().all(|&p| (0.05..=1.0).contains(&p)));
     }
 
     #[test]

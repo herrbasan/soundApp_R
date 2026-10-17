@@ -179,6 +179,9 @@ pub struct TextSystem {
     scale_ctx: ScaleContext,
     cache: HashMap<GlyphKey, AtlasGlyph>,
     shape_cache: HashMap<(u8, u16, u64), Vec<(u16, f32, f32, f32)>>,
+    /// Rotated (-45°) text runs, cached by `(face, px_tenths, hash(text))`.
+    /// Cleared whenever the atlas is cleared, exactly like `cache`.
+    rot_cache: HashMap<(u8, u16, u64), AtlasGlyph>,
     pub atlas: Vec<u8>,
     cursor_x: u16,
     cursor_y: u16,
@@ -203,6 +206,7 @@ impl TextSystem {
             scale_ctx: ScaleContext::new(),
             cache: HashMap::with_capacity(512),
             shape_cache: HashMap::with_capacity(128),
+            rot_cache: HashMap::with_capacity(16),
             atlas: vec![0u8; ATLAS_W * ATLAS_H],
             cursor_x: 1,
             cursor_y: 1,
@@ -219,6 +223,7 @@ impl TextSystem {
         if self.cursor_y + 160 >= ATLAS_H as u16 {
             self.atlas.fill(0);
             self.cache.clear();
+            self.rot_cache.clear();
             self.cursor_x = 1;
             self.cursor_y = 1;
             self.row_h = 0;
@@ -413,6 +418,126 @@ impl TextSystem {
         })
     }
 
+    /// Lay `text` out horizontally, rotate the rasterized run by -45° (text reads
+    /// bottom-left → top-right on a y-down screen), and pack the square result
+    /// into the glyph atlas once. Cached by `(face, px_tenths, hash(text))` and
+    /// cleared with the atlas, so the returned `AtlasGlyph` stays valid exactly
+    /// as long as any other cached glyph does.
+    pub fn layout_rotated_ccw45(
+        &mut self,
+        face: FontFace,
+        engine: FontEngine,
+        text: &str,
+        px_size: f32,
+    ) -> Option<AtlasGlyph> {
+        if text.is_empty() {
+            return None;
+        }
+        let px_tenths = (px_size * 10.0).round() as u16;
+        let key = (face as u8, px_tenths, Self::hash_str(text));
+        if let Some(&ag) = self.rot_cache.get(&key) {
+            return if ag.w == 0 { None } else { Some(ag) };
+        }
+
+        // 1) Lay the run out horizontally into a standalone grayscale bitmap.
+        let mut glyphs = Vec::new();
+        let _ = self.layout_run(face, engine, text, 0.0, px_size, px_size, &mut glyphs);
+        let empty = AtlasGlyph {
+            uv_x: 0,
+            uv_y: 0,
+            w: 0,
+            h: 0,
+            offset_x: 0,
+            offset_y: 0,
+        };
+        if glyphs.is_empty() {
+            self.rot_cache.insert(key, empty);
+            return None;
+        }
+
+        let min_x = glyphs.iter().map(|g| g.x).min().unwrap();
+        let min_y = glyphs.iter().map(|g| g.y).min().unwrap();
+        let max_x = glyphs.iter().map(|g| g.x + g.w as i32).max().unwrap();
+        let max_y = glyphs.iter().map(|g| g.y + g.h as i32).max().unwrap();
+        let pad = 2i32;
+        let src_w = (max_x - min_x + pad * 2).max(1) as usize;
+        let src_h = (max_y - min_y + pad * 2).max(1) as usize;
+        let mut src = vec![0u8; src_w * src_h];
+        for g in &glyphs {
+            let ox = g.x - min_x + pad;
+            let oy = g.y - min_y + pad;
+            for row in 0..g.h as usize {
+                let sy = g.uv_y as usize + row;
+                let dy = oy as usize + row;
+                if sy >= ATLAS_H || dy >= src_h {
+                    break;
+                }
+                for col in 0..g.w as usize {
+                    let sx = g.uv_x as usize + col;
+                    let dx = ox as usize + col;
+                    if sx >= ATLAS_W || dx >= src_w {
+                        break;
+                    }
+                    let cov = self.atlas[sy * ATLAS_W + sx];
+                    if cov != 0 {
+                        let dst = &mut src[dy * src_w + dx];
+                        *dst = (*dst).max(cov);
+                    }
+                }
+            }
+        }
+
+        // 2) Rotate -45° into a square canvas, bilinearly sampled.
+        const C: f32 = std::f32::consts::FRAC_1_SQRT_2; // 0.70710678
+        let diag = (((src_w + src_h) as f32) * 0.75).ceil() as usize + 4;
+        let c = diag as f32 * 0.5;
+        let scx = src_w as f32 * 0.5;
+        let scy = src_h as f32 * 0.5;
+        let mut rot = vec![0u8; diag * diag];
+        let sample = |x: i32, y: i32| -> f32 {
+            if x < 0 || y < 0 || x >= src_w as i32 || y >= src_h as i32 {
+                0.0
+            } else {
+                src[y as usize * src_w + x as usize] as f32
+            }
+        };
+        for dy in 0..diag {
+            let vy = dy as f32 + 0.5 - c;
+            for dx in 0..diag {
+                let vx = dx as f32 + 0.5 - c;
+                // Inverse rotation: text direction maps to (+C, -C).
+                let u = vx * C - vy * C + scx;
+                let v = vx * C + vy * C + scy;
+                let x0 = u.floor() as i32;
+                let y0 = v.floor() as i32;
+                let fx = u - x0 as f32;
+                let fy = v - y0 as f32;
+                let a = sample(x0, y0);
+                let b = sample(x0 + 1, y0);
+                let cc = sample(x0, y0 + 1);
+                let d = sample(x0 + 1, y0 + 1);
+                let val = a * (1.0 - fx) * (1.0 - fy)
+                    + b * fx * (1.0 - fy)
+                    + cc * (1.0 - fx) * fy
+                    + d * fx * fy;
+                rot[dy * diag + dx] = val.clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        // 3) Pack once into the shared R8 atlas.
+        let (ux, uy) = self.alloc_atlas(diag as u16, diag as u16, &rot);
+        let ag = AtlasGlyph {
+            uv_x: ux,
+            uv_y: uy,
+            w: diag as u16,
+            h: diag as u16,
+            offset_x: 0,
+            offset_y: -((diag / 2) as i16),
+        };
+        self.rot_cache.insert(key, ag);
+        Some(ag)
+    }
+
     /// Shape and lay out `text` into positioned atlas quads.
     pub fn layout_run(
         &mut self,
@@ -557,6 +682,129 @@ impl TextSystem {
                 pen_x - x
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PX: f32 = 32.0;
+
+    fn gid(face: FontFace, ch: char) -> u16 {
+        TextSystem::new().fonts[face as usize]
+            .fd
+            .chars()
+            .get(&ch)
+            .map(|n| n.get())
+            .unwrap_or(0)
+    }
+
+    /// Raw swash rasterization for `gid`, with hinting toggled.
+    ///
+    /// The two calls answer different questions and must stay separate: a glyph
+    /// that is empty under `hint(true)` but has ink under `hint(false)` carries a
+    /// broken TrueType instruction program, which is a defect in the font file
+    /// itself. A glyph that is empty both ways is a missing outline.
+    fn swash_raster(ts: &mut TextSystem, face: FontFace, gid: u16, hint: bool) -> (u16, u16, usize) {
+        let fref = ts.fonts[face as usize].as_ref();
+        let mut scaler = ts.scale_ctx.builder(fref).size(PX).hint(hint).build();
+        match Render::new(&[Source::Outline])
+            .format(Format::Alpha)
+            .render(&mut scaler, gid)
+        {
+            Some(img) => {
+                let ink = img.data.iter().filter(|&&c| c != 0).count();
+                (img.placement.width as u16, img.placement.height as u16, ink)
+            }
+            None => (0, 0, 0),
+        }
+    }
+
+    fn fontdue_raster(ts: &TextSystem, face: FontFace, ch: char) -> (u16, u16, usize) {
+        let (m, bmp) = ts.fonts[face as usize].fd.rasterize(ch, PX);
+        let ink = bmp.iter().filter(|&&c| c != 0).count();
+        (m.width as u16, m.height as u16, ink)
+    }
+
+    #[test]
+    fn diagnose_capital_m_glyph() {
+        let mut ts = TextSystem::new();
+        for face in [FontFace::Regular, FontFace::SemiBold] {
+            let g = gid(face, 'M');
+            let sw_hinted = swash_raster(&mut ts, face, g, true);
+            let sw_plain = swash_raster(&mut ts, face, g, false);
+            let fd = fontdue_raster(&ts, face, 'M');
+            println!(
+                "{face:?}: cmap('M')=gid {g} | swash hinted {sw_hinted:?} | swash unhinted {sw_plain:?} | fontdue {fd:?} | advance {}",
+                ts.fonts[face as usize].fd.metrics('M', PX).advance_width
+            );
+        }
+    }
+
+    /// End-to-end guard for the integration the raw raster test cannot see:
+    /// `layout_run` must emit one quad per glyph and every quad must point at
+    /// atlas pixels that actually contain ink. A glyph can rasterize perfectly
+    /// and still render blank if its atlas slot is stale or its UVs are wrong.
+    #[test]
+    fn layout_run_emits_inked_atlas_quads() {
+        const CASES: [&str; 5] = ["MP3", "MPEG", "Murr_01.mp3", "AMMA", "audio"];
+        for engine in [FontEngine::Swash, FontEngine::Fontdue] {
+            for fs in [13.0f32, 14.0, 16.0, 19.0, 24.0] {
+                let mut ts = TextSystem::new();
+                for s in CASES {
+                    let mut out = Vec::new();
+                    ts.layout_run(FontFace::Regular, engine, s, 0.0, 20.0, fs, &mut out);
+                    let label = format!("{engine:?} {fs}px {s:?}");
+                    assert_eq!(out.len(), s.chars().count(), "{label}: glyph count");
+                    for (i, g) in out.iter().enumerate() {
+                        assert!(g.w > 0 && g.h > 0, "{label}: glyph {i} has empty extent");
+                        let mut ink = 0usize;
+                        for r in 0..g.h as usize {
+                            for c in 0..g.w as usize {
+                                let (x, y) = (g.uv_x as usize + c, g.uv_y as usize + r);
+                                if x < ATLAS_W && y < ATLAS_H && ts.atlas[y * ATLAS_W + x] != 0 {
+                                    ink += 1;
+                                }
+                            }
+                        }
+                        assert!(ink > 0, "{label}: glyph {i} samples an empty atlas region");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every printable ASCII glyph except space must carry ink in both weights
+    /// under both rasterizers. `w > 0 && h > 0` alone is too weak: a placement box
+    /// can be non-empty around a blank outline, so the test also counts lit pixels.
+    #[test]
+    fn all_printable_ascii_glyphs_rasterize() {
+        let mut ts = TextSystem::new();
+        let mut failures = Vec::new();
+        for face in [FontFace::Regular, FontFace::SemiBold] {
+            for code in 0x21u32..=0x7e {
+                let ch = char::from_u32(code).unwrap();
+                let label = format!("{face:?} U+{code:04X} '{ch}'");
+
+                let (fw, fh, fink) = fontdue_raster(&ts, face, ch);
+                if fw == 0 || fh == 0 || fink == 0 {
+                    failures.push(format!("fontdue {label} -> {fw}x{fh} ink={fink}"));
+                }
+
+                let g = gid(face, ch);
+                let (sw, sh, sink) = swash_raster(&mut ts, face, g, true);
+                if sw == 0 || sh == 0 || sink == 0 {
+                    failures.push(format!("swash {label} gid={g} -> {sw}x{sh} ink={sink}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of the 190 checked glyphs produced no ink:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
     }
 }
 
