@@ -806,5 +806,66 @@ mod tests {
             failures.join("\n  ")
         );
     }
+
+    /// Every `ICON_*` constant in `crate::widgets` must name a codepoint the icon face
+    /// actually carries. A wrong codepoint is not a compile error and not a blank box
+    /// you can see — it renders `.notdef`, or nothing at all, so it has to be asserted.
+    #[test]
+    fn all_icon_constants_rasterize_with_ink() {
+        const ICONS: [(&str, &str); 26] = [
+            ("ICON_PLAY", crate::widgets::ICON_PLAY),
+            ("ICON_PAUSE", crate::widgets::ICON_PAUSE),
+            ("ICON_PREV", crate::widgets::ICON_PREV),
+            ("ICON_NEXT", crate::widgets::ICON_NEXT),
+            ("ICON_CHECK", crate::widgets::ICON_CHECK),
+            ("ICON_CLOSE", crate::widgets::ICON_CLOSE),
+            ("ICON_CHEVRON_DOWN", crate::widgets::ICON_CHEVRON_DOWN),
+            ("ICON_CHEVRON_UP", crate::widgets::ICON_CHEVRON_UP),
+            ("ICON_SEARCH", crate::widgets::ICON_SEARCH),
+            ("ICON_SETTINGS", crate::widgets::ICON_SETTINGS),
+            ("ICON_DARK_MODE", crate::widgets::ICON_DARK_MODE),
+            ("ICON_LIGHT_MODE", crate::widgets::ICON_LIGHT_MODE),
+            ("ICON_EQ", crate::widgets::ICON_EQ),
+            ("ICON_VOLUME", crate::widgets::ICON_VOLUME),
+            ("ICON_LOCK", crate::widgets::ICON_LOCK),
+            ("ICON_TUNE", crate::widgets::ICON_TUNE),
+            ("ICON_LOOP", crate::widgets::ICON_LOOP),
+            ("ICON_SHUFFLE", crate::widgets::ICON_SHUFFLE),
+            ("ICON_RESTART", crate::widgets::ICON_RESTART),
+            ("ICON_ADD", crate::widgets::ICON_ADD),
+            ("ICON_MENU", crate::widgets::ICON_MENU),
+            ("ICON_CHEVRON_RIGHT", crate::widgets::ICON_CHEVRON_RIGHT),
+            ("ICON_CHEVRON_LEFT", crate::widgets::ICON_CHEVRON_LEFT),
+            ("ICON_FOLDER", crate::widgets::ICON_FOLDER),
+            ("ICON_INFO", crate::widgets::ICON_INFO),
+            ("ICON_MORE_VERT", crate::widgets::ICON_MORE_VERT),
+        ];
+        let mut ts = TextSystem::new();
+        let mut failures = Vec::new();
+        for (name, icon) in ICONS {
+            let ch = icon.chars().next().unwrap_or('\u{0}');
+            let cp = ch as u32;
+            let g = gid(FontFace::Icons, ch);
+            if g == 0 {
+                failures.push(format!("{name}: U+{cp:04X} is not in the icon cmap (.notdef)"));
+                continue;
+            }
+            let shaped = ts.get_or_shape(FontFace::Icons, icon, PX).to_vec();
+            let shaped_gid = shaped.first().map(|x| x.0).unwrap_or(0);
+            let (wu, hu, ink_u) = swash_raster(&mut ts, FontFace::Icons, shaped_gid, false);
+            if g == 0 || shaped_gid == 0 || wu == 0 || hu == 0 || ink_u == 0 {
+                failures.push(format!(
+                    "{name}: U+{cp:04X} fd_gid={g} shaped_gid={shaped_gid} -> {wu}x{hu} ink={ink_u}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of the {} icon constants render blank:\n  {}",
+            failures.len(),
+            ICONS.len(),
+            failures.join("\n  ")
+        );
+    }
 }
 

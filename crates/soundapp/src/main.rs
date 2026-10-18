@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{ResizeDirection, Window, WindowId};
+use winit::window::{Window, WindowId};
 
 use audio::{Audio, PlaybackParams, Source};
 use audio::TrackMetadata;
@@ -2053,6 +2053,7 @@ impl App {
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
                     w.ui_state.cursor = (position.x as f32, position.y as f32);
+                    nui::update_resize_cursor(&w.window, w.ui_state.cursor, w.size);
                     w.window.request_redraw();
                 }
             }
@@ -2073,6 +2074,15 @@ impl App {
                     if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
                         match state {
                             ElementState::Pressed => {
+                                // The resize border wins over the header drag:
+                                // both live in the top-left corner region.
+                                if nui::try_start_window_resize(
+                                    &w.window,
+                                    w.ui_state.cursor,
+                                    w.size,
+                                ) {
+                                    return;
+                                }
                                 // Drag by the empty header area (left of the close button),
                                 // exactly like the primary window's undecorated header.
                                 let rem = 16.0 * w.window.scale_factor() as f32;
@@ -3111,6 +3121,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui_state.cursor = (position.x as f32, position.y as f32);
+                // Undecorated shell: show the native resize arrow over the 6px edge
+                // band (12px corners) so press and hover agree on what the drag does.
+                if let Some(w) = &self.window {
+                    nui::update_resize_cursor(w, self.ui_state.cursor, self.size);
+                }
                 // While playing with animation on, the 60fps `about_to_wait` timer already
                 // redraws every frame — only force a redraw here for immediate drag feedback
                 // (mouse held) or when the timer is idle, so a 1000Hz mouse cannot spike FPS.
@@ -3151,40 +3166,13 @@ impl ApplicationHandler for App {
                 match button {
                     MouseButton::Left => match state {
                         ElementState::Pressed => {
-                            let dpi = self
-                                .window
-                                .as_ref()
-                                .map(|w| w.scale_factor() as f32)
-                                .unwrap_or(1.0);
                             let (cw, ch) = (self.size.0 as f32, self.size.1 as f32);
-                            let (mx, my) = self.ui_state.cursor;
-                            let edge = 6.0 * dpi;
-                            // Undecorated window: dragging within 6 px of an edge or
-                            // corner resizes, like a native frame.
-                            let dir = if mx <= edge && my <= edge {
-                                Some(ResizeDirection::NorthWest)
-                            } else if mx >= cw - edge && my <= edge {
-                                Some(ResizeDirection::NorthEast)
-                            } else if mx <= edge && my >= ch - edge {
-                                Some(ResizeDirection::SouthWest)
-                            } else if mx >= cw - edge && my >= ch - edge {
-                                Some(ResizeDirection::SouthEast)
-                            } else if mx <= edge {
-                                Some(ResizeDirection::West)
-                            } else if mx >= cw - edge {
-                                Some(ResizeDirection::East)
-                            } else if my <= edge {
-                                Some(ResizeDirection::North)
-                            } else if my >= ch - edge {
-                                Some(ResizeDirection::South)
-                            } else {
-                                None
-                            };
-                            if let Some(dir) = dir {
-                                if let Some(w) = self.window.clone() {
-                                    nui::drag_resize_window_live(&w, dir);
+                            // Undecorated window: dragging within the 6 px edge band or
+                            // the 12 px corners resizes, like a native frame.
+                            if let Some(w) = self.window.clone() {
+                                if nui::try_start_window_resize(&w, self.ui_state.cursor, self.size) {
+                                    return;
                                 }
-                                return;
                             }
                             let scale = (cw / Self::WIDTH as f32)
                                 .min(ch / if self.show_controls {
@@ -3407,7 +3395,10 @@ impl ApplicationHandler for App {
             .unwrap_or(false);
         let pending_meta =
             self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
-        let animating = (playing && self.animate) || pending_meta;
+        // Widget transitions (hover fades, popups, dialogs) drive their own 60 fps
+        // window so they finish and then the loop drops back to `Wait` / 0% CPU.
+        let ui_anim = self.ui_state.is_animating() || self.secondary_windows.any_animating();
+        let animating = (playing && self.animate) || pending_meta || ui_anim;
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
@@ -3415,7 +3406,7 @@ impl ApplicationHandler for App {
             // progress bar and MM:SS text; full-rate only while a DSP window is up.
             let dsp_open = self.secondary_windows.is_visible("monitoring")
                 || self.secondary_windows.is_visible("mixer");
-            let frame_ms = if pending_meta || dsp_open {
+            let frame_ms = if pending_meta || dsp_open || ui_anim {
                 self.frame_ms
             } else {
                 66

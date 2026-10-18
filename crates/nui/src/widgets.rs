@@ -144,8 +144,8 @@ pub const ICON_CHEVRON_DOWN: &str = "\u{e5cf}";
 pub const ICON_CHEVRON_UP: &str = "\u{e5ce}";
 pub const ICON_SEARCH: &str = "\u{e8b6}";
 pub const ICON_SETTINGS: &str = "\u{e8b8}";
-pub const ICON_DARK_MODE: &str = "\u{e51c}";
-pub const ICON_LIGHT_MODE: &str = "\u{e518}";
+pub const ICON_DARK_MODE: &str = "\u{e3a7}"; // brightness_2 (crescent moon)
+pub const ICON_LIGHT_MODE: &str = "\u{e3e4}"; // flare (sun)
 pub const ICON_EQ: &str = "\u{e01d}";
 pub const ICON_VOLUME: &str = "\u{e050}";
 pub const ICON_LOCK: &str = "\u{e897}";
@@ -154,6 +154,67 @@ pub const ICON_LOOP: &str = "\u{e040}";
 pub const ICON_SHUFFLE: &str = "\u{e043}";
 pub const ICON_RESTART: &str = "\u{e042}";
 pub const ICON_ADD: &str = "\u{e145}";
+pub const ICON_MENU: &str = "\u{e5d2}";
+pub const ICON_CHEVRON_RIGHT: &str = "\u{e5cc}";
+pub const ICON_CHEVRON_LEFT: &str = "\u{e5cb}";
+pub const ICON_FOLDER: &str = "\u{e2c7}";
+pub const ICON_INFO: &str = "\u{e88e}";
+pub const ICON_MORE_VERT: &str = "\u{e5d4}";
+
+// ============================================================================
+// Interpolation helpers — every widget transition eases through these so hover,
+// press and popup motion share one timing vocabulary.
+// ============================================================================
+
+#[inline]
+pub fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+#[inline]
+pub fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    (
+        (a.0 as f32 + (b.0 as f32 - a.0 as f32) * t).round() as u8,
+        (a.1 as f32 + (b.1 as f32 - a.1 as f32) * t).round() as u8,
+        (a.2 as f32 + (b.2 as f32 - a.2 as f32) * t).round() as u8,
+        (a.3 as f32 + (b.3 as f32 - a.3 as f32) * t).round() as u8,
+    )
+}
+
+#[inline]
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Scale a colour's alpha channel. Used for every popup/dialog fade: `lerp_color`
+/// moves the RGB channels too, which is wrong when only the *opacity* should change.
+#[inline]
+pub fn scale_alpha(c: Color, factor: f32) -> Color {
+    (c.0, c.1, c.2, (c.3 as f32 * factor.clamp(0.0, 1.0)).round() as u8)
+}
+
+/// Snappy deceleration curve matching `nui-theme.css` `cubic-bezier(0.1, 0.9, 0.2, 1.0)`:
+/// fast initial velocity with a smooth, zero-overshoot settle.
+#[inline]
+pub fn ease_out_snappy(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(4)
+}
+
+/// Strong symmetric ease-in-out S-curve (quartic `easeInOut`):
+/// crisp acceleration into a fast middle and smooth settle at both ends,
+/// identical in both forward (`0 -> 1`) and reverse (`1 -> 0`) directions.
+#[inline]
+pub fn ease_in_out_strong(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        8.0 * t * t * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(4) * 0.5
+    }
+}
 
 /// Exact nui_wc2 v3.0.0 "slate" theme tokens (NUI/css/nui-theme.css)
 #[derive(Clone, Copy, Debug)]
@@ -417,6 +478,53 @@ pub enum BadgeVariant {
     Danger,
 }
 
+/// One row of a `nui-menu-dropdown` / `nui-context-menu`.
+#[derive(Clone, Debug)]
+pub enum MenuItem<'a> {
+    Action {
+        label: &'a str,
+        icon: &'a str,
+        shortcut: &'a str,
+        action: &'a str,
+        disabled: bool,
+        checked: Option<bool>,
+    },
+    Separator,
+    Submenu {
+        label: &'a str,
+        icon: &'a str,
+        items: &'a [MenuItem<'a>],
+        disabled: bool,
+    },
+}
+
+/// A top-level `.nui-menu-bar` item and the dropdown it owns.
+#[derive(Clone, Debug)]
+pub struct MenuBarEntry<'a> {
+    pub label: &'a str,
+    pub items: &'a [MenuItem<'a>],
+}
+
+/// One row of an `nui-link-list[mode="fold"]`: a collapsible group, a navigable
+/// item, or a hairline separator.
+#[derive(Clone, Debug)]
+pub enum LinkListEntry<'a> {
+    Group {
+        id: u32,
+        label: &'a str,
+        icon: &'a str,
+        expanded: bool,
+        items: &'a [LinkListEntry<'a>],
+    },
+    Item {
+        key: &'a str,
+        label: &'a str,
+        icon: &'a str,
+        badge: &'a str,
+    },
+    Separator,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyCmd {
     Backspace,
@@ -473,6 +581,29 @@ pub struct UiState {
     pub hovered_file: Option<std::path::PathBuf>,
     pub dropped_files: Vec<std::path::PathBuf>,
 
+    // Frame clock: `dt` (seconds) is measured in `begin_frame` and every widget
+    // transition advances from it, so the whole UI animates in lockstep and the
+    // host can idle the repaint loop as soon as `animating` goes false.
+    pub anim_values: Vec<(u32, f32)>,
+    pub f32_anims: Vec<(u32, f32, f32, f32)>,
+    pub flash_values: Vec<(u32, f32)>,
+    pub animating: bool,
+    pub dt: f32,
+    last_frame_time: Option<std::time::Instant>,
+
+    // Right-click menus: where the last one opened, and the submenu flyout that is
+    // currently hovered as `(menu_id, row index)`.
+    pub context_menu_pos: (f32, f32),
+    pub active_submenu: Option<(u32, usize)>,
+
+    // True while a modal (`dialog`) is drawing its own widgets. The popup rect blocks
+    // hover for everything behind the modal, but the modal's own controls must stay live.
+    pub inside_popup: bool,
+
+    // Id of the modal that currently owns the popup slot. Without it a dialog cannot
+    // tell "dismissed last frame" from "opened this frame" — both look like an empty slot.
+    pub modal_id: Option<u32>,
+
     last_click_time: std::time::Instant,
     last_click_pos: (f32, f32),
 }
@@ -503,6 +634,16 @@ impl UiState {
             focus_visible: false,
             hovered_file: None,
             dropped_files: Vec::new(),
+            anim_values: Vec::new(),
+            f32_anims: Vec::new(),
+            flash_values: Vec::new(),
+            animating: false,
+            dt: 1.0 / 60.0,
+            last_frame_time: None,
+            context_menu_pos: (-1000.0, -1000.0),
+            active_submenu: None,
+            inside_popup: false,
+            modal_id: None,
             last_click_time: std::time::Instant::now(),
             last_click_pos: (-1000.0, -1000.0),
         }
@@ -532,8 +673,14 @@ impl UiState {
     pub fn begin_frame(&mut self) {
         self.hovered_id = None;
         self.focus_order.clear();
-        // If a popup is open and the user clicks outside both the popup and its trigger,
-        // we close the popup at the end of the frame if nothing claimed it.
+        self.inside_popup = false;
+        let now = std::time::Instant::now();
+        self.dt = match self.last_frame_time {
+            Some(prev) => now.duration_since(prev).as_secs_f32().clamp(0.001, 0.05),
+            None => 1.0 / 60.0,
+        };
+        self.last_frame_time = Some(now);
+        self.animating = false;
     }
 
     pub fn end_frame(&mut self) {
@@ -564,12 +711,15 @@ impl UiState {
             };
             self.focused_id = Some(self.focus_order[next]);
         }
+        // If a popup is open and the user clicks outside both the popup and its trigger,
+        // we close the popup at the end of the frame if nothing claimed it.
         if self.mouse_pressed {
             if let (Some(_), Some(pr)) = (self.open_popup_id, self.popup_rect) {
                 if !pr.contains(self.cursor.0, self.cursor.1) && self.active_id != self.open_popup_id
                 {
                     self.open_popup_id = None;
                     self.popup_rect = None;
+                    self.active_submenu = None;
                 }
             }
         }
@@ -588,6 +738,10 @@ impl UiState {
     #[inline]
     pub fn can_hover(&self, id: u32, r: Rect) -> bool {
         if !r.contains(self.cursor.0, self.cursor.1) {
+            return false;
+        }
+        // While a modal dialog is open, block all background widgets outside the modal pass.
+        if self.modal_id.is_some() && !self.inside_popup {
             return false;
         }
         // If a popup is open, block hover/click on underlying widgets inside the popup's rect
@@ -625,6 +779,94 @@ impl UiState {
         if !self.focus_order.contains(&id) {
             self.focus_order.push(id);
         }
+    }
+
+    /// `true` while at least one widget transition started this frame is still in flight.
+    #[inline]
+    pub fn is_animating(&self) -> bool {
+        self.animating
+    }
+
+    /// Ease a boolean toward `target` over `duration_s` using a strong `easeInOut` S-curve,
+    /// returning the eased `0.0..=1.0` value. Linear progress is stepped by `dt / duration_s`
+    /// so both `false -> true` and `true -> false` take the exact `duration_s` with symmetric easing.
+    pub fn animate_bool(&mut self, key: u32, target: bool, duration_s: f32) -> f32 {
+        let target_f = if target { 1.0 } else { 0.0 };
+        let idx = match self.anim_values.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                self.anim_values.push((key, target_f));
+                return target_f;
+            }
+        };
+        let step = self.dt / duration_s.max(0.001);
+        let cur = &mut self.anim_values[idx].1;
+        if target {
+            *cur = (*cur + step).min(1.0);
+        } else {
+            *cur = (*cur - step).max(0.0);
+        }
+        if (*cur - target_f).abs() > 1e-4 {
+            self.animating = true;
+        }
+        ease_in_out_strong(*cur)
+    }
+
+    /// Interpolate a continuous `f32` toward `target` over `duration_s` using `ease_in_out_strong`.
+    /// Whenever `target` changes, the transition retargets smoothly from its current eased value.
+    pub fn animate_f32(&mut self, key: u32, target: f32, duration_s: f32) -> f32 {
+        let idx = match self.f32_anims.iter().position(|(k, _, _, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                self.f32_anims.push((key, target, target, 1.0));
+                return target;
+            }
+        };
+        let (_, start, prev_target, t) = self.f32_anims[idx];
+        let cur_val = lerp_f32(start, prev_target, ease_in_out_strong(t));
+        if (target - prev_target).abs() > 0.5 {
+            self.f32_anims[idx] = (key, cur_val, target, 0.0);
+        }
+        let step = self.dt / duration_s.max(0.001);
+        let entry = &mut self.f32_anims[idx];
+        entry.3 = (entry.3 + step).min(1.0);
+        if entry.3 < 1.0 {
+            self.animating = true;
+            lerp_f32(entry.1, entry.2, ease_in_out_strong(entry.3))
+        } else {
+            entry.1 = entry.2;
+            entry.2
+        }
+    }
+
+    /// Snappy `0.10s` press/click flash (`1.0` while held or on the click frame, then 100ms fade-out).
+    pub fn flash_alpha(&mut self, id: u32, held: bool, clicked: bool) -> f32 {
+        if held || clicked {
+            let idx = match self.flash_values.iter().position(|(k, _)| *k == id) {
+                Some(i) => i,
+                None => {
+                    self.flash_values.push((id, 1.0));
+                    self.animating = true;
+                    return 1.0;
+                }
+            };
+            self.flash_values[idx].1 = 1.0;
+            self.animating = true;
+            return 1.0;
+        }
+        let dt = self.dt;
+        let idx = match self.flash_values.iter().position(|(k, _)| *k == id) {
+            Some(i) => i,
+            None => return 0.0,
+        };
+        if self.flash_values[idx].1 <= 0.0 {
+            return 0.0;
+        }
+        self.flash_values[idx].1 = (self.flash_values[idx].1 - dt / 0.10).max(0.0);
+        if self.flash_values[idx].1 > 0.001 {
+            self.animating = true;
+        }
+        ease_out_cubic(self.flash_values[idx].1)
     }
 }
 
@@ -741,7 +983,7 @@ impl<'a> Ui<'a> {
         // `--nui-space-quarter` gap between tabs.
         let fs = t.font_base();
         let icon_sz = (t.rem * 1.08).round();
-        let pad_x = t.space();
+        let pad_x = (t.rem * 0.8).round();
         let gap = t.space_quarter();
 
         // Bottom border line across full tablist width
@@ -750,6 +992,8 @@ impl<'a> Ui<'a> {
         let mut tx = r.x;
         let cy = r.y + (r.h - 2.0) * 0.5;
         let baseline = (cy + fs * 0.33).round();
+        let mut sel_x = 0.0f32;
+        let mut sel_w = 0.0f32;
 
         self.scene.push_clip(r.x, r.y, r.w, r.h);
         for (i, &(icon, label)) in labels.iter().enumerate() {
@@ -778,26 +1022,30 @@ impl<'a> Ui<'a> {
             }
 
             let is_selected = *active == i;
-            if hovered && !is_selected {
+            let sel_t = self
+                .state
+                .animate_bool(id ^ 0x3400_0000, is_selected, 0.30);
+            let hov_t = self
+                .state
+                .animate_bool(id ^ 0x3300_0000, hovered && !is_selected, 0.15);
+            if hov_t > 0.01 {
                 self.scene.rounded_rect(
                     tab_r.x,
                     tab_r.y + 2.0,
                     tab_r.w,
                     tab_r.h - 3.0,
                     t.radius1(),
-                    t.shade2,
+                    lerp_color((t.shade2.0, t.shade2.1, t.shade2.2, 0), t.shade2, hov_t),
                     (0, 0, 0, 0),
                     0.0,
                 );
             }
 
-            let fg = if is_selected {
-                t.highlight
-            } else if hovered {
-                t.text
-            } else {
-                t.text_dim
-            };
+            let fg = lerp_color(
+                lerp_color(t.text_dim, t.text, hov_t),
+                t.highlight,
+                sel_t,
+            );
 
             let mut cx = tab_r.x + pad_x;
             if !icon.is_empty() {
@@ -813,7 +1061,7 @@ impl<'a> Ui<'a> {
             }
             self.scene.text(
                 self.text_sys,
-                if is_selected {
+                if sel_t > 0.5 {
                     FontFace::SemiBold
                 } else {
                     FontFace::Regular
@@ -827,18 +1075,28 @@ impl<'a> Ui<'a> {
             );
 
             if is_selected {
-                self.scene
-                    .rect(tab_r.x, tab_r.y + tab_r.h - 2.0, tab_r.w, 2.0, t.highlight);
+                sel_x = tab_r.x;
+                sel_w = tab_r.w;
             }
 
             tx += tab_w + gap;
         }
         self.scene.pop_clip();
+
+        // One animated 2px indicator that slides/morphs between tabs over 0.30s with strong easeInOut.
+        let ind_x = self.state.animate_f32(base_id ^ 0x3100_0000, sel_x, 0.30);
+        let ind_w = self.state.animate_f32(base_id ^ 0x3200_0000, sel_w, 0.30);
+        if ind_w > 0.5 {
+            self.scene
+                .rect(ind_x.round(), r.y + r.h - 2.0, ind_w.round(), 2.0, t.highlight);
+        }
         changed
     }
 
-    /// `nui-button` (Primary, Outline, Ghost, Danger, Success).
-    /// Matches nui-theme.css: uppercase xsmall text, border-radius1, highlight-dim -> highlight hover.
+    /// `nui-button` (Primary, Outline, Ghost, Danger, Success). Matches the `nui-select`
+    /// control treatment: `border-radius2`, drop shadow, `highlight-dim -> highlight`
+    /// hover eased over 0.15s (`transition: background-color 0.15s ease`) and a 0.50s
+    /// white click flash.
     pub fn button(
         &mut self,
         id: u32,
@@ -859,57 +1117,75 @@ impl<'a> Ui<'a> {
         }
         let active = self.state.active_id == Some(id);
         let clicked = hovered && self.state.mouse_released && active;
+        let rad = t.radius2();
+        let hov_t = self.state.animate_bool(id ^ 0x1100_0000, hovered, 0.15);
 
         let (bg, border, border_w, fg) = match variant {
-            ButtonVariant::Primary => {
-                let bg = if hovered { t.highlight } else { t.highlight_dim };
-                (bg, rgba(255, 255, 255, 32), 1.0, rgb(255, 255, 255))
-            }
+            ButtonVariant::Primary => (
+                lerp_color(t.highlight_dim, t.highlight, hov_t),
+                lerp_color(rgba(255, 255, 255, 34), rgba(255, 255, 255, 68), hov_t),
+                1.0,
+                rgb(255, 255, 255),
+            ),
             ButtonVariant::Outline => {
-                if hovered {
-                    (t.palette_gray, t.palette_gray, 1.0, rgb(255, 255, 255))
-                } else {
-                    ((0, 0, 0, 0), t.palette_gray, 1.0, t.text_dim)
-                }
+                let rest_bg = if t.dark { t.shade3 } else { t.base };
+                let hov_bg = if t.dark { t.shade4 } else { t.shade2 };
+                (
+                    lerp_color(rest_bg, hov_bg, hov_t),
+                    lerp_color(t.shade4, t.shade5, hov_t),
+                    1.0,
+                    lerp_color(t.text_dim, t.text, hov_t),
+                )
             }
-            ButtonVariant::Ghost => {
-                if hovered {
-                    (t.shade3, (0, 0, 0, 0), 0.0, t.text)
-                } else {
-                    ((0, 0, 0, 0), (0, 0, 0, 0), 0.0, t.text_dim)
-                }
-            }
-            ButtonVariant::Danger => {
-                let bg = if hovered {
-                    t.palette_alert_hi
-                } else {
-                    t.palette_alert
-                };
-                (bg, rgba(255, 255, 255, 32), 1.0, rgb(255, 255, 255))
-            }
-            ButtonVariant::Success => {
-                let bg = if hovered {
-                    t.palette_activate_hi
-                } else {
-                    t.palette_activate
-                };
-                (bg, rgba(255, 255, 255, 32), 1.0, rgb(255, 255, 255))
-            }
+            ButtonVariant::Ghost => (
+                lerp_color((t.shade3.0, t.shade3.1, t.shade3.2, 0), t.shade3, hov_t),
+                (0, 0, 0, 0),
+                0.0,
+                lerp_color(t.text_dim, t.text, hov_t),
+            ),
+            ButtonVariant::Danger => (
+                lerp_color(t.palette_alert, t.palette_alert_hi, hov_t),
+                rgba(255, 255, 255, 38),
+                1.0,
+                rgb(255, 255, 255),
+            ),
+            ButtonVariant::Success => (
+                lerp_color(t.palette_activate, t.palette_activate_hi, hov_t),
+                rgba(255, 255, 255, 38),
+                1.0,
+                rgb(255, 255, 255),
+            ),
         };
 
+        // Soft drop shadow under every filled variant (Ghost is flat by design).
+        if variant != ButtonVariant::Ghost {
+            self.scene.shadow(
+                r.x,
+                r.y + 1.0,
+                r.w,
+                r.h,
+                rad,
+                3.5,
+                rgba(0, 0, 0, if t.dark { 52 } else { 16 }),
+            );
+        }
         if bg.3 > 0 || border_w > 0.0 {
             self.scene
-                .rounded_rect(r.x, r.y, r.w, r.h, t.radius1(), bg, border, border_w);
+                .rounded_rect(r.x, r.y, r.w, r.h, rad, bg, border, border_w);
         }
-        // Active click white flash (`nui-button button:active::after { opacity: 0.2 }`)
-        if active && self.state.mouse_down {
+
+        // Press/click flash: full-strength while held, then a 0.50s fade-out.
+        let flash = self
+            .state
+            .flash_alpha(id, active && self.state.mouse_down, clicked);
+        if flash > 0.01 {
             self.scene.rounded_rect(
                 r.x,
                 r.y,
                 r.w,
                 r.h,
-                t.radius1(),
-                rgba(255, 255, 255, 48),
+                rad,
+                rgba(255, 255, 255, (52.0 * flash).round() as u8),
                 (0, 0, 0, 0),
                 0.0,
             );
@@ -917,7 +1193,8 @@ impl<'a> Ui<'a> {
 
         let upper = label.to_uppercase();
         let fs = t.font_xsmall();
-        let icon_sz = (t.rem * 1.12).round();
+        let icon_sz = (fs * 1.2).round();
+        let gap = (t.rem * 0.375).round();
         let text_w = if upper.is_empty() {
             0.0
         } else {
@@ -929,7 +1206,7 @@ impl<'a> Ui<'a> {
         } else if upper.is_empty() {
             icon_sz
         } else {
-            icon_sz + (t.rem * 0.35).round()
+            icon_sz + gap
         };
         let total_w = icon_w + text_w;
         let mut cx = r.x + (r.w - total_w) * 0.5;
@@ -961,7 +1238,7 @@ impl<'a> Ui<'a> {
             );
         }
         self.scene.pop_clip();
-        self.draw_focus_ring(id, r, t.radius1());
+        self.draw_focus_ring(id, r, rad);
         clicked
     }
 
@@ -986,8 +1263,11 @@ impl<'a> Ui<'a> {
         let baseline = (cy + fs * 0.355).round();
 
         // Outer container fill + 1px border (active segment paints over its section of the border)
+        let rad = t.radius2();
         self.scene
-            .rounded_rect(r.x, r.y, r.w, r.h, t.radius1(), t.base, t.shade3, 1.0);
+            .shadow(r.x, r.y + 1.0, r.w, r.h, rad, 3.5, rgba(0, 0, 0, if t.dark { 52 } else { 16 }));
+        self.scene
+            .rounded_rect(r.x, r.y, r.w, r.h, rad, t.base, t.shade4, 1.0);
 
         for (i, &opt) in options.iter().enumerate() {
             let id = base_id + i as u32;
@@ -1007,13 +1287,14 @@ impl<'a> Ui<'a> {
             }
 
             let is_active = *selected == i;
+            let hov_t = self.state.animate_bool(id ^ 0x1300_0000, hovered, 0.15);
             if is_active {
                 self.scene.rounded_rect(
                     sr.x,
                     sr.y,
                     sr.w,
                     sr.h,
-                    if i == 0 || i + 1 == n { t.radius1() } else { 0.0 },
+                    if i == 0 || i + 1 == n { rad } else { 0.0 },
                     t.highlight,
                     (0, 0, 0, 0),
                     0.0,
@@ -1021,19 +1302,39 @@ impl<'a> Ui<'a> {
                 // Keep inner seam square when first or last segment is active
                 if i == 0 && n > 1 {
                     self.scene
-                        .rect(sr.x + sr.w - t.radius1(), sr.y, t.radius1(), sr.h, t.highlight);
+                        .rect(sr.x + sr.w - rad, sr.y, rad, sr.h, t.highlight);
                 } else if i + 1 == n && n > 1 {
-                    self.scene
-                        .rect(sr.x, sr.y, t.radius1(), sr.h, t.highlight);
+                    self.scene.rect(sr.x, sr.y, rad, sr.h, t.highlight);
                 }
-            } else if hovered {
-                self.scene
-                    .rect(sr.x + 1.0, sr.y + 1.0, sr.w - 2.0, sr.h - 2.0, t.shade2);
+            } else if hov_t > 0.01 {
+                self.scene.rect(
+                    sr.x + 1.0,
+                    sr.y + 1.0,
+                    sr.w - 2.0,
+                    sr.h - 2.0,
+                    lerp_color(t.base, t.shade2, hov_t),
+                );
             }
 
             if i + 1 < n && !is_active && *selected != i + 1 {
                 self.scene
                     .rect(sr.x + sr.w - 1.0, sr.y + 1.0, 1.0, sr.h - 2.0, t.shade3);
+            }
+
+            let active = self.state.active_id == Some(id);
+            let flash = self.state.flash_alpha(
+                id,
+                active && self.state.mouse_down,
+                hovered && self.state.mouse_released && active,
+            );
+            if flash > 0.01 {
+                self.scene.rect(
+                    sr.x + 1.0,
+                    sr.y + 1.0,
+                    sr.w - 2.0,
+                    sr.h - 2.0,
+                    rgba(255, 255, 255, (56.0 * flash).round() as u8),
+                );
             }
 
             let upper = opt.to_uppercase();
@@ -1084,25 +1385,24 @@ impl<'a> Ui<'a> {
 
         let cy = r.y + r.h * 0.5;
         let by = (cy - box_sz * 0.5).round();
-        let (bg, border_col) = if *checked {
-            (t.highlight, t.highlight)
-        } else if hovered {
-            (t.base, t.highlight)
-        } else {
-            (t.base, t.shade4)
-        };
+        // Box fill/border colour settles over 0.25s; the tick itself pops in over 0.12s.
+        let box_t = self.state.animate_bool(id ^ 0x5100_0000, *checked, 0.25);
+        let chk_t = self.state.animate_bool(id ^ 0x5300_0000, *checked, 0.12);
+        let hov_t = self.state.animate_bool(id ^ 0x5200_0000, hovered, 0.15);
+        let bg = lerp_color(t.base, t.highlight, box_t);
+        let border_col = lerp_color(lerp_color(t.shade4, t.highlight, hov_t), t.highlight, box_t);
         self.scene
             .rounded_rect(r.x.round(), by, box_sz, box_sz, 3.0, bg, border_col, 2.0);
 
-        if *checked {
-            let icon_sz = (box_sz * 0.85).round();
+        if chk_t > 0.01 {
+            let icon_sz = (box_sz * 0.85 * (0.4 + 0.6 * chk_t)).round();
             self.scene.icon_centered(
                 self.text_sys,
                 ICON_CHECK,
                 r.x.round() + box_sz * 0.5,
                 by + box_sz * 0.5,
                 icon_sz,
-                rgb(255, 255, 255),
+                rgba(255, 255, 255, (255.0 * chk_t).round() as u8),
             );
         }
 
@@ -1115,7 +1415,7 @@ impl<'a> Ui<'a> {
             (cy + fs * 0.33).round(),
             fs,
             (r.x + r.w - ltx).max(0.0),
-            if hovered { t.text } else { t.text_dim },
+            lerp_color(t.text_dim, t.text, hov_t),
         );
         self.draw_focus_ring(id, r, t.radius1());
         changed
@@ -1125,8 +1425,8 @@ impl<'a> Ui<'a> {
     pub fn switch(&mut self, id: u32, r: Rect, label: &str, on: &mut bool) -> bool {
         let t = self.theme;
         self.state.register_focusable(id);
-        let sw_h = (t.rem * 1.24).round();
-        let sw_w = (sw_h * 1.82).round();
+        let sw_h = (t.rem * 1.25).round();
+        let sw_w = (sw_h * 1.8).round();
         let fs = t.font_small();
         let hovered = self.state.can_hover(id, r);
         let mut changed = false;
@@ -1143,13 +1443,9 @@ impl<'a> Ui<'a> {
 
         let cy = r.y + r.h * 0.5;
         let sy = (cy - sw_h * 0.5).round();
-        let track_col = if *on {
-            t.highlight
-        } else if hovered {
-            t.shade5
-        } else {
-            t.shade4
-        };
+        let on_t = self.state.animate_bool(id ^ 0x4100_0000, *on, 0.30);
+        let hov_t = self.state.animate_bool(id ^ 0x4200_0000, hovered, 0.15);
+        let track_col = lerp_color(lerp_color(t.shade4, t.shade5, hov_t), t.highlight, on_t);
         self.scene.rounded_rect(
             r.x.round(),
             sy,
@@ -1163,24 +1459,24 @@ impl<'a> Ui<'a> {
 
         let pad = (sw_h * 0.16).round().max(2.0);
         let thumb_d = sw_h - pad * 2.0;
-        let thumb_x = if *on {
-            r.x.round() + sw_w - pad - thumb_d
-        } else {
-            r.x.round() + pad
-        };
+        // The thumb elongates at mid-flight (peak stretch when `on_t = 0.5`), which is
+        // what gives the toggle its "flipped" feel instead of a plain slide.
+        let thumb_w = thumb_d + (1.0 - (2.0 * on_t - 1.0).abs()) * (t.rem * 0.22);
+        let thumb_x =
+            (r.x.round() + pad + on_t * (sw_w - pad * 2.0 - thumb_d)).round();
         self.scene.shadow(
             thumb_x,
             sy + pad + 1.0,
-            thumb_d,
+            thumb_w,
             thumb_d,
             thumb_d * 0.5,
-            3.0,
-            rgba(0, 0, 0, 70),
+            2.5,
+            rgba(0, 0, 0, if t.dark { 55 } else { 22 }),
         );
         self.scene.rounded_rect(
             thumb_x,
             sy + pad,
-            thumb_d,
+            thumb_w,
             thumb_d,
             thumb_d * 0.5,
             rgb(255, 255, 255),
@@ -1197,7 +1493,7 @@ impl<'a> Ui<'a> {
             (cy + fs * 0.33).round(),
             fs,
             (r.x + r.w - ltx).max(0.0),
-            if hovered { t.text } else { t.text_dim },
+            lerp_color(t.text_dim, t.text, hov_t),
         );
         self.draw_focus_ring(id, r, t.radius1());
         changed
@@ -1207,6 +1503,7 @@ impl<'a> Ui<'a> {
     /// `0.5rem` inner `highlight` dot when selected.
     pub fn radio(&mut self, id: u32, r: Rect, label: &str, selected: bool) -> bool {
         let t = self.theme;
+        self.state.register_focusable(id);
         // Ensure even integer diameter so center dot aligns cleanly
         let mut d = (t.rem * 1.22).round() as i32;
         if d % 2 != 0 {
@@ -1229,31 +1526,29 @@ impl<'a> Ui<'a> {
         let cy = r.y + r.h * 0.5;
         let rx = r.x.round();
         let ry = (cy - d * 0.5).round();
-        let border_col = if selected || hovered {
-            t.highlight
-        } else {
-            t.shade4
-        };
+        let sel_t = self.state.animate_bool(id ^ 0x6100_0000, selected, 0.25);
+        let hov_t = self.state.animate_bool(id ^ 0x6200_0000, hovered, 0.15);
+        let border_col = lerp_color(t.shade4, t.highlight, hov_t.max(sel_t));
         self.scene
             .rounded_rect(rx, ry, d, d, d * 0.5, t.base, border_col, 2.0);
 
-        if selected {
-            let mut dot_d = (d * 0.44).round() as i32;
-            if dot_d % 2 != 0 {
-                dot_d += 1;
+        if sel_t > 0.01 {
+            // `transform: scale(0) -> scale(1)` — the dot grows from nothing rather
+            // than popping in at a fixed size.
+            let dot_d = ((d * 0.44).round() * sel_t).round();
+            if dot_d >= 1.0 {
+                let off = (d - dot_d) * 0.5;
+                self.scene.rounded_rect(
+                    rx + off,
+                    ry + off,
+                    dot_d,
+                    dot_d,
+                    dot_d * 0.5,
+                    t.highlight,
+                    (0, 0, 0, 0),
+                    0.0,
+                );
             }
-            let dot_d = dot_d as f32;
-            let off = (d - dot_d) * 0.5;
-            self.scene.rounded_rect(
-                rx + off,
-                ry + off,
-                dot_d,
-                dot_d,
-                dot_d * 0.5,
-                t.highlight,
-                (0, 0, 0, 0),
-                0.0,
-            );
         }
 
         let ltx = (rx + d + t.rem * 0.55).round();
@@ -1265,8 +1560,9 @@ impl<'a> Ui<'a> {
             (cy + fs * 0.33).round(),
             fs,
             (r.x + r.w - ltx).max(0.0),
-            if hovered || selected { t.text } else { t.text_dim },
+            lerp_color(t.text_dim, t.text, hov_t.max(sel_t)),
         );
+        self.draw_focus_ring(id, r, t.radius1());
         clicked
     }
 
@@ -1426,8 +1722,8 @@ impl<'a> Ui<'a> {
             thumb_d,
             thumb_d,
             thumb_d * 0.5,
-            4.0,
-            rgba(0, 0, 0, 90),
+            3.0,
+            rgba(0, 0, 0, if t.dark { 60 } else { 24 }),
         );
         self.scene.rounded_rect(
             tx,
@@ -1648,8 +1944,8 @@ impl<'a> Ui<'a> {
             r.w,
             r.h,
             t.radius1(),
-            if focused { 6.0 } else { 3.5 },
-            rgba(0, 0, 0, if t.dark { 55 } else { 25 }),
+            if focused { 4.5 } else { 3.0 },
+            rgba(0, 0, 0, if t.dark { 42 } else { 14 }),
         );
         let bg = if focused && t.dark {
             t.shade3
@@ -1841,20 +2137,18 @@ impl<'a> Ui<'a> {
         }
 
         let is_open = self.state.open_popup_id == Some(id);
-        let bg = if is_open {
-            t.shade3
-        } else if hovered {
-            if t.dark { t.shade4 } else { t.shade2 }
-        } else if t.dark {
-            t.shade3
-        } else {
-            t.base
-        };
-        let border_col = if is_open || hovered {
-            t.shade5
-        } else {
-            t.shade4
-        };
+        // One call, one advance: `animate_bool` steps its value by `dt`, so asking twice
+        // in a frame would move the transition at double speed.
+        let hov_t = self
+            .state
+            .animate_bool(id ^ 0x1200_0000, hovered || is_open, 0.15);
+        let open_t = self.state.animate_bool(id ^ 0x2200_0000, is_open, 0.30);
+        // `nui-select.is-open .nui-select-arrow { transform: rotate(180deg); }`
+        let chev_t = self.state.animate_bool(id ^ 0x2300_0000, is_open, 0.30);
+        let rest_bg = if t.dark { t.shade3 } else { t.base };
+        let hov_bg = if t.dark { t.shade4 } else { t.shade2 };
+        let bg = lerp_color(rest_bg, hov_bg, hov_t);
+        let border_col = lerp_color(t.shade4, t.shade5, hov_t);
 
         let rad = t.radius2();
         self.scene.shadow(
@@ -1863,8 +2157,8 @@ impl<'a> Ui<'a> {
             r.w,
             r.h,
             rad,
-            4.5,
-            rgba(0, 0, 0, if t.dark { 75 } else { 30 }),
+            3.5,
+            rgba(0, 0, 0, if t.dark { 52 } else { 16 }),
         );
         if is_open {
             // `border-radius: r r 0 0` via clip
@@ -1896,66 +2190,80 @@ impl<'a> Ui<'a> {
         );
         self.scene.pop_clip();
 
-        self.scene.icon_centered(
-            self.text_sys,
-            if is_open {
-                ICON_CHEVRON_UP
-            } else {
-                ICON_CHEVRON_DOWN
-            },
+        self.draw_chevron_rotated(
             r.x + r.w - pad_x - arrow_sz * 0.35,
             cy,
-            arrow_sz,
-            t.shade5,
+            (t.rem * 0.28).round().max(3.5),
+            1.8,
+            chev_t * std::f32::consts::PI,
+            t.shade6,
         );
 
         // Render top-layer popup in Scene's overlay pass so it paints above all page widgets
-        if is_open {
+        if is_open || open_t > 0.01 {
             // Option rows: `padding: var(--nui-space-half) var(--nui-space)` -> 2.25rem.
             let row_h = (t.rem * 2.25).round();
             let pop_h = row_h * options.len() as f32 + 2.0;
             let pop_r = Rect::new(r.x, r.y + r.h, r.w, pop_h);
-            self.state.popup_rect = Some(pop_r);
+            if is_open {
+                self.state.popup_rect = Some(pop_r);
+            }
+            let view_r = Rect::new(
+                pop_r.x,
+                pop_r.y + (1.0 - open_t) * -3.0,
+                pop_r.w,
+                (pop_h * (0.35 + 0.65 * open_t)).round(),
+            );
 
             self.scene.begin_overlay();
 
             // Rich soft SDF drop shadow + popup surface (`nui-select-popup` with `border-radius: 0 0 r r`)
             self.scene.shadow(
-                pop_r.x,
-                pop_r.y + 4.0,
-                pop_r.w,
-                pop_r.h,
+                view_r.x,
+                view_r.y + 3.0,
+                view_r.w,
+                view_r.h,
                 rad,
-                10.0,
-                rgba(0, 0, 0, if t.dark { 130 } else { 55 }),
+                8.0,
+                scale_alpha(rgba(0, 0, 0, if t.dark { 85 } else { 26 }), open_t),
             );
-            let pop_bg = if t.dark { t.shade2 } else { t.base };
-            self.scene.push_clip(pop_r.x, pop_r.y, pop_r.w, pop_r.h);
+            let pop_bg = scale_alpha(if t.dark { t.shade2 } else { t.base }, open_t);
+            self.scene
+                .push_clip(view_r.x, view_r.y, view_r.w, view_r.h);
             self.scene.rounded_rect(
-                pop_r.x,
-                pop_r.y - rad,
-                pop_r.w,
-                pop_r.h + rad,
+                view_r.x,
+                view_r.y - rad,
+                view_r.w,
+                view_r.h + rad,
                 rad,
                 pop_bg,
-                border_col,
+                scale_alpha(border_col, open_t),
                 1.0,
             );
             self.scene.pop_clip();
             // 1px separator line between trigger and popup
-            self.scene
-                .rect(pop_r.x + 1.0, pop_r.y, pop_r.w - 2.0, 1.0, t.shade3);
+            self.scene.rect(
+                view_r.x + 1.0,
+                view_r.y,
+                view_r.w - 2.0,
+                1.0,
+                scale_alpha(t.shade3, open_t),
+            );
 
-            self.scene
-                .push_clip(pop_r.x + 1.0, pop_r.y + 1.0, pop_r.w - 2.0, pop_r.h - 2.0);
+            self.scene.push_clip(
+                view_r.x + 1.0,
+                view_r.y + 1.0,
+                view_r.w - 2.0,
+                (view_r.h - 2.0).max(1.0),
+            );
             for (i, &opt) in options.iter().enumerate() {
                 let opt_r = Rect::new(
-                    pop_r.x + 1.0,
-                    pop_r.y + 1.0 + i as f32 * row_h,
-                    pop_r.w - 2.0,
+                    view_r.x + 1.0,
+                    view_r.y + 1.0 + i as f32 * row_h,
+                    view_r.w - 2.0,
                     row_h,
                 );
-                let opt_hov = opt_r.contains(self.state.cursor.0, self.state.cursor.1);
+                let opt_hov = is_open && opt_r.contains(self.state.cursor.0, self.state.cursor.1);
                 let is_sel = *selected == i;
 
                 if opt_hov {
@@ -1972,23 +2280,27 @@ impl<'a> Ui<'a> {
 
                 if opt_hov {
                     self.scene
-                        .rect(opt_r.x, opt_r.y, opt_r.w, opt_r.h, t.shade4);
+                        .rect(opt_r.x, opt_r.y, opt_r.w, opt_r.h, scale_alpha(t.shade4, open_t));
                 } else if is_sel {
                     let sel_bg = if t.dark {
                         rgb(50, 50, 50)
                     } else {
                         t.highlight_dim
                     };
-                    self.scene.rect(opt_r.x, opt_r.y, opt_r.w, opt_r.h, sel_bg);
+                    self.scene
+                        .rect(opt_r.x, opt_r.y, opt_r.w, opt_r.h, scale_alpha(sel_bg, open_t));
                 }
 
-                let fg = if is_sel {
-                    rgb(255, 255, 255)
-                } else if opt_hov {
-                    t.text
-                } else {
-                    t.text_dim
-                };
+                let fg = scale_alpha(
+                    if is_sel {
+                        rgb(255, 255, 255)
+                    } else if opt_hov {
+                        t.text
+                    } else {
+                        t.text_dim
+                    },
+                    open_t,
+                );
 
                 let o_cy = opt_r.y + opt_r.h * 0.5;
                 let o_base = (o_cy + fs * 0.33).round();
@@ -2001,10 +2313,10 @@ impl<'a> Ui<'a> {
                     },
                     self.font_engine,
                     opt,
-                    (pop_r.x + pad_x).round(),
+                    (view_r.x + pad_x).round(),
                     o_base,
                     fs,
-                    (pop_r.w - pad_x * 2.0 - arrow_sz).max(0.0),
+                    (view_r.w - pad_x * 2.0 - arrow_sz).max(0.0),
                     fg,
                 );
 
@@ -2013,7 +2325,7 @@ impl<'a> Ui<'a> {
                     self.scene.icon_centered(
                         self.text_sys,
                         ICON_CHECK,
-                        pop_r.x + pop_r.w - pad_x - arrow_sz * 0.35,
+                        view_r.x + view_r.w - pad_x - arrow_sz * 0.35,
                         o_cy,
                         csz,
                         fg,
@@ -2392,6 +2704,31 @@ impl<'a> Ui<'a> {
         self.scene.pop_clip();
     }
 
+    /// Draw an anti-aliased vector chevron centred at `(cx, cy)` with `angle_rad`
+    /// (`0.0` = pointing down `⌄`, `PI` = pointing up `^`, `-PI/2` = pointing right `›`).
+    /// Uses `Scene::line` (`kind = 4` capsule SDF) so rotation animations (`nui-select`
+    /// 0->180deg, `nui-link-list` group caret -90->0deg) are subpixel-smooth at any angle.
+    pub fn draw_chevron_rotated(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        arm: f32,
+        thickness: f32,
+        angle_rad: f32,
+        color: Color,
+    ) {
+        // Base chevron at angle 0 points DOWN: (-arm, -arm*0.45) -> (0, arm*0.45) -> (arm, -arm*0.45)
+        let (s, c) = angle_rad.sin_cos();
+        let rot = |lx: f32, ly: f32| -> (f32, f32) {
+            (cx + lx * c - ly * s, cy + lx * s + ly * c)
+        };
+        let p0 = rot(-arm, -arm * 0.45);
+        let p1 = rot(0.0, arm * 0.45);
+        let p2 = rot(arm, -arm * 0.45);
+        self.scene.line(p0.0, p0.1, p1.0, p1.1, thickness, color);
+        self.scene.line(p1.0, p1.1, p2.0, p2.1, thickness, color);
+    }
+
     /// Interactive waveform seekbar: 96+ vertical peak bars between a centre
     /// zero-line, a crisp `2px` playhead, hover highlight, and click/drag
     /// scrubbing that writes `*playhead` (0.0..=1.0). Returns `true` when scrubbed.
@@ -2539,6 +2876,1031 @@ impl<'a> Ui<'a> {
         }
         self.state.dropped_files.pop()
     }
+
+    // ==================================================================
+    // Menus — `.nui-menu-bar`, `.nui-menu-dropdown`, `nui-context-menu`
+    // ==================================================================
+
+    /// Natural width/height of a dropdown panel for `items` (FNV-stable, cached-free:
+    /// menus are measured once per frame, which is a handful of shaped runs).
+    fn menu_metrics(&mut self, items: &[MenuItem<'_>]) -> (f32, f32) {
+        let t = self.theme;
+        let row_h = (t.rem * 1.95).round();
+        let sep_h = (t.rem * 0.5).round();
+        let pad_x = t.space();
+        let lead_gap = t.space_half();
+        let fs = (t.rem * 0.875).round();
+        let fs_short = (t.rem * 0.75).round();
+        let icon_sz = (t.rem * 1.0).round();
+
+        let mut content_w = 0.0f32;
+        // `nui-menu.css` panels are `padding: var(--nui-space-quarter) 0` — 4px of
+        // breathing room above the first row and below the last one.
+        let pad_y = t.space_quarter();
+        let mut drop_h = pad_y * 2.0;
+        for it in items {
+            let (label, icon, check, shortcut, chevron) = match it {
+                MenuItem::Separator => {
+                    drop_h += sep_h;
+                    continue;
+                }
+                MenuItem::Action {
+                    label,
+                    icon,
+                    shortcut,
+                    checked,
+                    ..
+                } => (*label, *icon, checked.is_some(), *shortcut, false),
+                MenuItem::Submenu { label, icon, .. } => (*label, *icon, false, "", true),
+            };
+            drop_h += row_h;
+            let lead = if icon.is_empty() { 0.0 } else { icon_sz + lead_gap }
+                + if check { icon_sz + lead_gap } else { 0.0 };
+            let lw = self
+                .text_sys
+                .measure(FontFace::Regular, self.font_engine, label, fs);
+            let sw = if shortcut.is_empty() {
+                0.0
+            } else {
+                self.text_sys
+                    .measure(FontFace::Regular, self.font_engine, shortcut, fs_short)
+                    + lead_gap
+            };
+            let cw = if chevron { icon_sz + lead_gap } else { 0.0 };
+            content_w = content_w.max(lead + lw + sw + cw);
+        }
+        ((content_w + pad_x * 2.0).round().max((t.rem * 12.0).round()), drop_h)
+    }
+
+    /// Draw one dropdown panel and everything inside it, including the hovered
+    /// submenu flyout. `live` is `false` while the close animation plays, so a
+    /// fading panel cannot be clicked. Returns the `action` of the row that fired.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_menu_dropdown(
+        &mut self,
+        menu_id: u32,
+        live: bool,
+        drop_x: f32,
+        drop_y: f32,
+        win_w: f32,
+        win_h: Option<f32>,
+        items: &[MenuItem<'_>],
+    ) -> Option<String> {
+        let t = self.theme;
+        let row_h = (t.rem * 1.95).round();
+        let sep_h = (t.rem * 0.5).round();
+        let pad_x = t.space();
+        let pad_y = t.space_quarter();
+        let icon_sz = (t.rem * 1.0).round();
+        let child_id = menu_id ^ 0x9A00_0000;
+
+        let (drop_w, drop_h) = self.menu_metrics(items);
+        // Keep the panel on screen instead of letting rows run off the edge.
+        let mut x0 = drop_x.max(0.0);
+        if x0 + drop_w > win_w {
+            x0 = (win_w - drop_w - 4.0).max(0.0);
+        }
+        let mut y0 = drop_y;
+        if let Some(bottom) = win_h {
+            if y0 + drop_h > bottom {
+                y0 = (bottom - drop_h - 4.0).max(0.0);
+            }
+        }
+
+        let open_t = self.state.animate_bool(menu_id ^ 0x9500_0000, live, 0.25);
+        if !live && open_t <= 0.01 {
+            if self.state.active_submenu.map(|(m, _)| m) == Some(menu_id) {
+                self.state.active_submenu = None;
+            }
+            return None;
+        }
+
+        let cursor = self.state.cursor;
+        // Geometry pass first: the flyout has to stay open while the cursor is inside
+        // it, which is only knowable once every row's position is fixed.
+        let mut row_tops: Vec<f32> = Vec::with_capacity(items.len());
+        let mut sub_idx: Option<usize> = None;
+        let mut y = y0 + pad_y;
+        for (i, it) in items.iter().enumerate() {
+            row_tops.push(y);
+            match it {
+                MenuItem::Separator => y += sep_h,
+                MenuItem::Submenu { items: kids, disabled, .. } => {
+                    let row_r = Rect::new(x0 + 1.0, y, drop_w - 2.0, row_h);
+                    if !*disabled
+                        && !kids.is_empty()
+                        && row_r.contains(cursor.0, cursor.1)
+                    {
+                        sub_idx = Some(i);
+                    }
+                    y += row_h;
+                }
+                MenuItem::Action { .. } => y += row_h,
+            }
+        }
+        let flyout_x = |child_w: f32| -> f32 {
+            let right = x0 + drop_w - 2.0;
+            if right + child_w <= win_w {
+                right
+            } else {
+                (x0 - child_w).max(0.0)
+            }
+        };
+        if sub_idx.is_none() {
+            if let Some(i) = self
+                .state
+                .active_submenu
+                .filter(|(m, _)| *m == menu_id)
+                .map(|(_, i)| i)
+            {
+                if let Some(MenuItem::Submenu { items: kids, disabled: false, .. }) = items.get(i) {
+                    let (cw, _) = self.menu_metrics(kids);
+                    if Rect::new(flyout_x(cw), row_tops[i], cw, drop_h)
+                        .contains(cursor.0, cursor.1)
+                    {
+                        sub_idx = Some(i);
+                    }
+                }
+            }
+        }
+        self.state.active_submenu = sub_idx.map(|i| (menu_id, i));
+
+        let mut panel_r = Rect::new(x0, y0, drop_w, drop_h);
+        if let Some(i) = sub_idx {
+            if let Some(MenuItem::Submenu { items: kids, .. }) = items.get(i) {
+                let (cw, ch) = self.menu_metrics(kids);
+                panel_r = union_rect(panel_r, Rect::new(flyout_x(cw), row_tops[i], cw, ch));
+            }
+        }
+        if live {
+            self.state.popup_rect = Some(panel_r);
+        }
+
+        // `nui-dropdown.css`: `opacity: 0 -> 1` with `transform: translateY(-4px) -> translateY(0)`
+        // over 0.15s. The panel keeps its full height while opening — clipping it to
+        // `drop_h * open_t` cut the bottom rows off during the fade.
+        let view_r = Rect::new(x0, y0 + (1.0 - open_t) * -4.0, drop_w, drop_h);
+        self.scene.begin_overlay();
+        self.scene.shadow(
+            view_r.x,
+            view_r.y + 3.0,
+            view_r.w,
+            view_r.h,
+            t.radius2(),
+            t.rem * 0.7,
+            scale_alpha(rgba(0, 0, 0, if t.dark { 85 } else { 26 }), open_t),
+        );
+        self.scene.push_clip(view_r.x, view_r.y, view_r.w, view_r.h);
+        self.scene.rounded_rect(
+            view_r.x,
+            view_r.y,
+            view_r.w,
+            view_r.h,
+            t.radius2(),
+            scale_alpha(t.shade2, open_t),
+            scale_alpha(t.border2, open_t),
+            1.0,
+        );
+        self.scene.pop_clip();
+
+        self.scene.push_clip(
+            view_r.x + 1.0,
+            view_r.y + 1.0,
+            view_r.w - 2.0,
+            (view_r.h - 2.0).max(1.0),
+        );
+        let mut result = None;
+        let mut y = view_r.y + pad_y;
+        for (idx, it) in items.iter().enumerate() {
+            match it {
+                MenuItem::Separator => {
+                    self.scene.rect(
+                        view_r.x + 1.0,
+                        (y + sep_h * 0.5).round(),
+                        (view_r.w - 2.0).max(0.0),
+                        1.0,
+                        scale_alpha(t.border2, open_t),
+                    );
+                    y += sep_h;
+                }
+                MenuItem::Action {
+                    label,
+                    icon,
+                    shortcut,
+                    action,
+                    disabled,
+                    checked,
+                } => {
+                    let row_r = Rect::new(view_r.x + 1.0, y, view_r.w - 2.0, row_h);
+                    let hovered = live
+                        && !*disabled
+                        && row_r.contains(cursor.0, cursor.1);
+                    if hovered {
+                        self.state.hovered_id = Some(menu_id);
+                        // Only the menu that owns the entry clears it: a row in a flyout
+                        // must not close the parent's flyout out from under the cursor.
+                        if self.state.active_submenu.map(|(m, _)| m) == Some(menu_id) {
+                            self.state.active_submenu = None;
+                        }
+                        if self.state.mouse_pressed {
+                            result = Some(action.to_string());
+                            self.state.open_popup_id = None;
+                            self.state.active_submenu = None;
+                            self.state.mouse_pressed = false;
+                        }
+                    }
+                    if hovered {
+                        self.scene.rect(
+                            row_r.x,
+                            row_r.y,
+                            row_r.w,
+                            row_r.h,
+                            scale_alpha(t.shade3, open_t),
+                        );
+                    }
+                    self.menu_row_content(
+                        row_r,
+                        pad_x,
+                        icon_sz,
+                        row_h,
+                        matches!(checked, Some(true)),
+                        icon,
+                        label,
+                        shortcut,
+                        false,
+                        if *disabled {
+                            scale_alpha(t.text_muted, 0.5 * open_t)
+                        } else {
+                            scale_alpha(t.text, open_t)
+                        },
+                        scale_alpha(t.text_muted, open_t),
+                    );
+                    y += row_h;
+                }
+                MenuItem::Submenu { label, icon, disabled, .. } => {
+                    let row_r = Rect::new(view_r.x + 1.0, y, view_r.w - 2.0, row_h);
+                    let hovered = live
+                        && sub_idx == Some(idx)
+                        && row_r.contains(cursor.0, cursor.1);
+                    if hovered {
+                        self.state.hovered_id = Some(menu_id);
+                        self.scene.rect(
+                            row_r.x,
+                            row_r.y,
+                            row_r.w,
+                            row_r.h,
+                            scale_alpha(t.shade3, open_t),
+                        );
+                    }
+                    self.menu_row_content(
+                        row_r,
+                        pad_x,
+                        icon_sz,
+                        row_h,
+                        false,
+                        icon,
+                        label,
+                        "",
+                        true,
+                        if *disabled {
+                            scale_alpha(t.text_muted, 0.5 * open_t)
+                        } else {
+                            scale_alpha(t.text, open_t)
+                        },
+                        scale_alpha(t.text_dim, open_t),
+                    );
+                    y += row_h;
+                }
+            }
+        }
+        self.scene.pop_clip();
+
+        if let Some(i) = sub_idx {
+            if let Some(MenuItem::Submenu { items: kids, .. }) = items.get(i) {
+                let (cw, _) = self.menu_metrics(kids);
+                if let Some(a) =
+                    self.draw_menu_dropdown(child_id, live, flyout_x(cw), row_tops[i], win_w, win_h, kids)
+                {
+                    result = Some(a);
+                }
+            }
+        }
+
+        self.scene.end_overlay();
+        result
+    }
+
+    /// One dropdown row: optional check mark / leading icon, the label, and a
+    /// right-aligned hint — shortcut text for actions, chevron for submenus.
+    #[allow(clippy::too_many_arguments)]
+    fn menu_row_content(
+        &mut self,
+        row_r: Rect,
+        pad_x: f32,
+        icon_sz: f32,
+        row_h: f32,
+        check: bool,
+        icon: &str,
+        label: &str,
+        shortcut: &str,
+        chevron: bool,
+        fg: Color,
+        hint_color: Color,
+    ) {
+        let t = self.theme;
+        let lead_gap = t.space_half();
+        let fs = (t.rem * 0.875).round();
+        let fs_short = (t.rem * 0.75).round();
+        let cy = row_r.y + row_h * 0.5;
+        let baseline = (cy + fs * 0.33).round();
+
+        let mut cx = row_r.x + pad_x;
+        if check {
+            self.scene
+                .icon_centered(self.text_sys, ICON_CHECK, cx + icon_sz * 0.5, cy, icon_sz, fg);
+            cx += icon_sz + lead_gap;
+        }
+        if !icon.is_empty() {
+            self.scene
+                .icon_centered(self.text_sys, icon, cx + icon_sz * 0.5, cy, icon_sz, fg);
+            cx += icon_sz + lead_gap;
+        }
+
+        let trailing_w = if chevron {
+            icon_sz
+        } else if shortcut.is_empty() {
+            0.0
+        } else {
+            self.text_sys
+                .measure(FontFace::Regular, self.font_engine, shortcut, fs_short)
+        };
+        self.text_clipped(
+            FontFace::Regular,
+            self.font_engine,
+            label,
+            cx.round(),
+            baseline,
+            fs,
+            (row_r.x + row_r.w - pad_x - trailing_w - cx).max(0.0),
+            fg,
+        );
+        if chevron {
+            self.scene.icon_centered(
+                self.text_sys,
+                ICON_CHEVRON_RIGHT,
+                row_r.x + row_r.w - pad_x - icon_sz * 0.5,
+                cy,
+                icon_sz,
+                hint_color,
+            );
+        } else if !shortcut.is_empty() {
+            self.text_clipped(
+                FontFace::Regular,
+                self.font_engine,
+                shortcut,
+                (row_r.x + row_r.w - pad_x - trailing_w).round(),
+                baseline,
+                fs_short,
+                trailing_w.max(0.0),
+                hint_color,
+            );
+        }
+    }
+
+    /// `.nui-menu-bar`: hover or press a top-level item to open its dropdown. While
+    /// any menu of this bar is open, sliding sideways switches to the neighbour.
+    pub fn menu_bar<'b>(
+        &mut self,
+        base_id: u32,
+        r: Rect,
+        entries: &[MenuBarEntry<'b>],
+    ) -> Option<String> {
+        let t = self.theme;
+        self.scene
+            .rect(r.x, r.y, r.w, r.h, if t.dark { t.shade1 } else { t.shade2 });
+        self.scene.rect(r.x, r.y + r.h - 1.0, r.w, 1.0, t.border2);
+
+        let fs = (t.rem * 0.875).round();
+        let pad_x = t.rem;
+        let baseline = (r.y + r.h * 0.5 + fs * 0.33).round();
+        let n = entries.len() as u32;
+        let mut item_x: Vec<f32> = Vec::with_capacity(entries.len());
+        let mut tx = r.x;
+
+        for (i, entry) in entries.iter().enumerate() {
+            let menu_id = base_id + i as u32;
+            let tw = self
+                .text_sys
+                .measure(FontFace::Regular, self.font_engine, entry.label, fs);
+            let item_w = (tw + pad_x * 2.0).round();
+            let item_r = Rect::new(tx, r.y, item_w, r.h);
+            item_x.push(tx);
+            tx += item_w;
+
+            let hovered = self.state.can_hover(menu_id, item_r);
+            let was_open = self.state.open_popup_id == Some(menu_id);
+            let any_open = matches!(self.state.open_popup_id, Some(p) if p >= base_id && p < base_id + n);
+            if hovered {
+                self.state.hovered_id = Some(menu_id);
+                if self.state.mouse_pressed {
+                    self.state.open_popup_id = if was_open { None } else { Some(menu_id) };
+                    self.state.active_submenu = None;
+                    // Consumed so `end_frame` does not read this same click as an
+                    // outside click and immediately close the menu we just opened.
+                    self.state.mouse_pressed = false;
+                } else if any_open && !was_open {
+                    self.state.open_popup_id = Some(menu_id);
+                    self.state.active_submenu = None;
+                }
+            }
+
+            let is_open = self.state.open_popup_id == Some(menu_id);
+            let hov_t = self.state.animate_bool(menu_id ^ 0x9100_0000, hovered, 0.15);
+            if is_open {
+                // `nui-menu.css`: the open item fills the full bar height (minus the
+                // 1px bottom rule) with a square accent block, not a floating pill.
+                self.scene.rect(
+                    item_r.x,
+                    item_r.y,
+                    item_r.w,
+                    (item_r.h - 1.0).max(0.0),
+                    t.highlight,
+                );
+                self.scene.text(
+                    self.text_sys,
+                    FontFace::Regular,
+                    self.font_engine,
+                    entry.label,
+                    (item_r.x + pad_x).round(),
+                    baseline,
+                    fs,
+                    rgb(255, 255, 255),
+                );
+            } else {
+                if hov_t > 0.01 {
+                    self.scene.rect(
+                        item_r.x,
+                        item_r.y,
+                        item_r.w,
+                        (item_r.h - 1.0).max(0.0),
+                        scale_alpha(t.shade3, hov_t),
+                    );
+                }
+                self.scene.text(
+                    self.text_sys,
+                    FontFace::Regular,
+                    self.font_engine,
+                    entry.label,
+                    (item_r.x + pad_x).round(),
+                    baseline,
+                    fs,
+                    t.text,
+                );
+            }
+        }
+
+        let open = self
+            .state
+            .open_popup_id
+            .filter(|p| *p >= base_id && *p < base_id + n)
+            .map(|p| (p - base_id) as usize);
+        match open {
+            Some(i) => self.draw_menu_dropdown(
+                base_id + i as u32,
+                true,
+                item_x[i],
+                r.y + r.h,
+                r.x + r.w,
+                None,
+                entries[i].items,
+            ),
+            None => None,
+        }
+    }
+
+    /// `nui-context-menu`: right-click inside `trigger_r` opens the menu at the cursor,
+    /// clamped so it never runs off the window.
+    pub fn context_menu<'b>(
+        &mut self,
+        id: u32,
+        trigger_r: Rect,
+        win_r: Rect,
+        items: &[MenuItem<'b>],
+    ) -> Option<String> {
+        if self.state.right_pressed
+            && trigger_r.contains(self.state.cursor.0, self.state.cursor.1)
+        {
+            self.state.open_popup_id = Some(id);
+            self.state.context_menu_pos = self.state.cursor;
+            self.state.active_submenu = None;
+            self.state.right_pressed = false;
+        }
+        let is_open = self.state.open_popup_id == Some(id);
+        let (cx, cy) = self.state.context_menu_pos;
+        self.draw_menu_dropdown(
+            id,
+            is_open,
+            cx,
+            cy,
+            win_r.x + win_r.w,
+            Some(win_r.y + win_r.h),
+            items,
+        )
+    }
+
+    // ==================================================================
+    // nui-link-list[mode="fold"] — collapsible navigation
+    // ==================================================================
+
+    /// Walk the tree once, advancing every group's expansion animation exactly once and
+    /// recording `(anim_key, eased, natural children height)` so the render pass can
+    /// size each group without re-stepping (a second step would double the speed).
+    fn link_list_measure(&mut self, entries: &[LinkListEntry<'_>], anims: &mut Vec<(u32, f32, f32)>) -> f32 {
+        let t = self.theme;
+        // `nui-theme.css:633` — group headers are `min-height: var(--nui-space-triple)`.
+        let hdr_h = (t.rem * 3.0).round();
+        let row_h = (t.rem * 2.65).round();
+        let sep_h = (t.rem * 0.5).round();
+        let mut h = 0.0;
+        for e in entries {
+            match e {
+                LinkListEntry::Separator => h += sep_h,
+                LinkListEntry::Item { .. } => h += row_h,
+                LinkListEntry::Group {
+                    id,
+                    expanded,
+                    items,
+                    ..
+                } => {
+                    h += hdr_h;
+                    let a = self.state.animate_bool(*id ^ 0x7100_0000, *expanded, 0.30);
+                    let kids_h = self.link_list_measure(items, anims);
+                    anims.push((*id ^ 0x7100_0000, a, kids_h));
+                    h += kids_h * a;
+                }
+            }
+        }
+        h
+    }
+
+    /// `nui-link-list[mode="fold"]` inside a scroll viewport. Returns `true` when a row
+    /// was activated; `active_key` and `toggled_group_id` are updated in place so the
+    /// host keeps ownership of the navigation state.
+    pub fn link_list<'b>(
+        &mut self,
+        base_id: u32,
+        r: Rect,
+        entries: &[LinkListEntry<'b>],
+        active_key: &mut String,
+        toggled_group_id: &mut Option<u32>,
+    ) -> bool {
+        let mut anims: Vec<(u32, f32, f32)> = Vec::new();
+        let content_h = self.link_list_measure(entries, &mut anims);
+        self.scroll_area(base_id, r, content_h, false, |ui, vp, scroll_y| {
+            ui.link_list_items(
+                base_id,
+                Rect::new(vp.x, vp.y - scroll_y, vp.w, content_h),
+                entries,
+                active_key,
+                toggled_group_id,
+                &anims,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn link_list_items(
+        &mut self,
+        base_id: u32,
+        r: Rect,
+        entries: &[LinkListEntry<'_>],
+        active_key: &mut String,
+        toggled_group_id: &mut Option<u32>,
+        anims: &[(u32, f32, f32)],
+    ) -> bool {
+        let t = self.theme;
+        let hdr_h = (t.rem * 3.0).round();
+        let row_h = (t.rem * 2.65).round();
+        let sep_h = (t.rem * 0.5).round();
+        let fs = t.font_small();
+        let pad_x = t.space();
+        let icon_sz = (t.rem * 1.05).round();
+        let chev_sz = (t.rem * 1.0).round();
+        let accent_w = (t.rem * 0.3).round().max(4.0);
+        let mut clicked = false;
+        let mut y = r.y;
+
+        for entry in entries {
+            match entry {
+                LinkListEntry::Separator => {
+                    self.scene.rect(
+                        r.x + pad_x * 0.5,
+                        (y + sep_h * 0.5).round(),
+                        (r.w - pad_x).max(0.0),
+                        1.0,
+                        t.border1,
+                    );
+                    y += sep_h;
+                }
+                LinkListEntry::Item {
+                    key,
+                    label,
+                    icon,
+                    badge,
+                } => {
+                    let id = base_id ^ fnv1a(key);
+                    let row_r = Rect::new(r.x, y, r.w, row_h);
+                    let hovered = self.state.can_hover(id, row_r);
+                    let is_active = *active_key == *key;
+                    if hovered {
+                        self.state.hovered_id = Some(id);
+                        if self.state.mouse_pressed {
+                            self.state.active_id = Some(id);
+                        }
+                        if self.state.mouse_released && self.state.active_id == Some(id) {
+                            *active_key = (*key).to_string();
+                            clicked = true;
+                        }
+                    }
+
+                    let hov_t = self
+                        .state
+                        .animate_bool(id ^ 0x7200_0000, hovered && !is_active, 0.15);
+                    let act_t = self.state.animate_bool(id ^ 0x7300_0000, is_active, 0.15);
+                    // `nui-theme.css:736` / `:741` — hover and active are distinct
+                    // flat fills, not a single shade ramp.
+                    let hov_bg = if t.dark { rgb(55, 55, 55) } else { rgb(240, 240, 240) };
+                    let act_bg = if t.dark { rgb(60, 65, 70) } else { rgb(230, 235, 240) };
+                    if hov_t > 0.01 {
+                        self.scene.rect(
+                            row_r.x,
+                            row_r.y,
+                            row_r.w,
+                            row_h,
+                            lerp_color((hov_bg.0, hov_bg.1, hov_bg.2, 0), hov_bg, hov_t),
+                        );
+                    }
+                    if act_t > 0.01 {
+                        self.scene.rect(
+                            row_r.x,
+                            row_r.y,
+                            row_r.w,
+                            row_h,
+                            lerp_color((act_bg.0, act_bg.1, act_bg.2, 0), act_bg, act_t),
+                        );
+                        self.scene.rect(
+                            row_r.x,
+                            row_r.y,
+                            accent_w,
+                            row_h,
+                            scale_alpha(t.highlight, act_t),
+                        );
+                        // `nui-theme.css:595` `li.list-item.active::before` — the
+                        // right-edge chevron marks the current page.
+                        self.draw_chevron_rotated(
+                            row_r.x + row_r.w - pad_x - chev_sz * 0.35,
+                            row_r.y + row_h * 0.5,
+                            (t.rem * 0.22).round().max(3.0),
+                            1.8,
+                            -std::f32::consts::FRAC_PI_2,
+                            scale_alpha(t.highlight, act_t),
+                        );
+                    }
+
+                    let fg = lerp_color(lerp_color(t.text_dim, t.text, hov_t), t.highlight, act_t);
+                    let icon_col = lerp_color(t.shade6, t.highlight, act_t.max(hov_t));
+                    // `nui-theme.css:726` — `.group-items > li a span { padding-left: 2.7rem }`
+                    // indents children so their labels align under the parent label.
+                    let mut cx = if icon.is_empty() {
+                        row_r.x + (t.rem * 2.7).round()
+                    } else {
+                        row_r.x + pad_x
+                    };
+                    if !icon.is_empty() {
+                        self.scene.icon_centered(
+                            self.text_sys,
+                            icon,
+                            cx + icon_sz * 0.5,
+                            row_r.y + row_h * 0.5,
+                            icon_sz,
+                            icon_col,
+                        );
+                        cx += icon_sz + t.space_half();
+                    }
+
+                    let label_max = if badge.is_empty() {
+                        row_r.x + row_r.w - pad_x - cx
+                    } else {
+                        let bfs = (t.rem * 0.7).round();
+                        let upper = badge.to_uppercase();
+                        let bt = self.text_sys.measure(
+                            FontFace::SemiBold,
+                            self.font_engine,
+                            &upper,
+                            bfs,
+                        );
+                        let bw = (bt + t.rem * 0.85).round();
+                        let bh = (t.rem * 1.25).round();
+                        let bx = (row_r.x + row_r.w - pad_x - bw).round();
+                        let by = (row_r.y + (row_h - bh) * 0.5).round();
+                        self.scene.rounded_rect(
+                            bx, by, bw, bh, bh * 0.5, t.shade4, (0, 0, 0, 0), 0.0,
+                        );
+                        self.scene.text(
+                            self.text_sys,
+                            FontFace::SemiBold,
+                            self.font_engine,
+                            &upper,
+                            (bx + t.rem * 0.42).round(),
+                            (by + bh * 0.5 + bfs * 0.355).round(),
+                            bfs,
+                            t.text_dim,
+                        );
+                        bx - t.space_half() - cx
+                    };
+                    self.text_clipped(
+                        FontFace::Regular,
+                        self.font_engine,
+                        label,
+                        cx.round(),
+                        (row_r.y + row_h * 0.5 + fs * 0.33).round(),
+                        fs,
+                        label_max.max(0.0),
+                        fg,
+                    );
+                    y += row_h;
+                }
+                LinkListEntry::Group {
+                    id,
+                    label,
+                    icon,
+                    expanded,
+                    items,
+                } => {
+                    let gid = base_id ^ id.wrapping_mul(0x9E37_79B9);
+                    let hdr_r = Rect::new(r.x, y, r.w, hdr_h);
+                    // Expansion comes from the measure pass so the tray height stays
+                    // identical in the layout and the paint pass; the caret reads it here.
+                    let (a, kids_h) = anims
+                        .iter()
+                        .find(|(k, _, _)| *k == (*id ^ 0x7100_0000))
+                        .map(|(_, a, h)| (*a, *h))
+                        .unwrap_or((if *expanded { 1.0 } else { 0.0 }, 0.0));
+                    let hovered = self.state.can_hover(gid, hdr_r);
+                    if hovered {
+                        self.state.hovered_id = Some(gid);
+                        if self.state.mouse_pressed {
+                            *toggled_group_id = Some(*id);
+                            self.state.mouse_pressed = false;
+                        }
+                    }
+                    // Header background: hover tints it, an expanded group lifts it a step
+                    // (`nui-theme.css:731`).
+                    let lifted = if t.dark { rgb(48, 48, 48) } else { rgb(240, 240, 240) };
+                    self.scene
+                        .rect(hdr_r.x, hdr_r.y, hdr_r.w, hdr_h, scale_alpha(lifted, a));
+                    if hovered {
+                        self.scene.rect(
+                            hdr_r.x,
+                            hdr_r.y,
+                            hdr_r.w,
+                            hdr_h,
+                            scale_alpha(t.shade3, 1.0 - a),
+                        );
+                    }
+
+                    let mut cx = hdr_r.x + pad_x;
+                    if !icon.is_empty() {
+                        self.scene.icon_centered(
+                            self.text_sys,
+                            icon,
+                            cx + icon_sz * 0.5,
+                            hdr_r.y + hdr_h * 0.5,
+                            icon_sz,
+                            lerp_color(t.text_dim, t.text, a),
+                        );
+                        cx += icon_sz + t.space_half();
+                    }
+                    // Caret rotates from right (-90deg, collapsed) to down (0deg, expanded).
+                    self.draw_chevron_rotated(
+                        hdr_r.x + hdr_r.w - pad_x - chev_sz * 0.35,
+                        hdr_r.y + hdr_h * 0.5,
+                        (t.rem * 0.24).round().max(3.5),
+                        1.8,
+                        (a - 1.0) * std::f32::consts::FRAC_PI_2,
+                        lerp_color(
+                            rgba(t.text_dim.0, t.text_dim.1, t.text_dim.2, 90),
+                            t.highlight,
+                            a,
+                        ),
+                    );
+                    self.text_clipped(
+                        FontFace::Regular,
+                        self.font_engine,
+                        label,
+                        cx.round(),
+                        (hdr_r.y + hdr_h * 0.5 + fs * 0.33).round(),
+                        fs,
+                        (hdr_r.x
+                            + hdr_r.w
+                            - pad_x
+                            - chev_sz
+                            - t.space_half()
+                            - cx)
+                            .max(0.0),
+                        lerp_color(t.text_dim, t.text, a.max(if hovered { 1.0 } else { 0.0 })),
+                    );
+
+                    let vis_h = kids_h * a;
+                    if vis_h > 0.5 {
+                        let kids_r = Rect::new(r.x, y + hdr_h, r.w, vis_h);
+                        // Inset tray behind the children (nui-theme.css:720).
+                        let tray_bg = if t.dark { rgb(30, 30, 30) } else { rgb(255, 255, 255) };
+                        self.scene.rect(kids_r.x, kids_r.y, kids_r.w, kids_r.h, tray_bg);
+                        self.scene.push_clip(r.x, kids_r.y, r.w, vis_h);
+                        clicked |= self.link_list_items(
+                            base_id,
+                            kids_r,
+                            items,
+                            active_key,
+                            toggled_group_id,
+                            anims,
+                        );
+                        self.scene.pop_clip();
+                    }
+                    y += hdr_h + vis_h;
+                }
+            }
+        }
+        clicked
+    }
+
+    // ==================================================================
+    // nui-dialog — modal with backdrop, header bar and an arbitrary body
+    // ==================================================================
+
+    /// Modal dialog centred in `win_r`. While `*open` it claims the popup slot, so
+    /// widgets behind the backdrop cannot be hovered or clicked and a click on the
+    /// backdrop (or `Escape`) clears the slot, which syncs `*open` back to `false`
+    /// on the next frame. Closing plays the same scale/slide out as the open.
+    pub fn dialog(
+        &mut self,
+        id: u32,
+        win_r: Rect,
+        open: &mut bool,
+        title: &str,
+        icon: &str,
+        dialog_w: f32,
+        dialog_h: f32,
+        body_fn: impl FnOnce(&mut Self, Rect),
+    ) {
+        let t = self.theme;
+        let open_t = self.state.animate_bool(id ^ 0x8100_0000, *open, 0.30);
+        if !*open && open_t <= 0.01 {
+            if self.state.modal_id == Some(id) {
+                self.state.modal_id = None;
+            }
+            return;
+        }
+
+        let sc = 0.95 + 0.05 * open_t;
+        let dw = (dialog_w * sc).round();
+        let dh = (dialog_h * sc).round();
+        let dx = (win_r.x + (win_r.w - dw) * 0.5).round();
+        let dy = (win_r.y + (win_r.h - dh) * 0.5 + (1.0 - open_t) * 8.0).round();
+        let dialog_r = Rect::new(dx, dy, dw, dh);
+
+        if *open {
+            self.state.modal_id = Some(id);
+            if self.state.key_cmds.contains(&KeyCmd::Escape) && self.state.open_popup_id.is_none() {
+                *open = false;
+                self.state.modal_id = None;
+            }
+        }
+        // Everything from here on is drawn inside the modal, so its controls stay
+        // hoverable while the widgets behind the backdrop do not.
+        self.state.inside_popup = true;
+
+        self.scene.begin_overlay();
+        self.scene.rect(
+            win_r.x,
+            win_r.y,
+            win_r.w,
+            win_r.h,
+            rgba(15, 15, 15, (195.0 * open_t).round() as u8),
+        );
+        self.scene.shadow(
+            dx,
+            dy + 3.0,
+            dw,
+            dh,
+            t.radius2(),
+            t.rem * 1.1,
+            rgba(0, 0, 0, ((if t.dark { 105.0 } else { 32.0 }) * open_t).round() as u8),
+        );
+        self.scene.rounded_rect(
+            dx,
+            dy,
+            dw,
+            dh,
+            t.radius2(),
+            scale_alpha(if t.dark { t.shade1 } else { t.base }, open_t),
+            scale_alpha(t.border2, open_t),
+            1.0,
+        );
+
+        let hdr_h = (t.rem * 3.0).round();
+        self.scene.rect(
+            dx + 1.0,
+            dy + 1.0,
+            (dw - 2.0).max(0.0),
+            hdr_h - 1.0,
+            scale_alpha(t.shade2, open_t),
+        );
+        self.scene.rect(dx, dy + hdr_h, dw, 1.0, scale_alpha(t.border2, open_t));
+
+        let fs = t.font_small();
+        let icon_sz = (t.rem * 1.15).round();
+        let mut tx = dx + t.space();
+        if !icon.is_empty() {
+            self.scene.icon_centered(
+                self.text_sys,
+                icon,
+                tx + icon_sz * 0.5,
+                dy + hdr_h * 0.5,
+                icon_sz,
+                scale_alpha(t.highlight, open_t),
+            );
+            tx += icon_sz + t.space_half();
+        }
+        self.text_clipped(
+            FontFace::SemiBold,
+            self.font_engine,
+            title,
+            tx.round(),
+            (dy + hdr_h * 0.5 + fs * 0.33).round(),
+            fs,
+            (dx + dw - t.rem * 3.0 - tx).max(0.0),
+            scale_alpha(t.text, open_t),
+        );
+
+        let cb = (t.rem * 1.75).round();
+        let cb_r = Rect::new(
+            dx + dw - t.rem * 0.6 - cb,
+            dy + (hdr_h - cb) * 0.5,
+            cb,
+            cb,
+        );
+        if self.button(id + 1, cb_r, "", ICON_CLOSE, ButtonVariant::Ghost) {
+            *open = false;
+            self.state.modal_id = None;
+        }
+
+        let body_r = Rect::new(
+            dx + 1.0,
+            dy + hdr_h + 1.0,
+            (dw - 2.0).max(0.0),
+            (dh - hdr_h - 2.0).max(0.0),
+        );
+        self.scene
+            .push_clip(body_r.x, body_r.y, body_r.w, body_r.h);
+        body_fn(self, body_r);
+        self.state.inside_popup = false;
+        self.scene.pop_clip();
+        self.scene.end_overlay();
+
+        // Clicking the dim backdrop outside the dialog (and outside any open dropdown) closes it.
+        if *open && self.state.mouse_pressed && !dialog_r.contains(self.state.cursor.0, self.state.cursor.1) {
+            let in_dropdown = self
+                .state
+                .popup_rect
+                .map(|pr| pr.contains(self.state.cursor.0, self.state.cursor.1))
+                .unwrap_or(false);
+            if !in_dropdown {
+                *open = false;
+                self.state.modal_id = None;
+                self.state.mouse_pressed = false;
+            }
+        }
+    }
+}
+
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
+/// FNV-1a so a `&str` key maps to the same widget id every frame.
+fn fnv1a(s: &str) -> u32 {
+    let mut h: u32 = 2166136261;
+    for b in s.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
 }
 
 fn prev_char_boundary(s: &str, idx: usize) -> usize {

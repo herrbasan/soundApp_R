@@ -202,12 +202,12 @@ impl<'a> Ui<'a> {
         let t = self.theme;
         self.scene.shadow(
             r.x,
-            r.y + (t.rem * 0.25).round(),
+            r.y + (t.rem * 0.18).round(),
             r.w,
             r.h,
             t.radius2(),
-            (t.rem * 0.85).round(),
-            crate::widgets::rgba(0, 0, 0, if t.dark { 75 } else { 28 }),
+            (t.rem * 0.75).round(),
+            crate::widgets::rgba(0, 0, 0, if t.dark { 55 } else { 18 }),
         );
         self.scene.rounded_rect(
             r.x,
@@ -215,7 +215,7 @@ impl<'a> Ui<'a> {
             r.w,
             r.h,
             t.radius2(),
-            t.shade2,
+            if t.dark { t.shade2 } else { t.shade1 },
             t.border2,
             1.0,
         );

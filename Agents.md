@@ -45,7 +45,9 @@ soundApp_R/
                           #   input_group, form_field)
         window.rs         # Multi-Window Manager (WindowManager, ManagedWindow, shared TextSystem atlas_gen sync)
     nui-demo/             # Standalone component playground -> nui_demo.exe (no audio/FFmpeg deps)
-      src/main.rs         # 5-tab NUI playground + secondary UiState Inspector window (W) + dropzone (D)
+      src/main.rs         # 6-tab NUI playground (menu bar, collapsible sidebar, modal dialog,
+                      # right-click context menu) + secondary UiState Inspector window (W)
+                      # + dropzone preview (D) + live window drag/resize
     soundapp/             # SoundApp application crate -> soundapp_r.exe
       build.rs            # Compiles ffmpeg_bridge.cpp against FFmpeg 7+ headers/libs and stages runtime DLLs
       src/
@@ -65,7 +67,7 @@ soundApp_R/
 ### The three binaries
 
 1. **`crates/nui`** — reusable library: `render.rs` with `kind = 0..5` (0 sharp rect, 1 Swash glyph, 2 Fontdue glyph, 3 SDF shadow, 4 AA capsule line, **5 RGBA image quad**), `DWMWA_CLOAK (13)` + dark `#131313` `GCLP_HBRBACKGROUND` zero-flash reveal, Swash subpixel shaping, `layout_rotated_ccw45` for atlas-cached `-45°` text, widgets, layout, window manager.
-2. **`crates/nui-demo`** → **`nui_demo.exe`** — standalone 5-tab NUI Component Playground (*Controls & Inputs*, *Layout & Cards*, *Vectors & Canvas*, *Typography & Icons*, *Virtual List 10k*), plus a secondary `UiState` Inspector window (`W`) and dropzone preview (`D`). Zero audio/FFmpeg dependencies. **This is the iteration surface for `crates/nui` design work.**
+2. **`crates/nui-demo`** → **`nui_demo.exe`** — standalone 6-tab NUI Component Playground (*Controls & Inputs*, *Layout & Cards*, *Vectors & Canvas*, *Typography & Icons*, *Virtual List 10k*, *Menus & Overlays*), wrapped in a real app shell: undecorated app header (empty middle = live window drag zone), `.nui-menu-bar` (File / View / Components / Diagnostics), an animated collapsible `nui-sidebar` + `nui-link-list[mode="fold"]`, a right-click `nui-context-menu`, and a modal `nui-dialog` that now owns every demo control the header used to carry. Plus a secondary `UiState` Inspector window (`W`) and dropzone preview (`D`); the window is resizable via edge/corner hit-testing. Zero audio/FFmpeg dependencies. **This is the iteration surface for `crates/nui` design work.**
 3. **`crates/soundapp`** → **`soundapp_r.exe`** — minimalist, fast-opening, low-footprint FFmpeg audio player: `480×278` with controls, `480×221` without (`C`); proportional UI scaling via `+`/`-`/`0`, `Ctrl+Wheel`, or undecorated edge/corner drag.
 
 ## Test Media & Remote

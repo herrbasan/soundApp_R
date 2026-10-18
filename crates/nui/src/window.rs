@@ -108,6 +108,71 @@ pub fn drag_resize_window_live(window: &Window, dir: ResizeDirection) {
     }
 }
 
+/// Hit-test a 6px logical border (with 12px corner zones) on an undecorated window.
+/// `cursor` and `win_size` are physical pixels; `scale_factor` converts the
+/// logical border width the same way `WindowManager::build_window_attrs` sizes the window.
+pub fn hit_test_resize_border(
+    cursor: (f32, f32),
+    win_size: (u32, u32),
+    scale_factor: f64,
+) -> Option<ResizeDirection> {
+    let dpi = scale_factor as f32;
+    let (cw, ch) = (win_size.0 as f32, win_size.1 as f32);
+    let (mx, my) = cursor;
+    let edge = (6.0 * dpi).round();
+    let corner = (12.0 * dpi).round();
+    if mx < 0.0 || my < 0.0 || mx > cw || my > ch {
+        return None;
+    }
+    let on_l = mx <= edge;
+    let on_r = mx >= cw - edge;
+    let on_t = my <= edge;
+    let on_b = my >= ch - edge;
+    if !(on_l || on_r || on_t || on_b) {
+        return None;
+    }
+    if mx <= corner && my <= corner {
+        Some(ResizeDirection::NorthWest)
+    } else if mx >= cw - corner && my <= corner {
+        Some(ResizeDirection::NorthEast)
+    } else if mx <= corner && my >= ch - corner {
+        Some(ResizeDirection::SouthWest)
+    } else if mx >= cw - corner && my >= ch - corner {
+        Some(ResizeDirection::SouthEast)
+    } else if on_l {
+        Some(ResizeDirection::West)
+    } else if on_r {
+        Some(ResizeDirection::East)
+    } else if on_t {
+        Some(ResizeDirection::North)
+    } else {
+        Some(ResizeDirection::South)
+    }
+}
+
+/// Update the window's mouse cursor icon to show resize arrows when hovering an edge/corner.
+pub fn update_resize_cursor(window: &Window, cursor: (f32, f32), win_size: (u32, u32)) {
+    use winit::window::CursorIcon;
+    let icon = match hit_test_resize_border(cursor, win_size, window.scale_factor()) {
+        Some(ResizeDirection::North) | Some(ResizeDirection::South) => CursorIcon::NsResize,
+        Some(ResizeDirection::East) | Some(ResizeDirection::West) => CursorIcon::EwResize,
+        Some(ResizeDirection::NorthWest) | Some(ResizeDirection::SouthEast) => CursorIcon::NwseResize,
+        Some(ResizeDirection::NorthEast) | Some(ResizeDirection::SouthWest) => CursorIcon::NeswResize,
+        None => CursorIcon::Default,
+    };
+    window.set_cursor(icon);
+}
+
+/// If `cursor` is on the window's resize border, start a live resize drag and return `true`.
+pub fn try_start_window_resize(window: &Window, cursor: (f32, f32), win_size: (u32, u32)) -> bool {
+    if let Some(dir) = hit_test_resize_border(cursor, win_size, window.scale_factor()) {
+        drag_resize_window_live(window, dir);
+        true
+    } else {
+        false
+    }
+}
+
 /// Declarative creation spec for a managed window (`WindowManager::ensure_window`).
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
@@ -150,6 +215,7 @@ impl WindowManager {
     pub fn build_window_attrs(spec: &WindowSpec) -> WindowAttributes {
         let mut attrs = Window::default_attributes()
             .with_title(spec.title)
+            .with_resizable(true)
             .with_inner_size(LogicalSize::new(spec.width, spec.height))
             .with_min_inner_size(LogicalSize::new(spec.min_width, spec.min_height))
             .with_decorations(!spec.undecorated)
@@ -256,6 +322,12 @@ impl WindowManager {
                 w.window.request_redraw();
             }
         }
+    }
+
+    /// `true` when any visible window still has a UI transition in flight. Drives the
+    /// host's 60 fps repaint timer so widget animations finish before going idle.
+    pub fn any_animating(&self) -> bool {
+        self.windows.iter().any(|w| w.visible && w.ui_state.is_animating())
     }
 }
 

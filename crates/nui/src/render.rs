@@ -591,7 +591,7 @@ void main() {
         float a = cov * v_fill.a;
         frag_color = vec4(v_fill.rgb * a, a);
     } else if (kind == 3) {
-        // kind == 3: Soft SDF drop shadow
+        // kind == 3: Soft SDF drop shadow (Gaussian half-plane edge integral: 0.5 at d=0, cubic falloff)
         float radius = v_params.x;
         float blur = max(v_params.y, 1.0);
         vec2 half_sz = max(v_rect_size * 0.5 - vec2(blur), vec2(1.0));
@@ -599,7 +599,7 @@ void main() {
         float r = min(radius, min(half_sz.x, half_sz.y));
         float d = sd_rounded_box(p, half_sz, r);
         float t = clamp(1.0 - max(d, 0.0) / blur, 0.0, 1.0);
-        float a = t * t * (3.0 - 2.0 * t) * v_fill.a;
+        float a = 0.5 * t * t * t * v_fill.a;
         if (a <= 0.002) discard;
         frag_color = vec4(v_fill.rgb * a, a);
     } else if (kind == 5) {
@@ -1448,7 +1448,7 @@ impl Renderer {
                         let d = dx.max(dy).min(0.0) + dx.max(0.0).hypot(dy.max(0.0)) - rad;
                         if d > 0.0 {
                             let t = (1.0 - d / blur).clamp(0.0, 1.0);
-                            let cov = (t * t * (3.0 - 2.0 * t) * a as f32) as u8;
+                            let cov = (0.5 * t * t * t * a as f32) as u8;
                             if cov > 0 {
                                 let dst = &mut buf[row_off + px as usize];
                                 *dst = crate::text::GammaLut::blend_naive_srgb(*dst, r, g, b, cov);

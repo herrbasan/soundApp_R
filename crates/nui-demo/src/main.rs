@@ -2,8 +2,9 @@
 //
 // A zero-audio, zero-application-dependency harness for the `nui` crate: every
 // interactive widget, the declarative layout engine, the vector/scene primitives,
-// browser-grade typography and the virtualized list, in five rich tabs. The binary
-// is the canonical place to develop and verify a component before it ships.
+// browser-grade typography, the virtualized list, the menu/dialog/sidebar shell —
+// in six rich tabs. The binary is the canonical place to develop and verify a
+// component before it ships.
 
 use std::time::{Duration, Instant};
 
@@ -15,10 +16,11 @@ use winit::window::{Window, WindowId};
 
 use nui::{
     BackendKind, BadgeVariant, ButtonVariant, Color, FontEngine, FontFace, KeyCmd,
-    Length, Rect, Renderer, Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec,
-    ICON_ADD, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_CLOSE, ICON_DARK_MODE, ICON_EQ,
-    ICON_LIGHT_MODE, ICON_LOCK, ICON_LOOP, ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV,
-    ICON_RESTART, ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE, ICON_VOLUME,
+    Length, LinkListEntry, MenuBarEntry, MenuItem, Rect, Renderer, Scene, TextSystem, Theme, Ui,
+    UiState, WindowManager, WindowSpec, ICON_ADD, ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP,
+    ICON_CLOSE, ICON_DARK_MODE, ICON_EQ, ICON_INFO, ICON_LIGHT_MODE, ICON_LOCK, ICON_LOOP,
+    ICON_MENU, ICON_MORE_VERT, ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV, ICON_RESTART,
+    ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE, ICON_VOLUME,
 };
 
 /// Secondary window spec — the live `UiState` inspector.
@@ -107,7 +109,25 @@ const ICONS: &[(&str, &str)] = &[
     (ICON_SHUFFLE, "ICON_SHUFFLE"),
     (ICON_RESTART, "ICON_RESTART"),
     (ICON_ADD, "ICON_ADD"),
+    (ICON_MENU, "ICON_MENU"),
+    (ICON_INFO, "ICON_INFO"),
+    (ICON_MORE_VERT, "ICON_MORE_VERT"),
 ];
+
+/// Tab navigation table `(action id, icon, label)` — the single source of truth
+/// for both the Components menu bar entries and the `nui-tabs` strip.
+const TAB_NAV: [(&str, &str, &str); 6] = [
+    ("tab:0", ICON_TUNE, "Controls & Inputs"),
+    ("tab:1", ICON_SETTINGS, "Layout & Cards"),
+    ("tab:2", ICON_EQ, "Vectors & Canvas"),
+    ("tab:3", ICON_SEARCH, "Typography & Icons"),
+    ("tab:4", ICON_LOOP, "Virtual List (10k)"),
+    ("tab:5", ICON_MENU, "Menus & Overlays"),
+];
+
+/// `nui-select` options for the transition-duration preset (tab 5).
+const TRANSITION_PRESETS: &[&str] =
+    &["None (0.00s)", "Fast (0.15s)", "Standard (0.20s)", "Slow (0.45s)"];
 
 const TYPO_TEXT: &str = "Hamburgefonstiv · 0123456789 · QWERTY";
 
@@ -233,8 +253,25 @@ struct App {
     pending_window_toggles: Vec<&'static str>,
     open_window_spec: Option<&'static WindowSpec>,
 
+    // Shell chrome: header · menu bar · collapsible `nui-sidebar`
+    sidebar_open: bool,
+    nav_groups: [bool; 3],
+    active_nav_key: String,
+    show_status_dialog: bool,
+    last_menu_action: String,
+
     // Tab + component state
     active_tab: usize,
+    // Last tab index the entrance transition was seeded for. A change re-seeds the
+    // `0x7AB0_0000` animation key so the panel replays its fade-in.
+    prev_tab: usize,
+    // Tab 5 owns its controls: sharing tab 0's would couple the two playgrounds.
+    anim_thumb: bool,
+    anim_flash: bool,
+    anim_check: bool,
+    anim_check2: bool,
+    anim_easing: usize,
+    anim_duration: usize,
     input_main: String,
     input_second: String,
     seg_choice: usize,
@@ -278,7 +315,7 @@ impl App {
             text_sys: TextSystem::new(),
             ui_state: UiState::new(),
             modifiers: ModifiersState::empty(),
-            size: (1120, 720),
+            size: (1220, 740),
             t: 0.0,
             frame_ms: 16,
             nopaint: false,
@@ -293,7 +330,20 @@ impl App {
             pending_window_toggles: Vec::new(),
             open_window_spec: None,
 
+            sidebar_open: true,
+            nav_groups: [true, true, true],
+            active_nav_key: "tab:0".to_string(),
+            show_status_dialog: false,
+            last_menu_action: "None (use menu bar or right-click)".to_string(),
+
             active_tab: 0,
+            prev_tab: 0,
+            anim_thumb: true,
+            anim_flash: false,
+            anim_check: true,
+            anim_check2: false,
+            anim_easing: 1,
+            anim_duration: 2,
             input_main: "NUI Rust playground".to_string(),
             input_second: String::new(),
             seg_choice: 0,
@@ -312,6 +362,48 @@ impl App {
             filter_used: String::new(),
             filtered: (0..ROW_COUNT).collect(),
             selected_row: 0,
+        }
+    }
+
+    /// Dispatch one action id emitted by `menu_bar` / `context_menu`. Runs outside the
+    /// `Ui` borrow so it is free to call [`App::set_zoom`] and touch widget state.
+    fn apply_nav_action(
+        &mut self,
+        action: &str,
+        toggle_backend_req: &mut bool,
+        toggle_font_req: &mut bool,
+        toggle_theme_req: &mut bool,
+        toggle_drop_req: &mut bool,
+        close_req: &mut bool,
+    ) {
+        self.last_menu_action = action.to_string();
+        match action {
+            "diag:dialog" => self.show_status_dialog = true,
+            "file:clear" => self.input_main.clear(),
+            "file:exit" => *close_req = true,
+            "view:sidebar" => self.sidebar_open = !self.sidebar_open,
+            "view:theme" => *toggle_theme_req = true,
+            "zoom:80" => self.set_zoom(0.8),
+            "zoom:100" => self.set_zoom(1.0),
+            "zoom:125" => self.set_zoom(1.25),
+            "zoom:150" => self.set_zoom(1.5),
+            "diag:inspector" => self.pending_window_toggles.push("inspector"),
+            "diag:backend" => *toggle_backend_req = true,
+            "diag:font" => *toggle_font_req = true,
+            "diag:drop" => *toggle_drop_req = true,
+            "diag:anim" => {
+                self.animate = !self.animate;
+                if self.animate {
+                    self.next_frame = Instant::now();
+                }
+            }
+            a if a.starts_with("tab:") => {
+                if let Some(n) = a[4..].parse::<usize>().ok().filter(|n| *n <= 5) {
+                    self.active_tab = n;
+                    self.active_nav_key = a.to_string();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -356,6 +448,10 @@ impl App {
         let mut toggle_drop_req = false;
         let mut zoom_delta: f32 = 0.0;
         let mut close_req = false;
+        // Menu bar and context menu both yield an action id; both are dispatched
+        // after the `Ui` borrow is released.
+        let menu_action: Option<String>;
+        let ctx_action: Option<String>;
 
         {
             let mut ui = Ui::new(
@@ -367,137 +463,88 @@ impl App {
             );
 
             // ================================================================
-            // 1. Application header (`nui-app-header`, 3.25rem)
+            // 1. Application header (`nui-app-header`, 3.25rem) — chrome only.
+            //    No badges, no demo buttons: the middle stays empty so it can act
+            //    as the live window drag zone.
             // ================================================================
             let hdr_h = theme.header_height();
             ui.scene.rect(0.0, 0.0, pw, hdr_h, theme.shade2);
             ui.scene.rect(0.0, hdr_h - 1.0, pw, 1.0, theme.border2);
 
-            let right_zone_w = (rem * 22.0).round();
+            let btn_h = (rem * 1.75).round();
+            let btn_y = (hdr_h - btn_h) * 0.5;
+
+            if ui.button(
+                89,
+                Rect::new((rem * 0.6).round(), btn_y, (rem * 2.1).round(), btn_h),
+                "",
+                ICON_MENU,
+                ButtonVariant::Ghost,
+            ) {
+                self.sidebar_open = !self.sidebar_open;
+            }
+
+            let title_fs = theme.font_medium();
             ui.scene
-                .push_clip(0.0, 0.0, (pw - right_zone_w).max(0.0), hdr_h);
-
-            let icon_sz = (rem * 1.25).round();
-            ui.scene.icon_centered(
+                .push_clip(rem * 3.1, 0.0, (pw - rem * 13.0).max(0.0), hdr_h);
+            let _ = ui.scene.text(
                 ui.text_sys,
-                ICON_TUNE,
-                rem * 0.85 + icon_sz * 0.5,
-                hdr_h * 0.5,
-                icon_sz,
-                theme.highlight,
-            );
-
-            let title_fs = theme.font_base();
-            let title_w = ui.scene.text(
-                ui.text_sys,
-                FontFace::SemiBold,
+                FontFace::Regular,
                 ui.font_engine,
-                "NUI Rust — Component Playground",
-                (rem * 2.35).round(),
+                "NUI Playground",
+                (rem * 3.1).round(),
                 (hdr_h * 0.5 + title_fs * 0.34).round(),
                 title_fs,
                 theme.text,
             );
-
-            let badge_y = (hdr_h - (rem * 1.48).round()) * 0.5;
-            let mut bx = rem * 2.35 + title_w + rem * 0.85;
-            let (b_lbl, b_var) = match active_backend {
-                BackendKind::Gpu => ("GPU · GL 3.3 SDF", BadgeVariant::Primary),
-                BackendKind::Cpu => ("CPU · SOFTBUFFER", BadgeVariant::Warning),
-            };
-            bx += ui.badge(bx, badge_y, b_lbl, b_var, Some(true)) + rem * 0.45;
-
-            let f_lbl = match self.font_engine {
-                FontEngine::Swash => "SWASH",
-                FontEngine::Fontdue => "FONTDUE",
-            };
-            bx += ui.badge(bx, badge_y, f_lbl, BadgeVariant::Primary, None) + rem * 0.45;
-
-            let fps_badge = if self.last_fps > 0 {
-                format!("{} FPS", self.last_fps)
-            } else {
-                "0% IDLE".to_string()
-            };
-            let _ = ui.badge(bx, badge_y, &fps_badge, BadgeVariant::Success, None);
             ui.scene.pop_clip();
 
-            // Header right controls: B · F · T · − · 100% · + · D · W · ×
-            let btn_h = (rem * 1.75).round();
-            let btn_y = (hdr_h - btn_h) * 0.5;
-            let mut rx = pw - rem * 0.6 - (rem * 2.1).round();
-            let close_w = (rem * 2.1).round();
+            // Right cluster: close · diagnostics · inspector · theme. Four identical
+            // 2rem icon buttons, matching the web Playground header exactly.
+            let icon_btn = (rem * 2.0).round();
+            let btn_gap = rem * 0.25;
+            let mut rx = pw - rem * 0.6 - icon_btn;
             if ui.button(
                 90,
-                Rect::new(rx, btn_y, close_w, btn_h),
+                Rect::new(rx, btn_y, icon_btn, icon_btn),
                 "",
                 ICON_CLOSE,
-                ButtonVariant::Danger,
+                ButtonVariant::Ghost,
             ) {
                 close_req = true;
             }
 
-            rx -= (rem * 2.1).round() + rem * 0.3;
+            rx -= icon_btn + btn_gap;
+            if ui.button(
+                98,
+                Rect::new(rx, btn_y, icon_btn, icon_btn),
+                "",
+                ICON_SETTINGS,
+                if self.show_status_dialog {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                },
+            ) {
+                self.show_status_dialog = !self.show_status_dialog;
+            }
+
+            rx -= icon_btn + btn_gap;
             if ui.button(
                 91,
-                Rect::new(rx, btn_y, (rem * 2.1).round(), btn_h),
-                "W",
+                Rect::new(rx, btn_y, icon_btn, icon_btn),
                 "",
-                ButtonVariant::Outline,
+                ICON_TUNE,
+                if self.secondary_windows.is_visible("inspector") {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                },
             ) {
                 self.pending_window_toggles.push("inspector");
             }
 
-            rx -= (rem * 2.1).round() + rem * 0.3;
-            let d_var = if ui.state.hovered_file.is_some() {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Outline
-            };
-            if ui.button(
-                92,
-                Rect::new(rx, btn_y, (rem * 2.1).round(), btn_h),
-                "D",
-                "",
-                d_var,
-            ) {
-                toggle_drop_req = true;
-            }
-
-            rx -= (rem * 1.75).round() + rem * 0.3;
-            if ui.button(
-                93,
-                Rect::new(rx, btn_y, (rem * 1.75).round(), btn_h),
-                "+",
-                "",
-                ButtonVariant::Outline,
-            ) {
-                zoom_delta = 0.1;
-            }
-
-            rx -= (rem * 3.4).round() + rem * 0.25;
-            let zoom_lbl = format!("{:.0}%", self.ui_zoom * 100.0);
-            if ui.button(
-                94,
-                Rect::new(rx, btn_y, (rem * 3.4).round(), btn_h),
-                &zoom_lbl,
-                "",
-                ButtonVariant::Outline,
-            ) {
-                zoom_delta = 1.0 - self.ui_zoom;
-            }
-
-            rx -= (rem * 1.75).round() + rem * 0.25;
-            if ui.button(
-                95,
-                Rect::new(rx, btn_y, (rem * 1.75).round(), btn_h),
-                "-",
-                "",
-                ButtonVariant::Outline,
-            ) {
-                zoom_delta = -0.1;
-            }
-
-            rx -= (rem * 2.1).round() + rem * 0.3;
+            rx -= icon_btn + btn_gap;
             let th_icon = if self.dark_mode {
                 ICON_LIGHT_MODE
             } else {
@@ -505,7 +552,7 @@ impl App {
             };
             if ui.button(
                 96,
-                Rect::new(rx, btn_y, (rem * 2.1).round(), btn_h),
+                Rect::new(rx, btn_y, icon_btn, icon_btn),
                 "",
                 th_icon,
                 ButtonVariant::Ghost,
@@ -513,56 +560,350 @@ impl App {
                 toggle_theme_req = true;
             }
 
-            rx -= (rem * 2.1).round() + rem * 0.3;
-            if ui.button(
-                97,
-                Rect::new(rx, btn_y, (rem * 2.1).round(), btn_h),
-                "F",
-                "",
-                ButtonVariant::Outline,
-            ) {
-                toggle_font_req = true;
-            }
-
-            rx -= (rem * 2.1).round() + rem * 0.3;
-            if ui.button(
-                98,
-                Rect::new(rx, btn_y, (rem * 2.1).round(), btn_h),
-                "B",
-                "",
-                ButtonVariant::Primary,
-            ) {
-                toggle_backend_req = true;
-            }
-
             // ================================================================
-            // 2. Full-width tab bar + tab body
+            // 2. `.nui-menu-bar` — the whole demo control surface
+            //    The shell geometry is needed first: the sidebar occupies the
+            //    full-height left column under the header, and the menu bar
+            //    starts immediately to its right.
             // ================================================================
             let m = Length::Rem(1.0).resolve(rem).round();
-            let tabs_r = Rect::new(
-                m,
-                hdr_h + (rem * 0.5).round(),
-                (pw - m * 2.0).max(0.0),
-                (rem * 2.6).round(),
-            );
-            let _ = ui.tabs(
-                100,
-                tabs_r,
-                &[
-                    (ICON_TUNE, "Controls & Inputs"),
-                    (ICON_SETTINGS, "Layout & Cards"),
-                    (ICON_EQ, "Vectors & Canvas"),
-                    (ICON_SEARCH, "Typography & Icons"),
-                    (ICON_LOOP, "Virtual List (10k)"),
-                ],
-                &mut self.active_tab,
+            let shell_y = hdr_h;
+            let shell_h = (ph - shell_y).max(0.0);
+
+            let side_t = ui.state.animate_bool(8800, self.sidebar_open, 0.30);
+            let side_w = ((rem * 15.0).round() * side_t).round();
+
+            let menu_h = (rem * 2.0).round();
+            let zoom_items: &[MenuItem<'_>] = &[
+                MenuItem::Action {
+                    label: "80%",
+                    icon: "",
+                    shortcut: "",
+                    action: "zoom:80",
+                    disabled: false,
+                    checked: Some((self.ui_zoom - 0.80).abs() < 0.01),
+                },
+                MenuItem::Action {
+                    label: "100%",
+                    icon: "",
+                    shortcut: "",
+                    action: "zoom:100",
+                    disabled: false,
+                    checked: Some((self.ui_zoom - 1.00).abs() < 0.01),
+                },
+                MenuItem::Action {
+                    label: "125%",
+                    icon: "",
+                    shortcut: "",
+                    action: "zoom:125",
+                    disabled: false,
+                    checked: Some((self.ui_zoom - 1.25).abs() < 0.01),
+                },
+                MenuItem::Action {
+                    label: "150%",
+                    icon: "",
+                    shortcut: "",
+                    action: "zoom:150",
+                    disabled: false,
+                    checked: Some((self.ui_zoom - 1.50).abs() < 0.01),
+                },
+            ];
+
+            let file_items: &[MenuItem<'_>] = &[
+                MenuItem::Action {
+                    label: "Status & Demo Controls…",
+                    icon: "",
+                    shortcut: "F1",
+                    action: "diag:dialog",
+                    disabled: false,
+                    checked: None,
+                },
+                MenuItem::Action {
+                    label: "Clear Primary Input",
+                    icon: "",
+                    shortcut: "Ctrl+L",
+                    action: "file:clear",
+                    disabled: false,
+                    checked: None,
+                },
+                MenuItem::Separator,
+                MenuItem::Action {
+                    label: "Exit Playground",
+                    icon: "",
+                    shortcut: "Esc",
+                    action: "file:exit",
+                    disabled: false,
+                    checked: None,
+                },
+            ];
+
+            let view_items: &[MenuItem<'_>] = &[
+                MenuItem::Action {
+                    label: "Show Sidebar",
+                    icon: "",
+                    shortcut: "Ctrl+B",
+                    action: "view:sidebar",
+                    disabled: false,
+                    checked: Some(self.sidebar_open),
+                },
+                MenuItem::Action {
+                    label: "Dark Theme",
+                    icon: "",
+                    shortcut: "T",
+                    action: "view:theme",
+                    disabled: false,
+                    checked: Some(self.dark_mode),
+                },
+                MenuItem::Separator,
+                MenuItem::Submenu {
+                    label: "UI Zoom",
+                    icon: "",
+                    disabled: false,
+                    items: zoom_items,
+                },
+            ];
+
+            let comp_items: Vec<MenuItem<'_>> = TAB_NAV
+                .iter()
+                .enumerate()
+                .map(|(i, &(action, _icon, label))| MenuItem::Action {
+                    label,
+                    icon: "",
+                    shortcut: "",
+                    action,
+                    disabled: false,
+                    checked: Some(i == self.active_tab),
+                })
+                .collect();
+
+            let diag_items: &[MenuItem<'_>] = &[
+                MenuItem::Action {
+                    label: "Status & Settings Dialog…",
+                    icon: "",
+                    shortcut: "",
+                    action: "diag:dialog",
+                    disabled: false,
+                    checked: Some(self.show_status_dialog),
+                },
+                MenuItem::Action {
+                    label: "UiState Inspector Window",
+                    icon: "",
+                    shortcut: "W",
+                    action: "diag:inspector",
+                    disabled: false,
+                    checked: None,
+                },
+                MenuItem::Separator,
+                MenuItem::Action {
+                    label: "Switch Backend (GPU / CPU)",
+                    icon: "",
+                    shortcut: "B",
+                    action: "diag:backend",
+                    disabled: false,
+                    checked: None,
+                },
+                MenuItem::Action {
+                    label: "Switch Font Engine (Swash / Fontdue)",
+                    icon: "",
+                    shortcut: "F",
+                    action: "diag:font",
+                    disabled: false,
+                    checked: None,
+                },
+                MenuItem::Action {
+                    label: "Toggle Dropzone Preview",
+                    icon: "",
+                    shortcut: "D",
+                    action: "diag:drop",
+                    disabled: false,
+                    checked: Some(ui.state.hovered_file.is_some()),
+                },
+                MenuItem::Action {
+                    label: "Toggle 60fps Stress Animation",
+                    icon: "",
+                    shortcut: "Space",
+                    action: "diag:anim",
+                    disabled: false,
+                    checked: Some(self.animate),
+                },
+            ];
+
+            let menus: Vec<MenuBarEntry<'_>> = vec![
+                MenuBarEntry { label: "File", items: file_items },
+                MenuBarEntry { label: "View", items: view_items },
+                MenuBarEntry { label: "Components", items: &comp_items },
+                MenuBarEntry { label: "Diagnostics", items: diag_items },
+            ];
+            menu_action = ui.menu_bar(
+                500,
+                Rect::new(side_w, hdr_h, (pw - side_w).max(0.0), menu_h),
+                &menus,
             );
 
+            // ================================================================
+            // 3. Collapsible `nui-sidebar` + `nui-link-list[mode="fold"]`
+            //    The sidebar is a full-height left column that starts directly
+            //    under the header; the menu bar sits to its right.
+            // ================================================================
+            if side_w > 2.0 {
+                ui.scene.rect(0.0, shell_y, side_w, shell_h, theme.shade2);
+                ui.scene
+                    .rect(side_w - 1.0, shell_y, 1.0, shell_h, theme.border2);
+
+                let g_components: &[LinkListEntry<'_>] = &[
+                    LinkListEntry::Item {
+                        key: "tab:0",
+                        label: "Controls & Inputs",
+                        icon: "",
+                        badge: "",
+                    },
+                    LinkListEntry::Item {
+                        key: "tab:1",
+                        label: "Layout & Cards",
+                        icon: "",
+                        badge: "",
+                    },
+                    LinkListEntry::Item {
+                        key: "tab:5",
+                        label: "Menus & Overlays",
+                        icon: "",
+                        badge: "",
+                    },
+                ];
+                let g_rendering: &[LinkListEntry<'_>] = &[
+                    LinkListEntry::Item {
+                        key: "tab:2",
+                        label: "Vectors & Canvas",
+                        icon: "",
+                        badge: "",
+                    },
+                    LinkListEntry::Item {
+                        key: "tab:3",
+                        label: "Typography & Icons",
+                        icon: "",
+                        badge: "",
+                    },
+                    LinkListEntry::Item {
+                        key: "tab:4",
+                        label: "Virtual List (10k)",
+                        icon: "",
+                        badge: "",
+                    },
+                ];
+                let g_system: &[LinkListEntry<'_>] = &[
+                    LinkListEntry::Item {
+                        key: "dlg:status",
+                        label: "Diagnostics & Status",
+                        icon: "",
+                        badge: "",
+                    },
+                    LinkListEntry::Item {
+                        key: "win:inspector",
+                        label: "Inspector Window",
+                        icon: "",
+                        badge: "",
+                    },
+                ];
+                let nav_entries: Vec<LinkListEntry<'_>> = vec![
+                    LinkListEntry::Group {
+                        id: 1,
+                        label: "Components",
+                        icon: ICON_TUNE,
+                        expanded: self.nav_groups[0],
+                        items: g_components,
+                    },
+                    LinkListEntry::Group {
+                        id: 2,
+                        label: "Rendering & Data",
+                        icon: ICON_EQ,
+                        expanded: self.nav_groups[1],
+                        items: g_rendering,
+                    },
+                    LinkListEntry::Separator,
+                    LinkListEntry::Group {
+                        id: 3,
+                        label: "System & Tools",
+                        icon: ICON_INFO,
+                        expanded: self.nav_groups[2],
+                        items: g_system,
+                    },
+                ];
+
+                let mut toggled_group: Option<u32> = None;
+                ui.scene
+                    .push_clip(0.0, shell_y, (side_w - 1.0).max(0.0), shell_h);
+                let nav_clicked = ui.link_list(
+                    850,
+                    Rect::new(
+                        0.0,
+                        shell_y,
+                        (rem * 15.0).round(),
+                        shell_h,
+                    ),
+                    &nav_entries,
+                    &mut self.active_nav_key,
+                    &mut toggled_group,
+                );
+                ui.scene.pop_clip();
+
+                if let Some(g) = toggled_group.filter(|g| (1..=3).contains(g)) {
+                    let slot = &mut self.nav_groups[(g - 1) as usize];
+                    *slot = !*slot;
+                }
+                if nav_clicked {
+                    let key = self.active_nav_key.clone();
+                    if let Some(n) = key.strip_prefix("tab:").and_then(|s| s.parse().ok()) {
+                        if n <= 5 {
+                            self.active_tab = n;
+                        }
+                    } else if key == "dlg:status" {
+                        self.show_status_dialog = true;
+                        self.active_nav_key = format!("tab:{}", self.active_tab);
+                    } else if key == "win:inspector" {
+                        self.pending_window_toggles.push("inspector");
+                        self.active_nav_key = format!("tab:{}", self.active_tab);
+                    }
+                }
+            }
+
+            let main_x = side_w + m;
+            let main_w = (pw - side_w - m * 2.0).max(0.0);
+            let tab_labels: Vec<(&str, &str)> =
+                TAB_NAV.iter().map(|&(_, icon, label)| (icon, label)).collect();
+            let tabs_r = Rect::new(
+                main_x,
+                hdr_h + menu_h,
+                main_w,
+                (rem * 2.5).round(),
+            );
+            if ui.tabs(100, tabs_r, &tab_labels, &mut self.active_tab) {
+                self.active_nav_key = format!("tab:{}", self.active_tab);
+            }
+
             let body_y = tabs_r.y + tabs_r.h + (rem * 0.6).round();
+            // Tab panel entrance (`@keyframes ani-fade-in`, nui-theme.css:4529): fade in
+            // plus a short upward slide. Re-seeding the key at 0.0 is what makes it
+            // replay — `animate_bool` snaps to the target the first time it sees a key.
+            const TAB_IN_KEY: u32 = 0x7AB0_0000;
+            if self.active_tab != self.prev_tab {
+                self.prev_tab = self.active_tab;
+                ui.state
+                    .anim_values
+                    .retain(|(k, _)| *k != TAB_IN_KEY);
+                ui.state.anim_values.push((TAB_IN_KEY, 0.0));
+            } else if !ui
+                .state
+                .anim_values
+                .iter()
+                .any(|(k, _)| *k == TAB_IN_KEY)
+            {
+                ui.state.anim_values.push((TAB_IN_KEY, 1.0));
+            }
+            let tab_in = ui.state.animate_bool(TAB_IN_KEY, true, 0.30);
             let body = Rect::new(
-                m,
-                body_y,
-                (pw - m * 2.0).max(0.0),
+                main_x,
+                body_y + (1.0 - tab_in) * (rem * 0.35),
+                main_w,
                 (ph - body_y - m).max(80.0),
             );
 
@@ -575,7 +916,7 @@ impl App {
                         ui.cols(body, Length::rem(1.25), [Length::fill(), Length::fill()]);
                     let mut select_r = Rect::new(0.0, 0.0, 0.0, 0.0);
 
-                    ui.card(col_l, Length::rem(1.25), Length::rem(0.9), |ui| {
+                    ui.card(col_l, Length::rem(1.25), Length::rem(0.62), |ui| {
                         let inp = ui.input_group("nui-input · primary field");
                         ui.text_input(301, inp, "Type something…", &mut self.input_main);
 
@@ -1091,11 +1432,11 @@ impl App {
                     );
 
                     ui.nui_card(icons_r, |ui| {
-                        ui.heading("Material Icons — 20 constants · layout_icon_centered");
+                        ui.heading("Material Icons — 23 constants · layout_icon_centered");
                         let area = ui.take_rest();
                         let cols = 5usize;
                         let cell_w = (area.w / cols as f32).floor();
-                        let cell_h = (area.h / 4.0).floor();
+                        let cell_h = (area.h / 5.0).floor();
                         for (i, &(glyph, name)) in ICONS.iter().enumerate() {
                             let cx = area.x + (i % cols) as f32 * cell_w;
                             let cy = area.y + (i / cols) as f32 * cell_h;
@@ -1136,7 +1477,7 @@ impl App {
                 // ============================================================
                 // TAB 4 — Virtual List (10k)
                 // ============================================================
-                _ => {
+                4 => {
                     // Rebuild the filtered index set only when the query changes.
                     let needle = self.filter.trim().to_lowercase();
                     if self.filter != self.filter_used {
@@ -1209,7 +1550,349 @@ impl App {
                         ui.kv_row("format", &track_meta(i), Length::rem(7.0));
                     });
                 }
+
+                // ============================================================
+                // TAB 5 — Menus & Overlays
+                // ============================================================
+                5 => {
+                    let [col_l, col_r] =
+                        ui.cols(body, Length::rem(1.25), [Length::fill(), Length::fill()]);
+
+                    ui.nui_card(col_l, |ui| {
+                        ui.heading("nui-menu, nui-context-menu & nui-dialog");
+                        ui.kv_row(
+                            "last menu action",
+                            &self.last_menu_action,
+                            Length::rem(9.0),
+                        );
+
+                        let [dlg_r, ctx_r] = ui.take_cols(
+                            Length::rem(2.0),
+                            Length::rem(0.6),
+                            [Length::fill(), Length::fill()],
+                        );
+                        if ui.button(
+                            560,
+                            dlg_r,
+                            "Open Diagnostics Dialog",
+                            ICON_INFO,
+                            ButtonVariant::Primary,
+                        ) {
+                            self.show_status_dialog = true;
+                        }
+                        if ui.button(
+                            561,
+                            ctx_r,
+                            "Pop Context Menu",
+                            ICON_MORE_VERT,
+                            ButtonVariant::Outline,
+                        ) {
+                            ui.state.open_popup_id = Some(550);
+                            ui.state.active_submenu = None;
+                            ui.state.context_menu_pos =
+                                (col_l.x + col_l.w * 0.5, col_l.y + col_l.h * 0.55);
+                        }
+
+                        let [sb_r, insp_r] = ui.take_cols(
+                            Length::rem(2.0),
+                            Length::rem(0.6),
+                            [Length::fill(), Length::fill()],
+                        );
+                        if ui.button(
+                            562,
+                            sb_r,
+                            "Toggle Sidebar",
+                            ICON_MENU,
+                            ButtonVariant::Outline,
+                        ) {
+                            self.sidebar_open = !self.sidebar_open;
+                        }
+                        if ui.button(
+                            563,
+                            insp_r,
+                            "Inspector Window (W)",
+                            ICON_SETTINGS,
+                            ButtonVariant::Outline,
+                        ) {
+                            self.pending_window_toggles.push("inspector");
+                        }
+
+                        let ctx_zone = ui.take_rest();
+                        ui.inset_card(
+                            ctx_zone,
+                            Length::rem(0.9),
+                            Length::rem(0.5),
+                            theme.border2,
+                            |ui| {
+                                ui.heading("nui-context-menu");
+                                let b = ui.bounds();
+                                let fs = theme.font_small();
+                                ui.text_clipped(
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    "Right-click anywhere in the workspace to open nui-context-menu (with nested submenus, checkmarks, and shortcuts).",
+                                    b.x.round(),
+                                    (b.y + fs).round(),
+                                    fs,
+                                    b.w,
+                                    theme.text_muted,
+                                );
+                            },
+                        );
+                    });
+
+                    ui.nui_card(col_r, |ui| {
+                        ui.heading("Animation System & Transition Polish");
+
+                        let live_anim = ui.state.is_animating();
+                        let st_row = ui.take(Length::rem(1.9));
+                        let badge_h = (rem * 1.48).round();
+                        let by = (st_row.y + (st_row.h - badge_h) * 0.5).round();
+                        let (st_lbl, st_var) = if live_anim {
+                            ("TRANSITION ACTIVE (60Hz)", BadgeVariant::Success)
+                        } else {
+                            ("0% CPU IDLE (ControlFlow::Wait)", BadgeVariant::Primary)
+                        };
+                        let _ = ui.badge(st_row.x, by, st_lbl, st_var, None);
+
+                        let s1 = ui.take(Length::rem(2.0));
+                        ui.switch(570, s1, "Smooth thumb sliding (0.30s easeInOut)", &mut self.anim_thumb);
+                        let s2 = ui.take(Length::rem(2.0));
+                        ui.switch(
+                            571,
+                            s2,
+                            "Button click flash (0.10s)",
+                            &mut self.anim_flash,
+                        );
+
+                        let c1 = ui.take(Length::rem(2.0));
+                        ui.checkbox(572, c1, "Check pop-in", &mut self.anim_check);
+                        let c2 = ui.take(Length::rem(2.0));
+                        ui.checkbox(573, c2, "Preserve formants", &mut self.anim_check2);
+
+                        let rr = ui.form_field("nui-radio · easing curve", Length::rem(2.0));
+                        let rw = (rr.w / 4.0).floor();
+                        for (i, lab) in ["Linear", "Ease", "Spring", "Bounce"]
+                            .iter()
+                            .enumerate()
+                        {
+                            if ui.radio(
+                                580 + i as u32,
+                                Rect::new(rr.x + i as f32 * rw, rr.y, rw, rr.h),
+                                lab,
+                                self.anim_easing == i,
+                            ) {
+                                self.anim_easing = i;
+                            }
+                        }
+
+                        let sel_r = ui.input_group("nui-select · dropdown slide-open");
+                        ui.select(590, sel_r, TRANSITION_PRESETS, &mut self.anim_duration);
+                    });
+                }
+                // `active_tab` is clamped to 0..=5 at every write site (CLI, menu,
+                // sidebar, `nui-tabs`); this arm exists only to satisfy usize
+                // exhaustiveness.
+                _ => {}
             }
+
+            // ================================================================
+            // 4. Overlay layers — context menu (right-click), then the modal dialog.
+            //    Drawn last so they sit above every sibling in the display list.
+            // ================================================================
+            let ctx_items: &[MenuItem<'_>] = &[
+                MenuItem::Action {
+                    label: "Status & Demo Controls…",
+                    icon: "",
+                    shortcut: "F1",
+                    action: "diag:dialog",
+                    disabled: false,
+                    checked: Some(self.show_status_dialog),
+                },
+                MenuItem::Action {
+                    label: "Show Sidebar",
+                    icon: "",
+                    shortcut: "Ctrl+B",
+                    action: "view:sidebar",
+                    disabled: false,
+                    checked: Some(self.sidebar_open),
+                },
+                MenuItem::Action {
+                    label: "Dark Theme",
+                    icon: "",
+                    shortcut: "T",
+                    action: "view:theme",
+                    disabled: false,
+                    checked: Some(self.dark_mode),
+                },
+                MenuItem::Action {
+                    label: "Clear Primary Input",
+                    icon: "",
+                    shortcut: "Ctrl+L",
+                    action: "file:clear",
+                    disabled: false,
+                    checked: None,
+                },
+                MenuItem::Separator,
+                MenuItem::Submenu {
+                    label: "UI Zoom",
+                    icon: "",
+                    disabled: false,
+                    items: zoom_items,
+                },
+            ];
+            ctx_action = if self.show_status_dialog {
+                // The modal owns the popup slot and its backdrop — a right-click must
+                // not open a context menu underneath it.
+                None
+            } else {
+                ui.context_menu(
+                    550,
+                    Rect::new(main_x, shell_y, main_w, shell_h),
+                    Rect::new(0.0, 0.0, pw, ph),
+                    ctx_items,
+                )
+            };
+
+            ui.dialog(
+                950,
+                Rect::new(0.0, 0.0, pw, ph),
+                &mut self.show_status_dialog,
+                "Diagnostics, Status & Demo Controls",
+                ICON_SETTINGS,
+                (rem * 38.0).round().min(pw - rem * 2.0),
+                (rem * 24.5).round().min(ph - rem * 2.0),
+                |ui, body_r| {
+                    ui.with_column(ui.pad(body_r, Length::rem(1.25)), Length::rem(0.75), |ui| {
+                        let st_row = ui.take(Length::rem(1.8));
+                        let badge_y = (st_row.y + (st_row.h - (rem * 1.48).round()) * 0.5).round();
+                        let mut bx = st_row.x;
+                        let (b_lbl, b_var) = match active_backend {
+                            BackendKind::Gpu => ("GPU · GL 3.3 SDF", BadgeVariant::Primary),
+                            BackendKind::Cpu => ("CPU · SOFTBUFFER", BadgeVariant::Warning),
+                        };
+                        bx += ui.badge(bx, badge_y, b_lbl, b_var, Some(true))
+                            + theme.space_half();
+
+                        let f_lbl = match self.font_engine {
+                            FontEngine::Swash => "SWASH",
+                            FontEngine::Fontdue => "FONTDUE",
+                        };
+                        bx += ui.badge(bx, badge_y, f_lbl, BadgeVariant::Primary, None)
+                            + theme.space_half();
+
+                        let fps_lbl = if self.last_fps > 0 {
+                            format!("{} FPS", self.last_fps)
+                        } else {
+                            "0% IDLE".to_string()
+                        };
+                        let _ = ui.badge(bx, badge_y, &fps_lbl, BadgeVariant::Success, None);
+
+                        let anim_lbl = if ui.state.is_animating() {
+                            "yes"
+                        } else {
+                            "no"
+                        };
+                        let left: [(&str, String); 3] = [
+                            (
+                                "active backend",
+                                match active_backend {
+                                    BackendKind::Gpu => "GPU · instanced SDF".to_string(),
+                                    BackendKind::Cpu => "CPU · softbuffer".to_string(),
+                                },
+                            ),
+                            (
+                                "font engine",
+                                match self.font_engine {
+                                    FontEngine::Swash => "Swash".to_string(),
+                                    FontEngine::Fontdue => "Fontdue".to_string(),
+                                },
+                            ),
+                            (
+                                "theme",
+                                if self.dark_mode { "dark" } else { "light" }.to_string(),
+                            ),
+                        ];
+                        let right: [(&str, String); 3] = [
+                            ("ui zoom", format!("{:.0}%", self.ui_zoom * 100.0)),
+                            (
+                                "quad instances",
+                                format!("{}", ui.scene.instances.len()),
+                            ),
+                            ("animating", anim_lbl.to_string()),
+                        ];
+
+                        let diag_r = ui.take(Length::rem(7.0));
+                        let [d1, d2] =
+                            ui.cols(diag_r, Length::rem(1.0), [Length::fill(), Length::fill()]);
+                        ui.with_column(d1, Length::rem(0.0), |ui| {
+                            for (k, v) in left.iter() {
+                                ui.kv_row(k, v, Length::rem(8.5));
+                            }
+                        });
+                        ui.with_column(d2, Length::rem(0.0), |ui| {
+                            for (k, v) in right.iter() {
+                                ui.kv_row(k, v, Length::rem(8.5));
+                            }
+                        });
+
+                        let r1 = ui.take(Length::rem(2.0));
+                        let [a1, a2, a3] = ui.cols(
+                            r1,
+                            Length::rem(0.6),
+                            [Length::fill(), Length::fill(), Length::fill()],
+                        );
+                        if ui.button(960, a1, "Backend [B]", "", ButtonVariant::Primary) {
+                            toggle_backend_req = true;
+                        }
+                        if ui.button(961, a2, "Font [F]", "", ButtonVariant::Outline) {
+                            toggle_font_req = true;
+                        }
+                        if ui.button(962, a3, "Theme [T]", "", ButtonVariant::Outline) {
+                            toggle_theme_req = true;
+                        }
+
+                        let zoom_lbl = format!("{:.0}% Reset", self.ui_zoom * 100.0);
+                        let r2 = ui.take(Length::rem(2.0));
+                        let [b1, b2, b3] = ui.cols(
+                            r2,
+                            Length::rem(0.6),
+                            [Length::fill(), Length::rem(6.5), Length::fill()],
+                        );
+                        if ui.button(963, b1, "Zoom -", "", ButtonVariant::Outline) {
+                            zoom_delta = -0.1;
+                        }
+                        if ui.button(964, b2, &zoom_lbl, "", ButtonVariant::Outline) {
+                            zoom_delta = 1.0 - self.ui_zoom;
+                        }
+                        if ui.button(965, b3, "Zoom +", "", ButtonVariant::Outline) {
+                            zoom_delta = 0.1;
+                        }
+
+                        let r3 = ui.take(Length::rem(2.0));
+                        let [c1, c2, c3] = ui.cols(
+                            r3,
+                            Length::rem(0.6),
+                            [Length::fill(), Length::fill(), Length::fill()],
+                        );
+                        if ui.button(966, c1, "Dropzone [D]", "", ButtonVariant::Outline)
+                        {
+                            toggle_drop_req = true;
+                        }
+                        if ui.button(967, c2, "Inspector [W]", "", ButtonVariant::Outline) {
+                            self.pending_window_toggles.push("inspector");
+                        }
+                        let anim_var = if self.animate {
+                            ButtonVariant::Success
+                        } else {
+                            ButtonVariant::Outline
+                        };
+                        if ui.button(968, c3, "60fps [Space]", "", anim_var) {
+                            self.animate = !self.animate;
+                        }
+                    });
+                },
+            );
 
             // Synthetic UI complexity stress test (`--ops N`).
             let iw = (pw as usize).max(1);
@@ -1234,6 +1917,17 @@ impl App {
 
             ui.scene.finish_frame();
             ui.state.end_frame();
+        }
+
+        for action in [menu_action, ctx_action].into_iter().flatten() {
+            self.apply_nav_action(
+                &action,
+                &mut toggle_backend_req,
+                &mut toggle_font_req,
+                &mut toggle_theme_req,
+                &mut toggle_drop_req,
+                &mut close_req,
+            );
         }
 
         if toggle_backend_req {
@@ -1383,6 +2077,7 @@ impl App {
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
                     w.ui_state.cursor = (position.x as f32, position.y as f32);
+                    nui::update_resize_cursor(&w.window, w.ui_state.cursor, w.size);
                     w.window.request_redraw();
                 }
             }
@@ -1403,12 +2098,20 @@ impl App {
                     if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
                         match state {
                             ElementState::Pressed => {
+                                if nui::try_start_window_resize(
+                                    &w.window,
+                                    w.ui_state.cursor,
+                                    w.size,
+                                ) {
+                                    return;
+                                }
                                 let rem = 16.0 * w.window.scale_factor() as f32;
                                 let hdr_h = (rem * 3.0).round();
                                 if w.ui_state.cursor.1 < hdr_h
                                     && w.ui_state.cursor.0 < w.size.0 as f32 - rem * 3.0
                                 {
-                                    let _ = w.window.drag_window();
+                                    let win = w.window.clone();
+                                    nui::drag_window_live(&win);
                                 } else {
                                     w.ui_state.on_mouse_press();
                                     w.window.request_redraw();
@@ -1524,9 +2227,11 @@ impl App {
                     ("backend", backend_lbl),
                     ("zoom", zoom_lbl),
                 ];
-                let shortcuts: [(&str, &str); 6] = [
+                let shortcuts: [(&str, &str); 8] = [
                     ("Tab / Shift+Tab", "focus ring"),
                     ("Ctrl+C / X / V / A", "clipboard"),
+                    ("Ctrl+B / Ctrl+L", "sidebar / clear input"),
+                    ("F1", "diagnostics dialog"),
                     ("B / F / T", "backend / font / theme"),
                     ("D / W", "dropzone / inspector"),
                     ("+ / - / 0", "zoom in / out / reset"),
@@ -1554,12 +2259,12 @@ impl App {
                     let [s1, s2] =
                         ui.cols(sc, Length::rem(1.0), [Length::fill(), Length::fill()]);
                     ui.with_column(s1, Length::rem(0.0), |ui| {
-                        for &(k, v) in shortcuts.iter().take(3) {
+                        for &(k, v) in shortcuts.iter().take(4) {
                             ui.kv_row(k, v, Length::rem(8.5));
                         }
                     });
                     ui.with_column(s2, Length::rem(0.0), |ui| {
-                        for &(k, v) in shortcuts.iter().skip(3) {
+                        for &(k, v) in shortcuts.iter().skip(4) {
                             ui.kv_row(k, v, Length::rem(8.5));
                         }
                     });
@@ -1596,8 +2301,9 @@ impl ApplicationHandler for App {
         }
         let mut attrs = Window::default_attributes()
             .with_title("NUI Rust — Component Playground")
-            .with_inner_size(winit::dpi::LogicalSize::new(1120.0, 700.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(1220.0, 740.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0))
+            .with_resizable(true)
             .with_decorations(false);
 
         #[cfg(target_os = "windows")]
@@ -1673,6 +2379,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui_state.cursor = (position.x as f32, position.y as f32);
+                if let Some(w) = &self.window {
+                    nui::update_resize_cursor(w, self.ui_state.cursor, self.size);
+                }
                 // While the animation timer runs, `about_to_wait` already redraws;
                 // only force a redraw for immediate drag feedback or when idle.
                 if !self.animate || self.ui_state.mouse_down {
@@ -1701,6 +2410,12 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => match button {
                 MouseButton::Left => match state {
                     ElementState::Pressed => {
+                        // Edge/corner resize wins over every in-window interaction.
+                        if let Some(w) = self.window.clone() {
+                            if nui::try_start_window_resize(&w, self.ui_state.cursor, self.size) {
+                                return;
+                            }
+                        }
                         let scale = self
                             .window
                             .as_ref()
@@ -1708,13 +2423,14 @@ impl ApplicationHandler for App {
                             .unwrap_or(1.0);
                         let rem = (16.0 * scale).round();
                         let hdr_h = (rem * 3.25).round();
-                        // Drag by the empty header area left of the control cluster.
-                        let right_btns_x = self.size.0 as f32 - rem * 22.0;
+                        // Drag by the empty header strip between the title and the
+                        // right-hand button cluster.
                         if self.ui_state.cursor.1 < hdr_h
-                            && self.ui_state.cursor.0 < right_btns_x
+                            && self.ui_state.cursor.0 > rem * 3.0
+                            && self.ui_state.cursor.0 < self.size.0 as f32 - rem * 10.0
                         {
                             if let Some(w) = &self.window {
-                                let _ = w.drag_window();
+                                nui::drag_window_live(w);
                             }
                         } else {
                             self.ui_state.on_mouse_press();
@@ -1759,6 +2475,9 @@ impl ApplicationHandler for App {
                                 return;
                             }
                         }
+                        Key::Named(NamedKey::F1) => {
+                            self.show_status_dialog = true;
+                        }
                         Key::Named(NamedKey::Backspace) => {
                             self.ui_state.key_cmds.push(KeyCmd::Backspace);
                         }
@@ -1802,6 +2521,12 @@ impl ApplicationHandler for App {
                         }
                         Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("v") => {
                             self.ui_state.key_cmds.push(KeyCmd::Paste);
+                        }
+                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("l") => {
+                            self.input_main.clear();
+                        }
+                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("b") => {
+                            self.sidebar_open = !self.sidebar_open;
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("b") => {
                             if let Some(r) = &mut self.renderer {
@@ -1888,24 +2613,31 @@ impl ApplicationHandler for App {
             }
         }
 
+        // A widget transition (menu slide, sidebar collapse, dialog pop, button flash)
+        // is animation too: keep the frame loop alive until every one has settled.
+        let ui_anim = self.ui_state.is_animating() || self.secondary_windows.any_animating();
+        let animating = self.animate || ui_anim;
+
         // Idle means 0% CPU: reset the FPS counter so the header badge reads IDLE.
-        if !self.animate {
+        if !animating {
             self.last_fps = 0;
             self.frames = 0;
             self.fps_at = Instant::now();
         }
 
         let now = Instant::now();
-        if self.animate && now >= self.next_frame {
+        if animating && now >= self.next_frame {
             self.next_frame = now + Duration::from_millis(self.frame_ms);
-            self.t += self.frame_ms as f32 / 1000.0;
+            if self.animate {
+                self.t += self.frame_ms as f32 / 1000.0;
+            }
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
             self.secondary_windows.request_redraw_all();
         }
 
-        let mut next: Option<Instant> = if self.animate {
+        let mut next: Option<Instant> = if animating {
             Some(self.next_frame)
         } else {
             None
@@ -1933,6 +2665,9 @@ fn main() {
     let mut font_engine = FontEngine::Swash;
     let mut screenshot: Option<String> = None;
     let mut open_select = false;
+    let mut open_menu = false;
+    let mut open_ctx = false;
+    let mut open_dialog = false;
     let mut initial_tab: usize = 0;
     let mut drop_preview = false;
     let mut focus_preview = false;
@@ -1945,6 +2680,9 @@ fn main() {
             "--static" => animate = false,
             "--nopaint" => nopaint = true,
             "--open-select" => open_select = true,
+            "--open-menu" => open_menu = true,
+            "--open-context-menu" => open_ctx = true,
+            "--open-dialog" => open_dialog = true,
             "--drop-preview" => drop_preview = true,
             "--focus-preview" => focus_preview = true,
             "--tab" => initial_tab = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -1988,7 +2726,8 @@ fn main() {
     app.nopaint = nopaint;
     app.extra_ops = extra_ops;
     app.screenshot_path = screenshot;
-    app.active_tab = initial_tab.min(4);
+    app.active_tab = initial_tab.min(5);
+    app.active_nav_key = format!("tab:{}", app.active_tab);
     app.open_window_spec = open_window.as_deref().and_then(window_spec_by_key);
     if let Some(k) = open_window.as_deref() {
         if app.open_window_spec.is_none() {
@@ -1997,7 +2736,18 @@ fn main() {
     }
     if open_select {
         app.active_tab = 0;
+        app.active_nav_key = "tab:0".to_string();
         app.ui_state.open_popup_id = Some(360);
+    }
+    if open_dialog {
+        app.show_status_dialog = true;
+    }
+    if open_menu {
+        app.ui_state.open_popup_id = Some(501);
+    }
+    if open_ctx {
+        app.ui_state.open_popup_id = Some(550);
+        app.ui_state.context_menu_pos = (520.0, 260.0);
     }
     if drop_preview {
         app.ui_state.hovered_file =
