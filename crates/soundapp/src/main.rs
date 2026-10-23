@@ -3460,6 +3460,15 @@ fn main() {
     let mut font_engine = FontEngine::Swash;
     let mut app_screenshot: Option<String> = None;
     let mut open_window: Option<String> = None;
+    // Offline render / latency harness (phase A instruments).
+    let mut render_in: Option<String> = None;
+    let mut render_out: Option<String> = None;
+    let mut render_pitch: f32 = 0.0;
+    let mut render_tempo: f32 = 1.0;
+    let mut render_formant = true;
+    let mut render_tape: Option<f32> = None;
+    let mut render_limit: Option<f64> = None;
+    let mut latency_probe = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -3469,6 +3478,15 @@ fn main() {
             "--static" => animate = false,
             "--nopaint" => nopaint = true,
             "--open-window" => open_window = args.next(),
+            "--render" => render_in = args.next(),
+            "--out" => render_out = args.next(),
+            "--pitch" => render_pitch = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            "--tempo" => render_tempo = args.next().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            "--formant" => render_formant = true,
+            "--no-formant" => render_formant = false,
+            "--tape" => render_tape = args.next().and_then(|v| v.parse().ok()),
+            "--limit" => render_limit = args.next().and_then(|v| v.parse().ok()),
+            "--latency-probe" => latency_probe = true,
             "--backend" => {
                 if let Some(b) = args.next() {
                     if b.eq_ignore_ascii_case("cpu") || b.eq_ignore_ascii_case("softbuffer") {
@@ -3513,6 +3531,121 @@ fn main() {
                 .unwrap_or_else(|| PathBuf::from(default_start)),
         )
     };
+
+    // Offline render: same DSP path as live playback, no audio device, no
+    // window. Runs faster than realtime and exits.
+    if let Some(in_path) = render_in {
+        let out = render_out.unwrap_or_else(|| "render_out.wav".to_string());
+        let params = PlaybackParams {
+            mode_tape: render_tape.is_some(),
+            pitch_semitones: render_tape.unwrap_or(render_pitch),
+            tempo_ratio: render_tempo,
+            hq: true,
+            formant_preserve: render_formant,
+        };
+        match audio::render_offline(
+            &PathBuf::from(in_path),
+            &params,
+            &PathBuf::from(&out),
+            render_limit,
+            48_000,
+        ) {
+            Ok(r) => {
+                println!(
+                    "[render] in={:.3}s out={:.3}s mode={} pitch={:+.1} tempo={:.2} -> {}",
+                    r.in_secs,
+                    r.out_secs,
+                    if params.mode_tape { "tape" } else { "pitchtime" },
+                    params.pitch_semitones,
+                    params.tempo_ratio,
+                    out
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("[render] failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Live-path parameter-latency measurement: play the default/arg track for
+    // 4 s (ring fills), then change pitch — the decoder thread logs how many
+    // seconds of pre-change audio the ring still holds (the audible delay).
+    if latency_probe {
+        let a = match audio::start(crate::audio::Source::Silence) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[probe] audio init failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        let path = startup_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(default_start));
+        println!("[probe] loading {}", path.display());
+        a.load_file(path);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let t0 = Instant::now();
+        let p1 = PlaybackParams {
+            pitch_semitones: 5.0,
+            ..Default::default()
+        };
+        a.set_params(p1);
+        println!(
+            "[probe] pitch +5 sent at t={:.2}s (pos {:.2}s)",
+            t0.elapsed().as_secs_f32(),
+            a.position_secs()
+        );
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            println!(
+                "[probe]   t={:.2}s pos {:.3}s",
+                t0.elapsed().as_secs_f32(),
+                a.position_secs()
+            );
+        }
+        a.seek(30.0);
+        println!(
+            "[probe] seek(30) at t={:.2}s",
+            t0.elapsed().as_secs_f32()
+        );
+        for _ in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            println!(
+                "[probe]   t={:.2}s pos {:.3}s",
+                t0.elapsed().as_secs_f32(),
+                a.position_secs()
+            );
+        }
+        let p2 = PlaybackParams {
+            pitch_semitones: 6.0,
+            tempo_ratio: 1.25,
+            ..Default::default()
+        };
+        a.set_params(p2);
+        println!(
+            "[probe] pitch +6 tempo 1.25 sent at t={:.2}s (pos {:.2}s)",
+            t0.elapsed().as_secs_f32(),
+            a.position_secs()
+        );
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            println!(
+                "[probe]   t={:.2}s pos {:.3}s",
+                t0.elapsed().as_secs_f32(),
+                a.position_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        println!(
+            "[probe] end pos {:.3}s / dur {:.3}s",
+            a.position_secs(),
+            a.duration_secs()
+        );
+        std::process::exit(0);
+    }
+
     let source = if tone {
         Source::Tone { hz: 440.0 }
     } else {

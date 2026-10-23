@@ -212,14 +212,27 @@ struct Shared {
     transport_gen: Arc<AtomicU64>,
     flush_gen: Arc<AtomicU64>,
     flush_ack: Arc<AtomicU64>,
+    /// Stretcher-side flush acknowledgement (source ring drained, engine reset).
+    stage_ack: Arc<AtomicU64>,
+    /// Live playback parameters, written by the decoder thread on
+    /// `Cmd::SetParams` and polled by the stretcher thread (bump `params_gen`).
+    params: Arc<Mutex<PlaybackParams>>,
+    params_gen: Arc<AtomicU64>,
+    /// Source-frame base for the position accounting, written by the decoder
+    /// thread right before a seek/load flush bump.
+    seek_target: Arc<AtomicU64>,
+    /// Frames the cpal callback has played out of the output ring.
+    out_played: Arc<AtomicU64>,
     total_frames: Arc<AtomicU64>,
     frames_played: Arc<AtomicU64>,
     started: Arc<AtomicBool>,
     /// Gapless single-track loop mode (`L` key / Loop button).
     loop_enabled: Arc<AtomicBool>,
-    /// The decoder has pushed its last sample; the ring may still hold audio.
+    /// The decoder has pushed its last sample; the big ring may still hold audio.
     decoder_eof: Arc<AtomicBool>,
-    /// The callback drained the ring after `decoder_eof` — one-shot for the UI.
+    /// The stretcher drained everything: engine idle, output ring may hold tail.
+    stage_eof: Arc<AtomicBool>,
+    /// The callback drained the output ring after `stage_eof` — one-shot for the UI.
     track_ended: Arc<AtomicBool>,
     /// When false the callback skips the DSP tap entirely (Monitoring closed).
     dsp_enabled: Arc<AtomicBool>,
@@ -377,8 +390,13 @@ impl Audio {
 }
 
 const RING_SECONDS: usize = 8;
+/// Depth of the post-stretcher output ring: the maximum audio latency between
+/// a parameter change and the speakers (Phase B target ≤ 100 ms).
+const OUT_RING_SECONDS: f64 = 0.08;
 /// Output frames produced per decoder iteration before re-checking commands.
 const CHUNK_FRAMES: usize = 8192;
+/// Source frames the stretcher pulls per cycle.
+const STRETCH_CHUNK: usize = 2048;
 /// Input frames to keep buffered past the read head for the interpolators.
 const LOOKAHEAD: usize = 4;
 
@@ -395,9 +413,6 @@ pub fn start(src: Source) -> Result<Audio, String> {
     );
     let stream_config = config.config();
 
-    let cap = rate as usize * out_ch * RING_SECONDS;
-    let (producer, consumer) = RingBuffer::<f32>::new(cap);
-
     let shared = Shared {
         playing: Arc::new(AtomicBool::new(true)),
         fade_out: Arc::new(AtomicBool::new(false)),
@@ -406,11 +421,17 @@ pub fn start(src: Source) -> Result<Audio, String> {
         transport_gen: Arc::new(AtomicU64::new(0)),
         flush_gen: Arc::new(AtomicU64::new(0)),
         flush_ack: Arc::new(AtomicU64::new(0)),
+        stage_ack: Arc::new(AtomicU64::new(0)),
+        params: Arc::new(Mutex::new(PlaybackParams::default())),
+        params_gen: Arc::new(AtomicU64::new(0)),
+        seek_target: Arc::new(AtomicU64::new(0)),
+        out_played: Arc::new(AtomicU64::new(0)),
         total_frames: Arc::new(AtomicU64::new(0)),
         frames_played: Arc::new(AtomicU64::new(0)),
         started: Arc::new(AtomicBool::new(false)),
         loop_enabled: Arc::new(AtomicBool::new(false)),
         decoder_eof: Arc::new(AtomicBool::new(false)),
+        stage_eof: Arc::new(AtomicBool::new(false)),
         track_ended: Arc::new(AtomicBool::new(false)),
         dsp_enabled: Arc::new(AtomicBool::new(false)),
         dsp: Arc::new(Mutex::new(DspTap::new(rate))),
@@ -420,12 +441,32 @@ pub fn start(src: Source) -> Result<Audio, String> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
 
-    // Producer thread: decode/render → pitch-shift → push.
+    // Big ring: decoded source audio (tape step applied), up to 8 s. Parameter
+    // changes never invalidate it — the pitch/tempo stage lives downstream.
+    let cap = rate as usize * out_ch * RING_SECONDS;
+    let (producer, src_consumer) = RingBuffer::<f32>::new(cap);
+
+    // Small output ring: the only audio standing between a parameter change
+    // and the speakers (bounded by OUT_RING_SECONDS).
+    let out_cap = ((rate as f64 * OUT_RING_SECONDS) as usize).max(4096) * out_ch;
+    let (out_producer, consumer) = RingBuffer::<f32>::new(out_cap);
+
+    // Producer thread: decode/render → tape resample → push raw source frames.
     {
         let sh = shared.clone();
         thread::Builder::new()
             .name("decode".into())
             .spawn(move || decoder_thread(cmd_rx, producer, src, rate, out_ch, sh))
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Stretcher thread: pulls source frames, applies pitch/tempo/formant one
+    // chunk from the audible edge, feeds the small output ring.
+    {
+        let sh = shared.clone();
+        thread::Builder::new()
+            .name("stretch".into())
+            .spawn(move || stretcher_thread(src_consumer, out_producer, rate, out_ch, sh))
             .map_err(|e| e.to_string())?;
     }
 
@@ -475,7 +516,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
                 // Fix #6: skip the tap entirely unless a consumer is attached.
                 let dsp_on = sh.dsp_enabled.load(Ordering::Relaxed);
                 let frames = data.len() / out_ch;
-                let mut advanced: u64 = 0;
+                let mut popped: u64 = 0;
                 for f in 0..frames {
                     vol_smooth += (target_vol - vol_smooth) * 0.005;
 
@@ -511,16 +552,17 @@ pub fn start(src: Source) -> Result<Audio, String> {
                             match consumer.pop() {
                                 Ok(v) => {
                                     sh.started.store(true, Ordering::Relaxed);
+                                    popped += 1;
                                     v
                                 }
                                 Err(_) => {
-                                    // Fix #1/#2: the ring is drained *and* the
-                                    // decoder signalled EOF — only now is the
-                                    // track really over. Never cut buffered audio.
+                                    // Fix #1/#2: the output ring is drained *and*
+                                    // the stretcher signalled EOF — only now is
+                                    // the track really over. Never cut buffered audio.
                                     if !sh.loop_enabled.load(Ordering::Relaxed)
-                                        && sh.decoder_eof.load(Ordering::Acquire)
+                                        && sh.stage_eof.load(Ordering::Acquire)
                                     {
-                                        sh.decoder_eof.store(false, Ordering::Release);
+                                        sh.stage_eof.store(false, Ordering::Release);
                                         sh.playing.store(false, Ordering::Release);
                                         sh.track_ended.store(true, Ordering::Release);
                                     }
@@ -538,12 +580,12 @@ pub fn start(src: Source) -> Result<Audio, String> {
                         let r = if out_ch > 1 { data[f * out_ch + 1] } else { l };
                         dsp_frames.push((l, r));
                     }
-                    if last_playing {
-                        advanced += 1;
-                    }
                 }
-                if advanced > 0 {
-                    sh.frames_played.fetch_add(advanced, Ordering::Relaxed);
+                // The stretcher thread owns `frames_played` (audible source
+                // position); the callback only reports what it played.
+                if popped > 0 {
+                    sh.out_played
+                        .fetch_add(popped / out_ch as u64, Ordering::Relaxed);
                 }
                 if !dsp_frames.is_empty() {
                     // Fix #7: `try_lock` — the real-time thread never waits on
@@ -797,6 +839,52 @@ impl RealTimePitchShifter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PitchStage trait (Phase B)
+// ---------------------------------------------------------------------------
+
+/// Swappable streaming pitch/tempo/formant engine. The consumer-side stretcher
+/// thread drives one implementation; `render_offline` drives the same trait so
+/// offline renders exercise the identical DSP. First implementation: the
+/// granular OLA shifter above; a future phase plugs in Signalsmith Stretch.
+pub trait PitchStage: Send {
+    /// Feed interleaved-stereo `input`, appending interleaved-stereo frames to
+    /// `out`. Input is buffered internally; `out` is expected to be empty on
+    /// entry.
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>);
+    fn set_pitch(&mut self, semitones: f32);
+    fn set_tempo(&mut self, ratio: f32);
+    fn set_formant(&mut self, preserve: bool);
+    /// Drop all buffered state (track change / seek).
+    fn reset(&mut self);
+    /// Source frames currently held by the engine that have not yet been
+    /// emitted to `out` — for position-display correction only.
+    fn latency_frames(&self, tempo: f32) -> usize;
+}
+
+impl PitchStage for RealTimePitchShifter {
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        RealTimePitchShifter::process(self, input, out)
+    }
+    fn set_pitch(&mut self, semitones: f32) {
+        RealTimePitchShifter::set_pitch(self, semitones)
+    }
+    fn set_tempo(&mut self, ratio: f32) {
+        RealTimePitchShifter::set_tempo(self, ratio)
+    }
+    fn set_formant(&mut self, preserve: bool) {
+        RealTimePitchShifter::set_formant(self, preserve)
+    }
+    fn reset(&mut self) {
+        RealTimePitchShifter::reset(self)
+    }
+    fn latency_frames(&self, tempo: f32) -> usize {
+        // inq is source-domain; stq is stretched-domain (stretched = src * r/t).
+        let stq_src = (self.stq.len() / 2) as f64 * tempo as f64 / self.pitch_ratio();
+        self.inq.len() / 2 + stq_src as usize
+    }
+}
+
 fn cubic_q(q: &VecDeque<f32>, i0: usize, frac: f32, c: usize) -> f32 {
     let at = |i: isize| -> f32 {
         if i < 0 {
@@ -847,8 +935,14 @@ fn pre_load(sh: &Shared) -> u64 {
 }
 
 fn wait_flush_ack(sh: &Shared, target: u64) {
-    let deadline = Instant::now() + Duration::from_millis(15);
-    while sh.flush_ack.load(Ordering::Acquire) < target && Instant::now() < deadline {
+    // Wait until BOTH the cpal callback (output ring drained) and the
+    // stretcher thread (source ring drained, engine reset) have acknowledged,
+    // so no stale audio is anywhere downstream when pushing resumes.
+    let deadline = Instant::now() + Duration::from_millis(30);
+    while (sh.flush_ack.load(Ordering::Acquire) < target
+        || sh.stage_ack.load(Ordering::Acquire) < target)
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -934,7 +1028,6 @@ fn decoder_thread(
 ) {
     let mut engine = Engine::None;
     let mut params = PlaybackParams::default();
-    let mut shifter = RealTimePitchShifter::new(out_rate);
     let mut step = 1.0f64;
 
     // FFmpeg state.
@@ -945,7 +1038,6 @@ fn decoder_thread(
 
     // Scratch buffers reused across iterations.
     let mut raw: Vec<f32> = Vec::new();
-    let mut post: Vec<f32> = Vec::new();
 
     let mut tone_hz: Option<f32> = None;
     let mut silence = false;
@@ -985,6 +1077,10 @@ fn decoder_thread(
         if let Some(p) = latest_params {
             params = p;
             step = compute_step(&params);
+            // Publish to the stretcher thread; it applies pitch/tempo at the
+            // audible edge and reports the actual change latency.
+            *sh.params.lock().unwrap() = params;
+            sh.params_gen.fetch_add(1, Ordering::SeqCst);
         }
         if let Some(p) = latest_load {
             let t0 = Instant::now();
@@ -992,7 +1088,6 @@ fn decoder_thread(
             load_t0 = Some(t0);
             first_chunk_logged = false;
             meta_pending = true;
-            shifter.reset();
             in_buf.clear();
             read_pos = 0.0;
             eof = false;
@@ -1003,8 +1098,11 @@ fn decoder_thread(
         if let Some(secs) = latest_seek {
             if let Engine::Ffmpeg(handle) = engine {
                 if !handle.is_null() {
+                    // The stretcher re-bases its position accounting from this
+                    // before it drains the rings on the flush below.
+                    sh.seek_target
+                        .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
                     let flush_target = pre_load(&sh);
-                    shifter.reset();
                     sh.decoder_eof.store(false, Ordering::Release);
                     sh.track_ended.store(false, Ordering::Release);
                     let ok = unsafe { sa_ffmpeg_seek(handle, secs) };
@@ -1012,10 +1110,7 @@ fn decoder_thread(
                     read_pos = 0.0;
                     eof = false;
                     wait_flush_ack(&sh, flush_target);
-                    if ok != 0 {
-                        sh.frames_played
-                            .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
-                    }
+                    let _ = ok;
                     sh.fade_out.store(false, Ordering::SeqCst);
                     sh.flushing.store(false, Ordering::SeqCst);
                     sh.transport_gen.fetch_add(1, Ordering::SeqCst);
@@ -1130,7 +1225,15 @@ fn decoder_thread(
             continue;
         }
 
-        push_processed(&mut producer, &params, &mut shifter, &raw, out_ch, &mut post);
+        // Raw source frames only — the pitch/tempo stage lives in the
+        // stretcher thread downstream of this ring (Phase B).
+        let frames = raw.len() / 2;
+        let fits = (producer.slots() / out_ch).min(frames);
+        for f in 0..fits {
+            for c in 0..out_ch {
+                let _ = producer.push(raw[f * 2 + c.min(1)]);
+            }
+        }
 
         // Extract metadata + cover art from the ALREADY-OPEN FFmpegDecoder handle
         // right after the first audio chunk is pushed into the ring buffer:
@@ -1154,6 +1257,177 @@ fn decoder_thread(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stretcher thread (Phase B)
+// ---------------------------------------------------------------------------
+
+/// Consumer-side pitch/tempo/formant stage. Pulls decoded source frames from
+/// the big ring and feeds a small output ring (`OUT_RING_SECONDS` deep) that
+/// the cpal callback drains. Because the stage sits one small buffer away from
+/// the speakers, parameter changes become audible within one buffer fill — no
+/// flush, no fade, and the 8 s decode buffer stays valid.
+///
+/// Runs on its own thread rather than inside the cpal callback: the OLA stage
+/// uses VecDeque/Vec scratch (allocation on growth) and a future engine
+/// (Signalsmith Stretch) has heavier setup, while an 80 ms output ring absorbs
+/// any scheduling hiccup that would glitch a true RT callback.
+fn stretcher_thread(
+    mut src: rtrb::Consumer<f32>,
+    mut out: rtrb::Producer<f32>,
+    out_rate: u32,
+    out_ch: usize,
+    sh: Shared,
+) {
+    let mut stage: Box<dyn PitchStage> = Box::new(RealTimePitchShifter::new(out_rate));
+    let mut params = PlaybackParams::default();
+    let mut seen_gen = sh.params_gen.load(Ordering::Acquire);
+    let mut seen_flush = sh.flush_gen.load(Ordering::Acquire);
+
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut post: Vec<f32> = Vec::new();
+    // Output frames that did not fit the ring last cycle (engine expansion).
+    let mut carry: Vec<f32> = Vec::new();
+
+    // Position accounting (source frames unless noted).
+    let mut base: u64 = 0; // media frames at the last flush
+    let mut media_consumed: f64 = 0.0; // pulled ring frames, in media frames
+    let mut out_produced: u64 = 0; // cumulative frames pushed to the output ring
+
+    let mut eof_seen = false;
+    let mut last_trace = Instant::now();
+
+    loop {
+        // --- New parameters: applied at the next chunk boundary. -------------
+        let g = sh.params_gen.load(Ordering::Acquire);
+        if g != seen_gen {
+            seen_gen = g;
+            let p = *sh.params.lock().unwrap();
+            if p != params {
+                let pending = out_produced
+                    .saturating_sub(sh.out_played.load(Ordering::Relaxed));
+                eprintln!(
+                    "[latency] pitch={:+.1} tempo={:.2} applied; {:.0} ms of processed audio buffered ahead",
+                    p.pitch_semitones,
+                    p.tempo_ratio,
+                    pending as f64 / out_rate as f64 * 1000.0
+                );
+            }
+            params = p;
+        }
+
+        // --- Seek/load flush: drop stale audio everywhere downstream. --------
+        let f = sh.flush_gen.load(Ordering::Acquire);
+        if f != seen_flush {
+            seen_flush = f;
+            while src.pop().is_ok() {}
+            stage.reset();
+            scratch.clear();
+            carry.clear();
+            base = sh.seek_target.load(Ordering::Acquire);
+            media_consumed = 0.0;
+            out_produced = sh.out_played.load(Ordering::Relaxed);
+            eof_seen = false;
+            sh.stage_eof.store(false, Ordering::Release);
+            sh.frames_played.store(base, Ordering::Release);
+            sh.stage_ack.store(f, Ordering::Release);
+        }
+
+        let neutral =
+            params.pitch_semitones.abs() < 1e-4 && (params.tempo_ratio - 1.0).abs() < 1e-4;
+        let bypass = params.mode_tape || neutral;
+
+        // Older carry goes out first (counted — it is audible output too).
+        out_produced += push_frames_fit(&mut out, &mut carry, out_ch) as u64;
+
+        let mut did_work = false;
+        let free = out.slots() / out_ch;
+        if free > 0 {
+            scratch.clear();
+            let want_samples = free.min(STRETCH_CHUNK) * 2;
+            while scratch.len() < want_samples {
+                match src.pop() {
+                    Ok(v) => scratch.push(v),
+                    Err(_) => break,
+                }
+            }
+            let frames = scratch.len() / 2;
+            if frames > 0 {
+                did_work = true;
+                media_consumed += frames as f64 * compute_step(&params);
+                if bypass {
+                    carry.extend_from_slice(&scratch);
+                } else {
+                    let src_out: &[f32] =
+                        apply_pitch_stage(&params, stage.as_mut(), &scratch, &mut post);
+                    carry.extend_from_slice(src_out);
+                }
+                out_produced += push_frames_fit(&mut out, &mut carry, out_ch) as u64;
+            }
+        }
+
+        // Input dry: either idle, or end-of-track draining.
+        if !did_work && carry.is_empty() {
+            if sh.decoder_eof.load(Ordering::Acquire) && src.slots() == 0 && !eof_seen {
+                if !bypass {
+                    post.clear();
+                    stage.process(&[], &mut post);
+                    carry.extend_from_slice(&post);
+                    out_produced += push_frames_fit(&mut out, &mut carry, out_ch) as u64;
+                }
+                if carry.is_empty() {
+                    eof_seen = true;
+                    sh.stage_eof.store(true, Ordering::Release);
+                }
+            } else if !sh.decoder_eof.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(3));
+            }
+        }
+
+        // --- Publish the audible media position. -----------------------------
+        // Everything pulled but not yet heard: engine-internal latency (source
+        // frames) plus carry + output-ring fill (output frames -> media via
+        // the effective output/media rate).
+        let played = sh.out_played.load(Ordering::Relaxed);
+        let pending = (out_produced.saturating_sub(played) + (carry.len() / 2) as u64) as f64;
+        let eff = if params.mode_tape {
+            compute_step(&params)
+        } else {
+            params.tempo_ratio as f64
+        };
+        let lat_media = if bypass {
+            0.0
+        } else {
+            stage.latency_frames(params.tempo_ratio) as f64
+        };
+        let pos = base as f64 + media_consumed - lat_media - pending * eff;
+        sh.frames_played.store(pos.max(base as f64) as u64, Ordering::Release);
+
+        // Anomaly trace (1 Hz): the stage is active, source is available, but
+        // nothing is queued ahead — the callback is running on fumes.
+        if !bypass
+            && pending == 0.0
+            && src.slots() > 0
+            && sh.playing.load(Ordering::Relaxed)
+            && last_trace.elapsed() >= Duration::from_secs(1)
+        {
+            last_trace = Instant::now();
+            eprintln!(
+                "[stretch] starving: out_produced={} played={} carry={}f lat={}f src={}f",
+                out_produced,
+                played,
+                carry.len() / 2,
+                stage.latency_frames(params.tempo_ratio),
+                src.slots() / out_ch
+            );
+        }
+
+        if !did_work && !carry.is_empty() {
+            thread::sleep(Duration::from_millis(3));
+        }
+    }
+}
+
 
 /// Produce up to `cap` interleaved-stereo frames by resampling `in_buf`.
 fn produce_ffmpeg(
@@ -1188,29 +1462,31 @@ fn produce_ffmpeg(
     produced
 }
 
-/// Apply the pitch/tempo/formant stage and push the result to the ring.
-fn push_processed(
-    producer: &mut rtrb::Producer<f32>,
+/// The pitch/tempo/formant stage shared by the consumer-side stretcher thread
+/// and offline rendering (`render_offline`): tape/neutral bypass, or the
+/// streaming `PitchStage`. Returns the interleaved-stereo frames to emit.
+fn apply_pitch_stage<'a>(
     params: &PlaybackParams,
-    shifter: &mut RealTimePitchShifter,
-    raw: &[f32],
-    out_ch: usize,
-    post: &mut Vec<f32>,
-) {
+    stage: &mut dyn PitchStage,
+    raw: &'a [f32],
+    post: &'a mut Vec<f32>,
+) -> &'a [f32] {
     let neutral = params.pitch_semitones.abs() < 1e-4 && (params.tempo_ratio - 1.0).abs() < 1e-4;
-    let bypass = params.mode_tape || neutral;
-
-    let src: &[f32] = if bypass {
+    if params.mode_tape || neutral {
         raw
     } else {
-        shifter.set_pitch(params.pitch_semitones);
-        shifter.set_tempo(params.tempo_ratio);
-        shifter.set_formant(params.formant_preserve);
+        stage.set_pitch(params.pitch_semitones);
+        stage.set_tempo(params.tempo_ratio);
+        stage.set_formant(params.formant_preserve);
         post.clear();
-        shifter.process(raw, post);
+        stage.process(raw, post);
         post
-    };
+    }
+}
 
+/// Push as many interleaved-stereo frames of `src` as fit; the remainder stays
+/// in `src` (caller reuses it as the carry buffer). Returns frames pushed.
+fn push_frames_fit(producer: &mut rtrb::Producer<f32>, src: &mut Vec<f32>, out_ch: usize) -> usize {
     let frames = src.len() / 2;
     let fits = (producer.slots() / out_ch).min(frames);
     for f in 0..fits {
@@ -1218,6 +1494,8 @@ fn push_processed(
             let _ = producer.push(src[f * 2 + c.min(1)]);
         }
     }
+    src.drain(0..fits * 2);
+    fits
 }
 
 fn open_ffmpeg(
@@ -1229,6 +1507,9 @@ fn open_ffmpeg(
     sh: &Shared,
 ) {
     close_engine(engine);
+    // New track: the stretcher re-bases its position accounting to zero when
+    // it services the flush below.
+    sh.seek_target.store(0, Ordering::SeqCst);
     let flush_target = pre_load(sh);
 
     let mut handle: *mut c_void = std::ptr::null_mut();
@@ -1342,8 +1623,130 @@ fn push_tone(
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Offline render (same DSP path as live playback, no audio device)
 // ---------------------------------------------------------------------------
+
+pub struct RenderResult {
+    pub in_secs: f64,
+    pub out_secs: f64,
+}
+
+/// Write interleaved-stereo f32 samples as a 32-bit IEEE-float WAV.
+fn write_wav_f32(path: &Path, rate: u32, ch: u16, samples: &[f32]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+    }
+    let data_len = (samples.len() * 4) as u32;
+    let mut w: Vec<u8> = Vec::with_capacity(44 + data_len as usize);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + data_len).to_le_bytes());
+    w.extend_from_slice(b"WAVE");
+    w.extend_from_slice(b"fmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    w.extend_from_slice(&ch.to_le_bytes());
+    w.extend_from_slice(&(rate as u32).to_le_bytes());
+    w.extend_from_slice(&(rate * ch as u32 * 4).to_le_bytes());
+    w.extend_from_slice(&((ch as u16) * 4).to_le_bytes());
+    w.extend_from_slice(&32u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        w.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, &w).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Render `path` through the exact live DSP path — FFmpeg decode → tape-mode
+/// Lanczos resample (`compute_step`) → `RealTimePitchShifter` via
+/// `apply_pitch_stage` — as fast as the CPU allows, with no audio device and
+/// no ring buffer, and write a float32 WAV. `limit_secs` caps the decoded
+/// input duration (for long files under test).
+pub fn render_offline(
+    path: &Path,
+    params: &PlaybackParams,
+    out_path: &Path,
+    limit_secs: Option<f64>,
+    rate: u32,
+) -> Result<RenderResult, String> {
+    let mut handle: *mut c_void = std::ptr::null_mut();
+    if let Some(c) = path_cstring(path) {
+        handle = unsafe { sa_ffmpeg_open(c.as_ptr(), rate as c_int) };
+    }
+    if handle.is_null() {
+        return Err(format!("FFmpeg open failed for {}", path.display()));
+    }
+
+    let full_dur = unsafe { sa_ffmpeg_duration(handle) };
+    let in_secs = limit_secs.map(|l| l.min(full_dur)).unwrap_or(full_dur);
+
+    let step = compute_step(params);
+    let mut shifter = RealTimePitchShifter::new(rate);
+
+    let mut in_buf: Vec<f32> = Vec::new();
+    let mut read_pos = 0.0f64;
+    let mut eof = false;
+    let mut tmp = vec![0.0f32; 8192 * 2];
+    let mut raw: Vec<f32> = Vec::new();
+    let mut post: Vec<f32> = Vec::new();
+    let mut pcm: Vec<f32> = Vec::new();
+
+    let in_limit_frames = limit_secs.map(|l| (l * rate as f64) as u64);
+    let mut in_frames_read: u64 = 0;
+
+    loop {
+        raw.clear();
+        let want_in = read_pos.ceil() as usize + LOOKAHEAD + 1;
+        while !eof && in_buf.len() / 2 < want_in {
+            if let Some(lim) = in_limit_frames {
+                if in_frames_read >= lim {
+                    eof = true;
+                    break;
+                }
+            }
+            let n = unsafe { sa_ffmpeg_read(handle, tmp.as_mut_ptr(), tmp.len() as c_int) };
+            if n <= 0 {
+                eof = true;
+                break;
+            }
+            in_frames_read += n as u64 / 2;
+            in_buf.extend_from_slice(&tmp[..n as usize]);
+        }
+        let avail = in_buf.len() / 2;
+        if avail < 2 {
+            if eof {
+                break;
+            }
+            continue;
+        }
+        let produced = produce_ffmpeg(&in_buf, avail, CHUNK_FRAMES, &mut read_pos, step, params.hq, &mut raw);
+        if read_pos > 32768.0 {
+            let consumed = read_pos.floor() as usize;
+            in_buf.drain(0..consumed * 2);
+            read_pos -= consumed as f64;
+        }
+        if produced == 0 {
+            if eof {
+                break;
+            }
+            continue;
+        }
+        let src = apply_pitch_stage(params, &mut shifter, &raw, &mut post);
+        pcm.extend_from_slice(src);
+    }
+
+    unsafe { sa_ffmpeg_close(handle) };
+    write_wav_f32(out_path, rate, 2, &pcm)?;
+    Ok(RenderResult {
+        in_secs,
+        out_secs: (pcm.len() / 2) as f64 / rate as f64,
+    })
+}
+
+
 
 #[cfg(test)]
 mod tests {
