@@ -1,635 +1,812 @@
-//! Phase 2.5 — ProTracker `.mod` engine.
+//! Tracker (module) source engine — a thin, safe owner around the vendored
+//! libopenmpt 0.8.9 C API (`vendor/libopenmpt`, BSD-3-Clause, compiled and
+//! linked by `build.rs`).
 //!
-//! A native parser for ProTracker modules (`.mod`, `M.K.` / `4CHN` / `6CHN` /
-//! `8CHN` signatures) plus a 4–8 channel Paula-style tracker synthesiser and a
-//! built-in demoscene chiptune so the engine always has something to play. It
-//! exposes the SoundApp tracker parameter set: `pitch_semitones`, `tempo_ratio`,
-//! `stereo_separation`, `interp_filter`, and per-channel VU levels.
+//! # Ownership / threading
+//!
+//! One [`TrackerEngine`] owns exactly one `openmpt_module`. libopenmpt module
+//! objects are safe to use from one thread at a time and never concurrently;
+//! every call here goes through `&mut self` (or `&self` for reads) and the raw
+//! handle never leaves the struct. `Send` is implemented so the engine can be
+//! built on one thread and moved once to the decoder thread — the pattern
+//! `audio.rs` already uses for its FFmpeg and Rubber Band handles. `Sync` is
+//! deliberately *not* implemented.
+//!
+//! # Why native controls
+//!
+//! libopenmpt renders module music from events: pitch and tempo are mixer
+//! domain parameters (`play.pitch_factor`, `play.tempo_factor`) applied
+//! *before* the mixer, exactly like the tracker does, and independent of each
+//! other. A tracker source therefore must not also be run through a
+//! time/pitch stretcher — that double-applies the shift. Whether this module's
+//! output enters any post chain is the caller's decision; nothing here forbids
+//! it, but the neutral configuration is a direct path to the output ring.
+//!
+//! # Timeline
+//!
+//! libopenmpt's position and seek APIs use the current scaled playback clock,
+//! including `play.tempo_factor`. This engine keeps its own output-timeline
+//! position as well: `played_secs` counts rendered frames since open/last
+//! seek, and duration is the module's default-clock duration divided by the
+//! current tempo ratio.
+//!
+//! # End of stream
+//!
+//! `play.at_end` is set to `stop`, so the mixer ends without libopenmpt's own
+//! fade-out and [`TrackerEngine::render`] returns `0` exactly once per pass.
+//! With looping enabled the repeat count is infinite and the mixer restarts
+//! inside the library, so `render` never returns `0`. Seeking clears the
+//! library's song-end latch, so a seek after the end resumes playback.
 
-use std::path::Path;
+// The engine API here is complete by design and exercised by this module's
+// own test suite (including `--ignored` live tests); the audio integration
+// uses a subset (open/render/seek/params/loop/metadata). `dead_code` would
+// otherwise flag the introspection half on non-test builds.
+#![allow(dead_code)]
 
-/// Maximum number of tracker channels supported.
-pub const MAX_CHANNELS: usize = 8;
+use core::ffi::{c_char, c_double, c_int, c_void};
+use std::ffi::{CStr, CString};
+use std::fmt;
+use std::path::{Path, PathBuf};
 
-/// Amiga PAL Paula clock / 2 — maps a period to a frequency.
-const PAULA_CLOCK: f64 = 3_546_894.6;
+// ---------------------------------------------------------------------------
+// C API surface (subset of libopenmpt.h actually used)
+// ---------------------------------------------------------------------------
 
-/// ProTracker period table (finetune 0), three octaves from C-1.
-const PERIODS: [u16; 36] = [
-    856, 808, 762, 720, 678, 640, 604, 570, 538, 508, 480, 453, 428, 404, 381, 360, 339, 320, 302,
-    285, 269, 254, 240, 226, 214, 202, 190, 180, 169, 160, 151, 143, 135, 127, 120, 113,
-];
-
-// The table is exposed for tests / future note-name helpers.
-#[allow(dead_code)]
-fn period_of(note: usize) -> u16 {
-    PERIODS[note.min(PERIODS.len() - 1)]
+/// Opaque `openmpt_module`. Never dereferenced on the Rust side.
+#[repr(C)]
+struct Module {
+    _private: [u8; 0],
 }
 
-#[derive(Clone, Copy, Default)]
-struct Cell {
-    sample: u8,
-    period: u16,
-    effect: u8,
-    param: u8,
-}
+type LogFunc = extern "C" fn(message: *const c_char, user: *mut c_void);
+type ErrorFunc = extern "C" fn(error: c_int, user: *mut c_void) -> c_int;
 
-#[derive(Clone)]
-struct Sample {
-    data: Vec<f32>,
-    volume: u8,
-    finetune: i8,
-    loop_start: usize,
-    loop_len: usize,
-}
+/// `OPENMPT_MODULE_RENDER_*` ids from libopenmpt.h.
+const RENDER_STEREOSEPARATION_PERCENT: c_int = 2;
+const RENDER_INTERPOLATIONFILTER_LENGTH: c_int = 3;
 
-/// A parsed ProTracker module.
-pub struct TrackerModule {
-    pub title: String,
-    pub channels: usize,
-    samples: Vec<Sample>,
-    patterns: Vec<Vec<[Cell; MAX_CHANNELS]>>,
-    order: Vec<u8>,
-    song_len: usize,
-    restart: u8,
-}
-
-impl TrackerModule {
-    /// Parse a ProTracker `.mod` from raw bytes.
-    pub fn parse(data: &[u8]) -> Result<TrackerModule, String> {
-        if data.len() < 1084 {
-            return Err("module too short for a ProTracker header".into());
-        }
-        let title = read_title(&data[0..20]);
-
-        // --- 31 sample headers -----------------------------
-        let mut samples: Vec<Sample> = Vec::with_capacity(31);
-        let mut sample_lens: Vec<usize> = Vec::with_capacity(31);
-        for i in 0..31 {
-            let off = 20 + i * 30;
-            let len_words = u16::from_be_bytes([data[off + 22], data[off + 23]]) as usize;
-            let finetune = {
-                let ft = data[off + 24] & 0x0F;
-                if ft >= 8 {
-                    ft as i8 - 16
-                } else {
-                    ft as i8
-                }
-            };
-            let volume = data[off + 25].min(64);
-            let loop_start_words = u16::from_be_bytes([data[off + 26], data[off + 27]]) as usize;
-            let loop_len_words = u16::from_be_bytes([data[off + 28], data[off + 29]]) as usize;
-            samples.push(Sample {
-                data: Vec::new(),
-                volume,
-                finetune,
-                loop_start: loop_start_words * 2,
-                loop_len: loop_len_words * 2,
-            });
-            sample_lens.push(len_words * 2);
-        }
-
-        // --- song layout -----------------------------------
-        let song_len = (data[950] as usize).clamp(1, 128);
-        let restart = data[951];
-        let mut order = vec![0u8; 128];
-        order.copy_from_slice(&data[952..1080]);
-        let channels = detect_channels(&data[1080..1084]);
-
-        let mut max_pat = 0usize;
-        for &o in order.iter().take(song_len) {
-            max_pat = max_pat.max(o as usize);
-        }
-        let n_patterns = max_pat + 1;
-
-        let row_bytes = channels * 4;
-        let pattern_bytes = 64 * row_bytes;
-        let hdr = 1084usize;
-
-        let mut patterns: Vec<Vec<[Cell; MAX_CHANNELS]>> = Vec::with_capacity(n_patterns);
-        for p in 0..n_patterns {
-            let base = hdr + p * pattern_bytes;
-            let mut rows = vec![[Cell::default(); MAX_CHANNELS]; 64];
-            if base + pattern_bytes <= data.len() {
-                for r in 0..64 {
-                    for c in 0..channels {
-                        let o = base + (r * channels + c) * 4;
-                        let b0 = data[o];
-                        let b1 = data[o + 1];
-                        let b2 = data[o + 2];
-                        let b3 = data[o + 3];
-                        rows[r][c] = Cell {
-                            sample: (b0 & 0xF0) | (b2 >> 4),
-                            period: (((b0 & 0x0F) as u16) << 8) | b1 as u16,
-                            effect: b2 & 0x0F,
-                            param: b3,
-                        };
-                    }
-                }
-            }
-            patterns.push(rows);
-        }
-
-        // --- sample data (8-bit signed) --------------------
-        let mut pos = hdr + n_patterns * pattern_bytes;
-        for i in 0..samples.len() {
-            let len = sample_lens[i];
-            let end = (pos + len).min(data.len());
-            let mut v: Vec<f32> = Vec::with_capacity(len);
-            for &b in &data[pos..end] {
-                v.push((b as i8) as f32 / 128.0);
-            }
-            // Drop a loop that points past the (possibly truncated) sample.
-            if samples[i].loop_start + samples[i].loop_len > v.len().max(2) {
-                samples[i].loop_len = 0;
-            }
-            samples[i].data = v;
-            pos += len;
-        }
-
-        Ok(TrackerModule {
-            title,
-            channels,
-            samples,
-            patterns,
-            order,
-            song_len,
-            restart,
-        })
-    }
-
-    /// Build a self-contained 4-channel demoscene chiptune.
-    pub fn builtin_demoscene() -> TrackerModule {
-        let square = oscillator(64, |p| if p < 0.5 { 0.6 } else { -0.6 });
-        let saw = oscillator(32, |p| p * 2.0 - 1.0);
-        let pulse = oscillator(48, |p| if p < 0.25 { 0.7 } else { -0.7 });
-        let noise = prng_wave(64, 0x1234_5678);
-
-        let samples = vec![
-            Sample { data: square, volume: 64, finetune: 0, loop_start: 0, loop_len: 64 },
-            Sample { data: saw, volume: 48, finetune: 0, loop_start: 0, loop_len: 32 },
-            Sample { data: pulse, volume: 40, finetune: 0, loop_start: 0, loop_len: 48 },
-            Sample { data: noise, volume: 56, finetune: 0, loop_start: 0, loop_len: 64 },
-            Sample { data: drum_kick(0.35), volume: 64, finetune: 0, loop_start: 0, loop_len: 0 },
-            Sample { data: drum_snare(0.25), volume: 64, finetune: 0, loop_start: 0, loop_len: 0 },
-            Sample { data: drum_hat(0.06), volume: 48, finetune: 0, loop_start: 0, loop_len: 0 },
-        ];
-
-        let bass_notes: [u16; 16] = [
-            428, 428, 508, 508, 570, 570, 508, 508, 428, 428, 508, 508, 453, 453, 508, 508,
-        ];
-        let lead_notes: [u16; 16] = [
-            214, 240, 269, 240, 202, 226, 254, 226, 180, 202, 226, 254, 240, 214, 202, 190,
-        ];
-        const DRUM_PERIOD: u16 = 74; // one-shot drums play ~1:1 at 48 kHz
-
-        let mut rows = vec![[Cell::default(); MAX_CHANNELS]; 64];
-        for r in 0..64 {
-            if r % 4 == 0 {
-                rows[r][0] = Cell { sample: 1, period: bass_notes[(r / 4) % 16], effect: 0, param: 0 };
-            }
-            if r % 2 == 0 {
-                rows[r][1] = Cell { sample: 2, period: lead_notes[(r / 2) % 16], effect: 0, param: 0 };
-            }
-            if r % 16 == 0 {
-                rows[r][2] = Cell { sample: 3, period: 302, effect: 0, param: 0 };
-            }
-            if r % 8 == 0 {
-                rows[r][3] = Cell { sample: 5, period: DRUM_PERIOD, effect: 0, param: 0 };
-            } else if r % 8 == 4 {
-                rows[r][3] = Cell { sample: 6, period: DRUM_PERIOD, effect: 0, param: 0 };
-            } else {
-                rows[r][3] = Cell { sample: 7, period: DRUM_PERIOD, effect: 0, param: 0 };
-            }
-        }
-
-        let mut order = vec![0u8; 128];
-        order[..8].fill(0);
-
-        TrackerModule {
-            title: "NUI Rust · Built-in Demoscene".to_string(),
-            channels: 4,
-            samples,
-            patterns: vec![rows],
-            order,
-            song_len: 8,
-            restart: 0,
-        }
-    }
-
-    fn order_len(&self) -> usize {
-        self.song_len.clamp(1, 128)
-    }
-}
-
-fn read_title(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
-}
-
-fn detect_channels(sig: &[u8]) -> usize {
-    match sig {
-        b"6CHN" => 6,
-        b"8CHN" | b"FLT8" | b"OKTA" | b"CD81" => 8,
-        _ => 4,
-    }
-}
-
-fn oscillator(n: usize, f: impl Fn(f32) -> f32) -> Vec<f32> {
-    (0..n).map(|i| f(i as f32 / n as f32)).collect()
-}
-
-fn prng_wave(n: usize, seed: u32) -> Vec<f32> {
-    let mut st = seed | 1;
-    let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
-        st ^= st << 13;
-        st ^= st >> 17;
-        st ^= st << 5;
-        v.push((st as f32 / u32::MAX as f32) * 2.0 - 1.0);
-    }
-    v
-}
-
-fn drum_kick(seconds: f32) -> Vec<f32> {
-    const R: f32 = 48_000.0;
-    let n = (seconds * R) as usize;
-    let mut v = Vec::with_capacity(n);
-    let mut phase = 0.0f32;
-    for i in 0..n {
-        let t = i as f32 / R;
-        let env = (-t * 12.0).exp();
-        let f = 150.0 * (-t * 18.0).exp() + 45.0;
-        phase += 2.0 * std::f32::consts::PI * f / R;
-        v.push((phase.sin() * env * 0.9).clamp(-1.0, 1.0));
-    }
-    v
-}
-
-fn drum_snare(seconds: f32) -> Vec<f32> {
-    const R: f32 = 48_000.0;
-    let n = (seconds * R) as usize;
-    let mut v = Vec::with_capacity(n);
-    let mut st = 0x9E37_79B9u32;
-    for i in 0..n {
-        let t = i as f32 / R;
-        st ^= st << 13;
-        st ^= st >> 17;
-        st ^= st << 5;
-        let noise = (st as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        let tone = (2.0 * std::f32::consts::PI * 180.0 * t).sin();
-        let env = (-t * 22.0).exp();
-        v.push(((noise * 0.7 + tone * 0.3) * env).clamp(-1.0, 1.0));
-    }
-    v
-}
-
-fn drum_hat(seconds: f32) -> Vec<f32> {
-    const R: f32 = 48_000.0;
-    let n = (seconds * R) as usize;
-    let mut st = 0xDEAD_BEEFu32;
-    let mut v = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = i as f32 / R;
-        st ^= st << 13;
-        st ^= st >> 17;
-        st ^= st << 5;
-        let noise = (st as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        let env = (-t * 90.0).exp();
-        v.push((noise * env * 0.5).clamp(-1.0, 1.0));
-    }
-    v
+extern "C" {
+    fn openmpt_get_library_version() -> u32;
+    fn openmpt_get_string(key: *const c_char) -> *const c_char;
+    fn openmpt_free_string(s: *const c_char);
+    fn openmpt_get_supported_extensions() -> *const c_char;
+    fn openmpt_is_extension_supported(extension: *const c_char) -> c_int;
+    fn openmpt_module_create_from_memory2(
+        filedata: *const c_void,
+        filesize: usize,
+        logfunc: Option<LogFunc>,
+        loguser: *mut c_void,
+        errfunc: Option<ErrorFunc>,
+        erruser: *mut c_void,
+        error: *mut c_int,
+        error_message: *mut *const c_char,
+        ctls: *const c_void,
+    ) -> *mut Module;
+    fn openmpt_module_destroy(module: *mut Module);
+    fn openmpt_module_read_interleaved_float_stereo(
+        module: *mut Module,
+        samplerate: c_int,
+        count: usize,
+        interleaved_stereo: *mut f32,
+    ) -> usize;
+    fn openmpt_module_set_repeat_count(module: *mut Module, repeat_count: i32) -> c_int;
+    fn openmpt_module_set_position_seconds(module: *mut Module, seconds: c_double) -> c_double;
+    fn openmpt_module_get_duration_seconds(module: *mut Module) -> c_double;
+    fn openmpt_module_set_render_param(module: *mut Module, param: c_int, value: i32) -> c_int;
+    fn openmpt_module_ctl_set_boolean(
+        module: *mut Module,
+        ctl: *const c_char,
+        value: c_int,
+    ) -> c_int;
+    fn openmpt_module_ctl_set_floatingpoint(
+        module: *mut Module,
+        ctl: *const c_char,
+        value: c_double,
+    ) -> c_int;
+    fn openmpt_module_ctl_set_text(
+        module: *mut Module,
+        ctl: *const c_char,
+        value: *const c_char,
+    ) -> c_int;
+    fn openmpt_module_get_metadata(module: *mut Module, key: *const c_char) -> *const c_char;
+    fn openmpt_module_get_num_channels(module: *mut Module) -> i32;
+    fn openmpt_module_get_num_orders(module: *mut Module) -> i32;
+    fn openmpt_module_get_num_patterns(module: *mut Module) -> i32;
+    fn openmpt_module_get_num_instruments(module: *mut Module) -> i32;
+    fn openmpt_module_get_num_samples(module: *mut Module) -> i32;
+    fn openmpt_module_get_num_subsongs(module: *mut Module) -> i32;
+    fn openmpt_module_get_current_channel_vu_left(module: *mut Module, channel: i32) -> f32;
+    fn openmpt_module_get_current_channel_vu_right(module: *mut Module, channel: i32) -> f32;
 }
 
 // ---------------------------------------------------------------------------
-// Player
+// Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Default)]
-struct ChannelState {
-    sample: u8,
-    period: u16,
-    vol: f32,
-    pos: f64,
-    active: bool,
+#[derive(Debug)]
+pub enum TrackerError {
+    /// The file could not be read from disk.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// libopenmpt refused to load the data (not a module, unsupported, damaged).
+    Open {
+        path: PathBuf,
+        code: i32,
+        detail: String,
+    },
+    /// libopenmpt rejected a `ctl` value.
+    Control { ctl: &'static str, value: String },
+    /// libopenmpt rejected a render parameter.
+    RenderParam { param: &'static str, value: i32 },
+    /// A caller-supplied parameter was not a usable number.
+    InvalidParam { param: &'static str, value: f64 },
+    /// Output sample rate outside libopenmpt's documented range.
+    Rate { rate: u32 },
 }
 
-/// A real-time ProTracker playback engine.
-pub struct TrackerPlayer {
-    rate: f32,
-    module: TrackerModule,
-    /// Ticks per row (effect `Fxx` / speed). Default 6.
-    speed: u32,
-    /// Beats per minute (effect `Fxx` / tempo). Default 125.
-    tempo: u32,
-    order_pos: usize,
-    row: usize,
-    tick: u32,
-    frames_to_tick: f64,
-    channels: [ChannelState; MAX_CHANNELS],
-    pitch_semitones: f32,
-    tempo_ratio: f32,
-    stereo_separation: f32,
-    interp_filter: usize,
-    pending_break: Option<usize>,
-    pending_jump: Option<usize>,
-    /// Per-channel VU levels (0..1), updated every rendered frame.
-    pub channel_vu: [f32; MAX_CHANNELS],
+impl fmt::Display for TrackerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrackerError::Read { path, source } => {
+                write!(f, "tracker source read {}: {source}", path.display())
+            }
+            TrackerError::Open { path, code, detail } => write!(
+                f,
+                "libopenmpt could not load {} (error {code}): {detail}",
+                path.display()
+            ),
+            TrackerError::Control { ctl, value } => {
+                write!(f, "libopenmpt rejected ctl {ctl} = {value}")
+            }
+            TrackerError::RenderParam { param, value } => {
+                write!(f, "libopenmpt rejected render param {param} = {value}")
+            }
+            TrackerError::InvalidParam { param, value } => {
+                write!(f, "invalid tracker parameter {param} = {value}")
+            }
+            TrackerError::Rate { rate } => write!(
+                f,
+                "output rate {rate} Hz outside libopenmpt's 8000..=192000 Hz range"
+            ),
+        }
+    }
 }
 
-impl TrackerPlayer {
-    /// Create a player for `sample_rate`, loaded with the built-in module.
-    pub fn new(sample_rate: u32) -> TrackerPlayer {
-        let mut p = TrackerPlayer {
-            rate: sample_rate as f32,
-            module: TrackerModule::builtin_demoscene(),
-            speed: 6,
-            tempo: 125,
-            order_pos: 0,
-            row: 0,
-            tick: 0,
-            frames_to_tick: 0.0,
-            channels: [ChannelState::default(); MAX_CHANNELS],
+impl std::error::Error for TrackerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TrackerError::Read { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parameter model
+// ---------------------------------------------------------------------------
+
+/// Mixer interpolation filter. Only the values libopenmpt implements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Interpolation {
+    /// libopenmpt's recommended default (currently 8-tap windowed sinc).
+    #[default]
+    Default,
+    /// No interpolation (zero order hold) — bright, aliasing, tracker-authentic.
+    ZeroOrderHold,
+    Linear,
+    Cubic,
+    WindowedSinc8,
+}
+
+impl Interpolation {
+    pub const ALL: [Interpolation; 5] = [
+        Interpolation::Default,
+        Interpolation::ZeroOrderHold,
+        Interpolation::Linear,
+        Interpolation::Cubic,
+        Interpolation::WindowedSinc8,
+    ];
+
+    /// The `RENDER_INTERPOLATIONFILTER_LENGTH` value libopenmpt expects.
+    pub fn filter_length(self) -> i32 {
+        match self {
+            Interpolation::Default => 0,
+            Interpolation::ZeroOrderHold => 1,
+            Interpolation::Linear => 2,
+            Interpolation::Cubic => 4,
+            Interpolation::WindowedSinc8 => 8,
+        }
+    }
+
+    /// Inverse of [`Interpolation::filter_length`]; `None` for lengths
+    /// libopenmpt documents as unsupported (e.g. 3, 5..7).
+    pub fn from_filter_length(length: i32) -> Option<Self> {
+        match length {
+            0 => Some(Interpolation::Default),
+            1 => Some(Interpolation::ZeroOrderHold),
+            2 => Some(Interpolation::Linear),
+            4 => Some(Interpolation::Cubic),
+            8 => Some(Interpolation::WindowedSinc8),
+            _ => None,
+        }
+    }
+}
+
+/// Native tracker playback parameters. Neutral by default — 0 semitones,
+/// tempo ratio 1.0, libopenmpt's 100 % separation, default interpolation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackerParams {
+    /// Event-domain pitch shift, independent of tempo. Range ±24 semitones
+    /// (`play.pitch_factor` accepts (0, 4], and 4 == +24 semitones).
+    pub pitch_semitones: f32,
+    /// Event-domain speed multiplier; 2.0 plays twice as fast. libopenmpt
+    /// accepts (0, 4]; this engine clamps to 0.25..=4.0.
+    pub tempo_ratio: f32,
+    /// Mixer stereo separation in percent, 0 (mono) ..= 200 (wide).
+    pub stereo_separation: f32,
+    pub interpolation: Interpolation,
+}
+
+impl Default for TrackerParams {
+    fn default() -> Self {
+        Self {
             pitch_semitones: 0.0,
             tempo_ratio: 1.0,
             stereo_separation: 100.0,
-            interp_filter: 1,
-            pending_break: None,
-            pending_jump: None,
-            channel_vu: [0.0; MAX_CHANNELS],
+            interpolation: Interpolation::Default,
+        }
+    }
+}
+
+/// Per-channel approximate mixer VU. Velocity based — libopenmpt documents
+/// that these do not reflect the waveform of the playing sample.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChannelVu {
+    pub left: f32,
+    pub right: f32,
+}
+
+impl ChannelVu {
+    /// Louder of the two sides.
+    pub fn peak(self) -> f32 {
+        self.left.max(self.right)
+    }
+}
+
+/// Module metadata as reported by libopenmpt, captured once at open.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackerMetadata {
+    pub title: String,
+    pub artist: String,
+    /// Tracker software that wrote the file (e.g. "Impulse Tracker").
+    pub tracker: String,
+    /// Short format id, e.g. "mod".
+    pub format: String,
+    /// Long format name, e.g. "ProTracker 3.x".
+    pub format_long: String,
+    /// Container format when the module was wrapped (xpk, mo3, umx, ...).
+    pub container: String,
+    pub date: String,
+    /// Song message, newline separated, as embedded by the author.
+    pub message: String,
+    /// Loader warnings — non-fatal format oddities libopenmpt absorbed.
+    pub warnings: String,
+    /// Event-domain duration in seconds at tempo 1.0, when finite.
+    pub duration_secs: Option<f64>,
+    /// Pattern channels (informational; not the output channel count).
+    pub channels: i32,
+    pub orders: i32,
+    pub patterns: i32,
+    pub instruments: i32,
+    pub samples: i32,
+    pub subsongs: i32,
+    pub file_size_bytes: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Library-level helpers
+// ---------------------------------------------------------------------------
+
+/// libopenmpt version as `(major, minor, patch)`.
+pub fn library_version() -> (u32, u32, u32) {
+    let v = unsafe { openmpt_get_library_version() };
+    (v >> 24, (v >> 16) & 0xff, v & 0xffff)
+}
+
+/// libopenmpt's verbose build string (e.g. `"0.8.9 (2026-08-19)"`).
+pub fn library_version_string() -> String {
+    let key = CString::new("library_version").expect("static key");
+    take_string(unsafe { openmpt_get_string(key.as_ptr()) }).unwrap_or_default()
+}
+
+/// Every extension this libopenmpt build can load, lower-case, without dots.
+pub fn supported_extensions() -> Vec<String> {
+    take_string(unsafe { openmpt_get_supported_extensions() })
+        .map(|list| {
+            list.split(';')
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether libopenmpt can load this path's extension. Asks the library rather
+/// than a hard-coded list, so the answer cannot drift from the linked build.
+pub fn is_tracker_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let Ok(ext) = CString::new(ext) else {
+        return false;
+    };
+    unsafe { openmpt_is_extension_supported(ext.as_ptr()) == 1 }
+}
+
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
+
+/// Output-timeline playhead plus the library handle it belongs to.
+pub struct TrackerEngine {
+    module: *mut Module,
+    path: PathBuf,
+    out_rate: u32,
+    metadata: TrackerMetadata,
+    params: TrackerParams,
+    /// Event-domain duration at tempo 1.0; `None` when libopenmpt reports a
+    /// non-finite length (a module whose pattern graph never ends).
+    module_duration_secs: Option<f64>,
+    /// Output-timeline position, counted from open or the last seek.
+    played_secs: f64,
+    looping: bool,
+    /// The last [`TrackerEngine::render`] hit the end of the song.
+    finished: bool,
+}
+
+/// SAFETY: the `openmpt_module` handle is only reachable through `&self` /
+/// `&mut self`, so it is used by exactly one thread at a time. libopenmpt
+/// documents that distinct modules may be used from distinct threads; sharing
+/// one module is the only prohibited case. Moving the engine to the decoder
+/// thread transfers the sole owner.
+unsafe impl Send for TrackerEngine {}
+
+impl TrackerEngine {
+    /// Load a module and prepare it to render interleaved stereo `f32` at
+    /// `out_rate`. libopenmpt renders at the device rate directly — no
+    /// resampling stage is needed downstream.
+    ///
+    /// The file is read into memory because libopenmpt's in-memory loader is
+    /// the fast path and copies what it needs; nothing of the buffer survives
+    /// this call.
+    pub fn open(path: &Path, out_rate: u32) -> Result<Self, TrackerError> {
+        if !(8_000..=192_000).contains(&out_rate) {
+            return Err(TrackerError::Rate { rate: out_rate });
+        }
+        let bytes = std::fs::read(path).map_err(|source| TrackerError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        let mut error: c_int = 0;
+        let mut error_message: *const c_char = std::ptr::null();
+        let module = unsafe {
+            openmpt_module_create_from_memory2(
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                None,
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+                &mut error,
+                &mut error_message,
+                std::ptr::null(),
+            )
         };
-        p.reset();
-        p
+        // libopenmpt allocates the message even on failure; always free it.
+        let detail = take_string(error_message);
+        if module.is_null() {
+            return Err(TrackerError::Open {
+                path: path.to_path_buf(),
+                code: error,
+                detail: detail.unwrap_or_else(|| "no detail reported".into()),
+            });
+        }
+
+        let mut engine = Self {
+            module,
+            path: path.to_path_buf(),
+            out_rate,
+            metadata: TrackerMetadata::default(),
+            params: TrackerParams::default(),
+            module_duration_secs: None,
+            played_secs: 0.0,
+            looping: false,
+            finished: false,
+        };
+        // Any error here drops `engine`, which destroys the module.
+        engine.configure_end_handling()?;
+        engine.read_metadata()?;
+        engine.apply_params(TrackerParams::default())?;
+        Ok(engine)
     }
 
-    /// Load and parse a `.mod` file, replacing the current module.
-    pub fn load_file(&mut self, path: &Path) -> Result<(), String> {
-        let data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        self.module = TrackerModule::parse(&data)?;
-        self.reset();
+    fn configure_end_handling(&mut self) -> Result<(), TrackerError> {
+        // Deterministic EOF instead of libopenmpt's own fade-out: the caller
+        // owns fades, and `render` must be able to report "pass finished".
+        self.set_ctl_text("play.at_end", "stop")?;
+        // Seek on the sample grid, so a seek lands on the PCM the module would
+        // have produced rather than on the row boundary.
+        self.set_ctl_bool("seek.sync_samples", true)?;
         Ok(())
     }
 
-    /// Replace the current module with the built-in demoscene chiptune.
-    pub fn load_builtin(&mut self) {
-        self.module = TrackerModule::builtin_demoscene();
-        self.reset();
+    fn read_metadata(&mut self) -> Result<(), TrackerError> {
+        let duration = unsafe { openmpt_module_get_duration_seconds(self.module) };
+        let module_duration_secs = if duration.is_finite() && duration >= 0.0 {
+            Some(duration)
+        } else {
+            None
+        };
+        self.module_duration_secs = module_duration_secs;
+        self.metadata = TrackerMetadata {
+            title: self.meta_string("title"),
+            artist: self.meta_string("artist"),
+            tracker: self.meta_string("tracker"),
+            format: self.meta_string("type"),
+            format_long: self.meta_string("type_long"),
+            container: self.meta_string("container_long"),
+            date: self.meta_string("date"),
+            message: self.meta_string("message"),
+            warnings: self.meta_string("warnings"),
+            duration_secs: module_duration_secs,
+            channels: unsafe { openmpt_module_get_num_channels(self.module) },
+            orders: unsafe { openmpt_module_get_num_orders(self.module) },
+            patterns: unsafe { openmpt_module_get_num_patterns(self.module) },
+            instruments: unsafe { openmpt_module_get_num_instruments(self.module) },
+            samples: unsafe { openmpt_module_get_num_samples(self.module) },
+            subsongs: unsafe { openmpt_module_get_num_subsongs(self.module) },
+            file_size_bytes: std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0),
+        };
+        Ok(())
     }
 
-    /// Set the global pitch offset (`-12..=12` semitones).
-    pub fn set_pitch(&mut self, semitones: f32) {
-        self.pitch_semitones = semitones.clamp(-12.0, 12.0);
+    fn meta_string(&self, key: &str) -> String {
+        let key = CString::new(key).expect("static metadata key");
+        let value = unsafe { openmpt_module_get_metadata(self.module, key.as_ptr()) };
+        take_string(value).unwrap_or_default()
     }
 
-    /// Set the tempo ratio (`0.5..=2.0`; `1.0` = the module's native speed).
-    pub fn set_tempo(&mut self, ratio: f32) {
-        self.tempo_ratio = ratio.clamp(0.5, 2.0);
-    }
-
-    /// Set stereo separation (`0` = mono, `100` = Amiga LRRL, `200` = wide).
-    pub fn set_stereo_separation(&mut self, sep: f32) {
-        self.stereo_separation = sep.clamp(0.0, 200.0);
-    }
-
-    /// Select the interpolation filter (0 nearest, 1 linear, 2 cubic, 3 sinc-8).
-    pub fn set_interp(&mut self, interp: usize) {
-        self.interp_filter = interp.min(3);
-    }
-
-    /// Title of the loaded module.
-    pub fn title(&self) -> &str {
-        &self.module.title
-    }
-
-    fn reset(&mut self) {
-        self.order_pos = 0;
-        self.row = 0;
-        self.tick = 0;
-        self.frames_to_tick = 0.0;
-        self.channels = [ChannelState::default(); MAX_CHANNELS];
-        self.channel_vu = [0.0; MAX_CHANNELS];
-        self.pending_break = None;
-        self.pending_jump = None;
-    }
-
-    fn tick_frames(&self) -> f64 {
-        // PAL timing: one tick = 2.5/tempo seconds.
-        let sec = 2.5 / self.tempo.max(1) as f64;
-        (sec * self.rate as f64 / self.tempo_ratio.max(0.01) as f64).max(1.0)
-    }
-
-    fn advance_tick(&mut self) {
-        if self.tick == 0 {
-            self.process_row();
-        }
-        self.tick += 1;
-        if self.tick >= self.speed.max(1) {
-            self.tick = 0;
-            if let Some(pos) = self.pending_jump.take() {
-                self.order_pos = pos;
-                self.row = self.pending_break.take().unwrap_or(0);
-            } else if let Some(row) = self.pending_break.take() {
-                self.row = row;
-                self.order_pos += 1;
-            } else {
-                self.row += 1;
-            }
-            if self.row >= 64 {
-                self.row = 0;
-                self.order_pos += 1;
-            }
-            let used = self.module.order_len();
-            if self.order_pos >= used {
-                self.order_pos = (self.module.restart as usize).min(used.saturating_sub(1));
-            }
+    fn set_ctl_bool(&mut self, ctl: &'static str, value: bool) -> Result<(), TrackerError> {
+        let key = CString::new(ctl).expect("static ctl key");
+        let ok =
+            unsafe { openmpt_module_ctl_set_boolean(self.module, key.as_ptr(), value as c_int) };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(TrackerError::Control {
+                ctl,
+                value: value.to_string(),
+            })
         }
     }
 
-    fn process_row(&mut self) {
-        let pat_idx = *self.module.order.get(self.order_pos).unwrap_or(&0) as usize;
-        if pat_idx >= self.module.patterns.len() {
-            return;
-        }
-        let row = self.row.min(63);
-        let cells = self.module.patterns[pat_idx][row];
-        let n_samples = self.module.samples.len();
-        let n_ch = self.module.channels.clamp(1, MAX_CHANNELS);
-
-        for c in 0..n_ch {
-            let cell = cells[c];
-            if cell.sample != 0 {
-                let si = cell.sample as usize;
-                if si <= n_samples {
-                    let vol = self.module.samples[si - 1].volume as f32 / 64.0;
-                    let empty = self.module.samples[si - 1].data.is_empty();
-                    let s = &mut self.channels[c];
-                    s.sample = cell.sample;
-                    s.vol = vol;
-                    if cell.period == 0 {
-                        s.pos = 0.0;
-                        s.active = !empty;
-                    }
-                }
-            }
-            if cell.period != 0 {
-                let si = self.channels[c].sample as usize;
-                let active = si >= 1 && si <= n_samples && !self.module.samples[si - 1].data.is_empty();
-                let s = &mut self.channels[c];
-                s.period = cell.period;
-                s.pos = 0.0;
-                s.active = active;
-            }
-            let p = cell.param;
-            match cell.effect {
-                0xB => self.pending_jump = Some((p as usize).min(127)),
-                0xC => self.channels[c].vol = p.min(64) as f32 / 64.0,
-                0xD => {
-                    let row = ((p >> 4) as usize) * 10 + (p & 0x0F) as usize;
-                    self.pending_break = Some(row.min(63));
-                }
-                0xF => {
-                    if p >= 0x20 {
-                        self.tempo = p as u32;
-                    } else if p > 0 {
-                        self.speed = p as u32;
-                    }
-                }
-                _ => {}
-            }
+    fn set_ctl_text(&mut self, ctl: &'static str, value: &str) -> Result<(), TrackerError> {
+        let key = CString::new(ctl).expect("static ctl key");
+        let text = CString::new(value).expect("static ctl value");
+        let ok = unsafe { openmpt_module_ctl_set_text(self.module, key.as_ptr(), text.as_ptr()) };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(TrackerError::Control {
+                ctl,
+                value: value.to_owned(),
+            })
         }
     }
 
-    /// Render `left.len()` stereo frames.
-    pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let n = left.len().min(right.len());
-        let pitch_factor = 2f64.powf(self.pitch_semitones as f64 / 12.0);
-        let sep = (self.stereo_separation / 100.0) as f64;
-        let n_ch = self.module.channels.clamp(1, MAX_CHANNELS);
+    // -- parameters ---------------------------------------------------------
 
-        for i in 0..n {
-            if self.frames_to_tick <= 0.0 {
-                self.advance_tick();
-                self.frames_to_tick = self.tick_frames();
-            }
-            self.frames_to_tick -= 1.0;
+    /// Apply a complete parameter set. Values are clamped into libopenmpt's
+    /// supported ranges; non-finite input is rejected rather than guessed at.
+    pub fn apply_params(&mut self, params: TrackerParams) -> Result<(), TrackerError> {
+        self.set_pitch_semitones(params.pitch_semitones)?;
+        self.set_tempo_ratio(params.tempo_ratio)?;
+        self.set_stereo_separation(params.stereo_separation)?;
+        self.set_interpolation(params.interpolation)?;
+        Ok(())
+    }
 
-            let mut l = 0.0f64;
-            let mut r = 0.0f64;
-            let mut frame_peak = [0.0f32; MAX_CHANNELS];
+    pub fn params(&self) -> TrackerParams {
+        self.params
+    }
 
-            for c in 0..n_ch {
-                let ch = self.channels[c];
-                if !ch.active || ch.sample == 0 || ch.period == 0 {
-                    continue;
+    /// `play.pitch_factor`. Independent of tempo: the event stream is
+    /// unaffected, only the sample pitch.
+    pub fn set_pitch_semitones(&mut self, semitones: f32) -> Result<(), TrackerError> {
+        let value = clamp_param(
+            "pitch_semitones",
+            semitones,
+            PITCH_SEMITONES_MAX,
+            -PITCH_SEMITONES_MAX,
+        )?;
+        let factor = 2.0f64.powf(value as f64 / 12.0);
+        let ctl = CString::new("play.pitch_factor").expect("static ctl key");
+        let ok = unsafe { openmpt_module_ctl_set_floatingpoint(self.module, ctl.as_ptr(), factor) };
+        if ok == 1 {
+            self.params.pitch_semitones = value;
+            Ok(())
+        } else {
+            Err(TrackerError::Control {
+                ctl: "play.pitch_factor",
+                value: format!("{factor} ({value} semitones)"),
+            })
+        }
+    }
+
+    /// `play.tempo_factor`. Independent of pitch; changes both the speed and
+    /// the output-timeline duration.
+    pub fn set_tempo_ratio(&mut self, ratio: f32) -> Result<(), TrackerError> {
+        let value = clamp_param("tempo_ratio", ratio, TEMPO_RATIO_MAX, TEMPO_RATIO_MIN)?;
+        let ctl = CString::new("play.tempo_factor").expect("static ctl key");
+        let ok = unsafe {
+            openmpt_module_ctl_set_floatingpoint(self.module, ctl.as_ptr(), value as f64)
+        };
+        if ok == 1 {
+            self.params.tempo_ratio = value;
+            Ok(())
+        } else {
+            Err(TrackerError::Control {
+                ctl: "play.tempo_factor",
+                value: value.to_string(),
+            })
+        }
+    }
+
+    /// Mixer stereo separation, 0..=200 percent.
+    pub fn set_stereo_separation(&mut self, percent: f32) -> Result<(), TrackerError> {
+        let value = clamp_param("stereo_separation", percent, STEREO_SEPARATION_MAX, 0.0)?;
+        let rounded = value.round() as i32;
+        set_render_param(
+            self.module,
+            RENDER_STEREOSEPARATION_PERCENT,
+            rounded,
+            "stereo_separation",
+        )?;
+        self.params.stereo_separation = rounded as f32;
+        Ok(())
+    }
+
+    pub fn set_interpolation(&mut self, interpolation: Interpolation) -> Result<(), TrackerError> {
+        let length = interpolation.filter_length();
+        set_render_param(
+            self.module,
+            RENDER_INTERPOLATIONFILTER_LENGTH,
+            length,
+            "interpolation",
+        )?;
+        self.params.interpolation = interpolation;
+        Ok(())
+    }
+
+    // -- transport ----------------------------------------------------------
+
+    /// Repeating playback natively inside libopenmpt (`repeat_count = -1`).
+    /// With looping on, [`TrackerEngine::render`] never returns 0; toggling it
+    /// off mid-loop stops at the next song end.
+    pub fn set_loop(&mut self, enabled: bool) -> Result<(), TrackerError> {
+        let repeat = if enabled { -1 } else { 0 };
+        let ok = unsafe { openmpt_module_set_repeat_count(self.module, repeat) };
+        if ok != 1 {
+            return Err(TrackerError::Control {
+                ctl: "repeat_count",
+                value: repeat.to_string(),
+            });
+        }
+        self.looping = enabled;
+        Ok(())
+    }
+
+    pub fn looping(&self) -> bool {
+        self.looping
+    }
+
+    /// Output-timeline duration in seconds at the current tempo ratio, or
+    /// `None` when the module has no finite end. Always finite when `Some`.
+    pub fn duration_secs(&self) -> Option<f64> {
+        self.module_duration_secs
+            .map(|d| d / self.params.tempo_ratio as f64)
+    }
+
+    /// Output-timeline position: rendered frames since open or the last seek,
+    /// in seconds. With looping on it wraps into `0..duration` once a pass
+    /// completes.
+    pub fn position_secs(&self) -> f64 {
+        self.played_secs
+    }
+
+    /// Seek on the output timeline. Values outside `0..=duration` are clamped;
+    /// the position actually reached is returned. Non-finite input is a caller
+    /// bug and returns an error rather than a guess.
+    pub fn seek(&mut self, seconds: f64) -> Result<f64, TrackerError> {
+        if !seconds.is_finite() {
+            return Err(TrackerError::InvalidParam {
+                param: "seek_seconds",
+                value: seconds,
+            });
+        }
+        let mut target = seconds.max(0.0);
+        if let Some(duration) = self.duration_secs() {
+            target = target.min(duration);
+        }
+        let reached = unsafe { openmpt_module_set_position_seconds(self.module, target) };
+        self.played_secs = reached.max(0.0);
+        self.finished = false;
+        Ok(self.played_secs)
+    }
+
+    /// Render interleaved stereo `f32` into `out` and return the frame count
+    /// written. Only the first `2 * returned` samples are touched. A return of
+    /// `0` means the end of the song and this engine is not looping.
+    ///
+    /// Samples are nominal `-1..1` but are **not** clipped by libopenmpt, so a
+    /// hot module can overshoot; the output stage owns limiting.
+    pub fn render(&mut self, out: &mut [f32]) -> usize {
+        assert!(
+            out.len() % 2 == 0,
+            "interleaved stereo buffer must hold whole frames, got {} samples",
+            out.len()
+        );
+        let frames = out.len() / 2;
+        if frames == 0 {
+            return 0;
+        }
+        let rendered = unsafe {
+            openmpt_module_read_interleaved_float_stereo(
+                self.module,
+                self.out_rate as c_int,
+                frames,
+                out.as_mut_ptr(),
+            )
+        };
+        self.played_secs += rendered as f64 / self.out_rate as f64;
+        if rendered == 0 {
+            self.finished = true;
+        } else if self.looping {
+            if let Some(duration) = self.duration_secs() {
+                if duration > 0.0 && self.played_secs >= duration {
+                    self.played_secs %= duration;
                 }
-                let si = ch.sample as usize;
-                if si > self.module.samples.len() {
-                    continue;
-                }
-                let sample = &self.module.samples[si - 1];
-                if sample.data.is_empty() {
-                    continue;
-                }
-                let v = sample_at(&sample.data, ch.pos, self.interp_filter);
-                let out = v * ch.vol;
-                frame_peak[c] = out.abs();
-
-                // Amiga LRRL panning scaled by separation.
-                let base = if c % 4 == 0 || c % 4 == 3 { -1.0 } else { 1.0 };
-                let pan = base * sep;
-                l += (out as f64) * 0.5 * (1.0 - pan);
-                r += (out as f64) * 0.5 * (1.0 + pan);
-
-                let finetune = sample.finetune as f64 / 96.0;
-                let freq = PAULA_CLOCK / ch.period as f64 * 2f64.powf(finetune) * pitch_factor;
-                let step = freq / self.rate as f64;
-                let mut pos = ch.pos + step;
-                let loop_end = sample.loop_start + sample.loop_len;
-                if sample.loop_len > 2 && loop_end <= sample.data.len() {
-                    while pos >= loop_end as f64 {
-                        pos -= sample.loop_len as f64;
-                    }
-                    if pos < 0.0 {
-                        pos = 0.0;
-                    }
-                } else if pos >= sample.data.len() as f64 {
-                    self.channels[c].active = false;
-                    pos = 0.0;
-                }
-                self.channels[c].pos = pos;
-            }
-
-            left[i] = (l * 0.5).clamp(-1.0, 1.0) as f32;
-            right[i] = (r * 0.5).clamp(-1.0, 1.0) as f32;
-            for c in 0..MAX_CHANNELS {
-                self.channel_vu[c] = self.channel_vu[c] * 0.9 + frame_peak[c] * 0.1;
             }
         }
+        rendered
+    }
+
+    /// `true` once [`TrackerEngine::render`] has reported the end of the song.
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    // -- introspection ------------------------------------------------------
+
+    pub fn out_rate(&self) -> u32 {
+        self.out_rate
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn metadata(&self) -> &TrackerMetadata {
+        &self.metadata
+    }
+
+    /// Pattern channels in the module (not the output channel count, which is
+    /// always stereo here).
+    pub fn channel_count(&self) -> u32 {
+        self.metadata.channels.max(0) as u32
+    }
+
+    /// VU/level view of every pattern channel, resizing `out` to
+    /// `channel_count()` and reusing its allocation across frames.
+    pub fn channel_vu_into(&self, out: &mut Vec<ChannelVu>) {
+        let count = self.channel_count() as usize;
+        out.clear();
+        out.reserve(count);
+        for index in 0..count {
+            out.push(unsafe {
+                ChannelVu {
+                    left: openmpt_module_get_current_channel_vu_left(self.module, index as i32),
+                    right: openmpt_module_get_current_channel_vu_right(self.module, index as i32),
+                }
+            });
+        }
+    }
+
+    /// Loudest channel's VU in one pass, for a single meter.
+    pub fn vu_peak(&self) -> ChannelVu {
+        let mut peak = ChannelVu::default();
+        for index in 0..self.channel_count() as i32 {
+            let left = unsafe { openmpt_module_get_current_channel_vu_left(self.module, index) };
+            let right = unsafe { openmpt_module_get_current_channel_vu_right(self.module, index) };
+            peak.left = peak.left.max(left);
+            peak.right = peak.right.max(right);
+        }
+        peak
+    }
+}
+
+impl Drop for TrackerEngine {
+    fn drop(&mut self) {
+        unsafe { openmpt_module_destroy(self.module) };
+    }
+}
+
+impl fmt::Debug for TrackerEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrackerEngine")
+            .field("path", &self.path)
+            .field("out_rate", &self.out_rate)
+            .field("params", &self.params)
+            .field("duration_secs", &self.duration_secs())
+            .field("position_secs", &self.played_secs)
+            .field("looping", &self.looping)
+            .field("finished", &self.finished)
+            .finish()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Interpolators
+// Internals
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn tap(data: &[f32], i: isize) -> f32 {
-    if i < 0 {
-        return 0.0;
+/// libopenmpt accepts (0, 4] for both play factors; factor 4 is +24 semitones.
+const PITCH_SEMITONES_MAX: f32 = 24.0;
+/// Lower bound chosen as the reciprocal of the library's upper bound, so the
+/// control travels symmetrically (0.25x .. 4.0x).
+const TEMPO_RATIO_MIN: f32 = 0.25;
+const TEMPO_RATIO_MAX: f32 = 4.0;
+const STEREO_SEPARATION_MAX: f32 = 200.0;
+
+fn clamp_param(param: &'static str, value: f32, high: f32, low: f32) -> Result<f32, TrackerError> {
+    if !value.is_finite() {
+        return Err(TrackerError::InvalidParam {
+            param,
+            value: value as f64,
+        });
     }
-    *data.get(i as usize).unwrap_or(&0.0)
+    Ok(value.clamp(low, high))
 }
 
-fn sample_at(data: &[f32], pos: f64, interp: usize) -> f32 {
-    let i0 = pos.floor();
-    let frac = (pos - i0) as f32;
-    let i0i = i0 as isize;
-    match interp {
-        1 => {
-            let a = tap(data, i0i);
-            let b = tap(data, i0i + 1);
-            a + (b - a) * frac
-        }
-        2 => {
-            let p0 = tap(data, i0i - 1);
-            let p1 = tap(data, i0i);
-            let p2 = tap(data, i0i + 1);
-            let p3 = tap(data, i0i + 2);
-            let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
-            let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
-            let c = -0.5 * p0 + 0.5 * p2;
-            ((a * frac + b) * frac + c) * frac + p1
-        }
-        3 => {
-            let mut acc = 0.0f32;
-            let mut wsum = 0.0f32;
-            for k in -3i32..=4 {
-                let x = frac - k as f32;
-                let w = lanczos(x);
-                acc += w * tap(data, i0i + k as isize);
-                wsum += w;
-            }
-            if wsum.abs() > 1e-6 {
-                acc / wsum
-            } else {
-                tap(data, i0i)
-            }
-        }
-        _ => tap(data, i0i),
+fn set_render_param(
+    module: *mut Module,
+    param: c_int,
+    value: i32,
+    name: &'static str,
+) -> Result<(), TrackerError> {
+    let ok = unsafe { openmpt_module_set_render_param(module, param, value) };
+    if ok == 1 {
+        Ok(())
+    } else {
+        Err(TrackerError::RenderParam { param: name, value })
     }
 }
 
-#[inline]
-fn lanczos(x: f32) -> f32 {
-    if x.abs() < 1e-6 {
-        return 1.0;
+/// Take ownership of a string libopenmpt allocated and free it. Every
+/// `const char *` the library returns must go through `openmpt_free_string` —
+/// the C runtime on the other side of the ABI is not necessarily ours.
+fn take_string(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
     }
-    if x.abs() >= 4.0 {
-        return 0.0;
-    }
-    let px = std::f32::consts::PI * x;
-    let ax = px / 4.0;
-    (px.sin() / px) * (ax.sin() / ax)
+    let value = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { openmpt_free_string(ptr) };
+    Some(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -641,29 +818,150 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_builtin_module_in_stereo() {
-        let mut p = TrackerPlayer::new(48_000);
-        p.load_builtin();
-        p.set_stereo_separation(100.0);
-        p.set_interp(2);
-        let mut l = vec![0.0f32; 4800];
-        let mut r = vec![0.0f32; 4800];
-        p.render(&mut l, &mut r);
-        let energy: f32 = l.iter().chain(r.iter()).map(|v| v * v).sum();
-        assert!(energy > 0.0, "expected non-zero tracker output");
-        assert!(
-            p.channel_vu.iter().any(|&v| v > 0.0),
-            "expected non-zero channel VU: {:?}",
-            p.channel_vu
-        );
+    fn linked_library_is_the_vendored_release() {
+        assert_eq!(library_version(), (0, 8, 9));
+        assert!(library_version_string().starts_with("0.8.9"));
     }
 
     #[test]
-    fn builtin_module_has_expected_shape() {
-        let m = TrackerModule::builtin_demoscene();
-        assert_eq!(m.channels, 4);
-        assert_eq!(m.samples.len(), 7);
-        assert_eq!(m.patterns.len(), 1);
-        assert_eq!(m.order_len(), 8);
+    fn extension_support_comes_from_the_library() {
+        for ext in ["mod", "s3m", "xm", "it", "mptm", "umx", "mo3"] {
+            assert!(
+                is_tracker_file(Path::new(&format!("x.{ext}"))),
+                "{ext} must be supported"
+            );
+        }
+        for ext in ["mp3", "flac", "wav", "mid", "txt"] {
+            assert!(
+                !is_tracker_file(Path::new(&format!("x.{ext}"))),
+                "{ext} must not be claimed"
+            );
+        }
+        assert!(
+            is_tracker_file(Path::new("A.MOD")),
+            "extension case is ignored"
+        );
+        assert!(!is_tracker_file(Path::new("no_extension")));
+        assert!(supported_extensions().len() > 40);
+    }
+
+    #[test]
+    fn interpolation_round_trips_through_filter_lengths() {
+        for interpolation in Interpolation::ALL {
+            assert_eq!(
+                Interpolation::from_filter_length(interpolation.filter_length()),
+                Some(interpolation)
+            );
+        }
+        assert_eq!(Interpolation::from_filter_length(3), None);
+        assert_eq!(Interpolation::default(), Interpolation::Default);
+    }
+
+    #[test]
+    fn defaults_are_neutral() {
+        let p = TrackerParams::default();
+        assert_eq!(p.pitch_semitones, 0.0);
+        assert_eq!(p.tempo_ratio, 1.0);
+        assert_eq!(p.stereo_separation, 100.0);
+        assert_eq!(p.interpolation, Interpolation::Default);
+    }
+
+    #[test]
+    fn out_of_range_rate_is_rejected_before_touching_the_file() {
+        let err = TrackerEngine::open(Path::new("irrelevant.mod"), 4_000).unwrap_err();
+        assert!(matches!(err, TrackerError::Rate { rate: 4_000 }));
+    }
+
+    #[test]
+    fn missing_file_is_a_read_error() {
+        let err = TrackerEngine::open(Path::new("Z:/definitely/not/here.mod"), 44_100).unwrap_err();
+        assert!(matches!(err, TrackerError::Read { .. }), "{err}");
+    }
+
+    #[test]
+    fn non_module_data_is_rejected_by_the_library() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let err = TrackerEngine::open(&manifest.join("Cargo.toml"), 44_100).unwrap_err();
+        assert!(matches!(err, TrackerError::Open { .. }), "{err}");
+    }
+
+    #[test]
+    fn non_finite_parameters_are_rejected() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Prove the range check fires before any file access.
+        let err = TrackerEngine::open(&manifest.join("Cargo.toml"), 192_001).unwrap_err();
+        assert!(matches!(err, TrackerError::Rate { rate: 192_001 }), "{err}");
+        assert!(matches!(
+            clamp_param("tempo_ratio", f32::NAN, TEMPO_RATIO_MAX, TEMPO_RATIO_MIN),
+            Err(TrackerError::InvalidParam { .. })
+        ));
+        assert_eq!(
+            clamp_param("tempo_ratio", 100.0, TEMPO_RATIO_MAX, TEMPO_RATIO_MIN).unwrap(),
+            TEMPO_RATIO_MAX
+        );
+        assert_eq!(
+            clamp_param(
+                "pitch_semitones",
+                -100.0,
+                PITCH_SEMITONES_MAX,
+                -PITCH_SEMITONES_MAX
+            )
+            .unwrap(),
+            -PITCH_SEMITONES_MAX
+        );
+    }
+
+    /// Media-dependent checks. Enable with `--ignored` on a machine that has
+    /// the canonical test share mounted.
+    #[test]
+    #[ignore = "requires Y:\\Test Files tracker media"]
+    fn native_tempo_seek_continues_render() {
+        let path = Path::new(r"Y:\Test Files\alpmar-3rd_world.mod");
+        let mut engine = TrackerEngine::open(&path, 48_000).expect("module must load");
+        engine.set_tempo_ratio(2.0).expect("native tempo");
+        let mut buffer = vec![0.0f32; 4096 * 2];
+        for seconds in [0.0, 10.0, 30.0, 60.0] {
+            let reached = engine.seek(seconds).expect("seek on scaled timeline");
+            assert!(
+                (reached - seconds).abs() < 1.0,
+                "seek {seconds}s reached {reached}s"
+            );
+            assert_eq!(
+                engine.render(&mut buffer),
+                4096,
+                "seek {seconds}s ended playback"
+            );
+        }
+    }
+
+    /// Media-dependent checks. Enable with `--ignored` on a machine that has
+    /// the canonical test share mounted.
+    #[test]
+    #[ignore = "requires Y:\\Test Files tracker media"]
+    fn loads_and_renders_the_canonical_modules() {
+        for name in ["alpmar-3rd_world.mod", "metroplx.s3m", "sunday_7_34.xm"] {
+            let path = Path::new(r"Y:\Test Files").join(name);
+            let mut engine = TrackerEngine::open(&path, 44_100).expect("module must load");
+            assert!(engine.channel_count() > 0, "{name}");
+            assert!(
+                engine.duration_secs().is_some(),
+                "{name} needs a finite length"
+            );
+            // Five seconds, not one block: an XM/S3M can legitimately open with
+            // a long silent lead-in, and "renders silence" must mean the module
+            // produces no audio, not that block 0 was empty.
+            let blocks = 5 * 44_100 / 4096 + 1;
+            let mut buffer = vec![0.0f32; 4096 * 2];
+            let mut peak = 0.0f32;
+            let mut frames = 0;
+            for _ in 0..blocks {
+                let rendered = engine.render(&mut buffer);
+                assert_eq!(rendered, 4096, "{name} must render a full block");
+                frames += rendered;
+                peak = buffer.iter().fold(peak, |acc, s| acc.max(s.abs()));
+            }
+            assert!(frames > 0, "{name} rendered nothing");
+            assert!(peak > 1e-3, "{name} must not render silence (peak {peak})");
+        }
     }
 }

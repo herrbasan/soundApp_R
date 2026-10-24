@@ -4,6 +4,8 @@
 mod audio;
 mod config;
 mod dsp;
+mod midi;
+mod tracker;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,16 +17,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use audio::{Audio, PlaybackParams, Source};
 use audio::TrackMetadata;
+use audio::{Audio, PlaybackParams, Source};
 use config::UserConfig;
 use dsp::{DspAnalyzer, DspSnapshot, BANDS};
 use nui::{
-    rgb, rgba, BackendKind, ButtonVariant, FontEngine, FontFace, KeyCmd, Length,
-    Rect, Renderer, Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_ADD,
-    ICON_CLOSE, ICON_EQ, ICON_LOOP, ICON_NEXT, ICON_PAUSE,
-    ICON_PLAY, ICON_PREV, ICON_RESTART, ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE,
-    ICON_VOLUME,
+    rgb, rgba, BackendKind, ButtonVariant, FontEngine, FontFace, KeyCmd, Length, Rect, Renderer,
+    Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_ADD, ICON_CHECK,
+    ICON_CLOSE, ICON_EQ, ICON_LOOP, ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV, ICON_RESTART,
+    ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE, ICON_VOLUME,
 };
 
 /// One channel strip in the Phase 3.4 multitrack preview mixer.
@@ -38,6 +39,208 @@ struct MixerStem {
     pan: f32,
     muted: bool,
     solo: bool,
+}
+
+/// The Parameters window's playback-parameter state — one value per control,
+/// split by engine so the dimmed engine card keeps its stored values while the
+/// other engine is active (matching the reference Electron Parameters window).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParamState {
+    /// `true` = Tape engine (resampling couples pitch & tempo); `false` = Rubber
+    /// Band Pitch/Time (independent pitch / tempo / formants).
+    tape: bool,
+    /// Tape speed in semitones (`-12..=12`, `0` = normal), always a whole
+    /// number — musical steps, as in the reference app. Tape physics: pitch
+    /// and tempo move together — `+12 st` plays at double speed.
+    tape_speed_st: f32,
+    /// Pitch/Time pitch shift in semitones (`-12..=12`), always a whole number.
+    pitch_st: f32,
+    /// Pitch/Time time stretch as a speed factor (`0.5..=1.5`), quantized to
+    /// whole percent (`1.0` = `100%`).
+    stretch: f32,
+    /// Pitch/Time formant preservation.
+    formant: bool,
+    /// Native tracker (libopenmpt) pitch in whole semitones (`-24..=24`,
+    /// `0` = neutral). Active only while a tracker module plays; the event
+    /// stream is unaffected — samples transpose, speed does not.
+    trk_pitch_st: f32,
+    /// Native tracker tempo in whole percent (`25..=400`, `100` = neutral).
+    /// Event-domain: rows and envelopes play faster/slower, samples keep pitch.
+    trk_tempo_pct: f32,
+    /// Native mixer stereo separation, `0..=200` percent (`100` = libopenmpt
+    /// default; `0` = mono).
+    trk_separation: f32,
+    /// Native mixer interpolation filter.
+    trk_interp: tracker::Interpolation,
+    /// Native MIDI (FluidSynth) transpose in whole semitones (`-24..=24`,
+    /// `0` = neutral). Applies live at the note-on/off hook — never restarts,
+    /// percussion channel 9 skips.
+    midi_transpose_st: f32,
+    /// Native MIDI tempo override in whole BPM (`30..=300`, default 120).
+    /// Applied only while `midi_bpm_override` is on; otherwise the file's
+    /// own tempo map rules.
+    midi_bpm: f32,
+    /// `true` = override the file's tempo with `midi_bpm` (absolute BPM).
+    midi_bpm_override: bool,
+    /// Native MIDI metronome click mixed over the rendered audio.
+    midi_metronome: bool,
+}
+
+impl Default for ParamState {
+    /// New-track defaults — matches the reference `DEFAULTS.audio`: tape engine,
+    /// neutral speed / pitch / stretch, formants off. Native tracker and MIDI
+    /// controls are neutral too; native sources ignore the shared audio set.
+    fn default() -> Self {
+        Self {
+            tape: true,
+            tape_speed_st: 0.0,
+            pitch_st: 0.0,
+            stretch: 1.0,
+            formant: false,
+            trk_pitch_st: 0.0,
+            trk_tempo_pct: 100.0,
+            trk_separation: 100.0,
+            trk_interp: tracker::Interpolation::Default,
+            midi_transpose_st: 0.0,
+            midi_bpm: 120.0,
+            midi_bpm_override: false,
+            midi_metronome: false,
+        }
+    }
+}
+
+impl ParamState {
+    /// Tape speed as a resample ratio (exponential: `+12 st` = `2.0x`).
+    fn tape_ratio(&self) -> f32 {
+        2.0f32.powf(self.tape_speed_st / 12.0)
+    }
+
+    /// The engine parameter set. The inactive engine's sliders are inert: tape
+    /// mode carries only the tape speed (pitch is the resample coupling), and
+    /// Pitch/Time mode ignores the tape slider. The native tracker set rides
+    /// along in every push; the engine applies it only to a tracker source.
+    fn engine_params(&self, hq: bool) -> PlaybackParams {
+        let (tempo_ratio, pitch_semitones) = if self.tape {
+            (self.tape_ratio(), 0.0)
+        } else {
+            (self.stretch, self.pitch_st)
+        };
+        PlaybackParams {
+            mode_tape: self.tape,
+            pitch_semitones,
+            tempo_ratio,
+            hq,
+            formant_preserve: self.formant,
+            tracker: tracker::TrackerParams {
+                pitch_semitones: self.trk_pitch_st,
+                tempo_ratio: self.trk_tempo_pct / 100.0,
+                stereo_separation: self.trk_separation,
+                interpolation: self.trk_interp,
+            },
+            midi: midi::MidiParams {
+                transpose_semitones: self.midi_transpose_st as i32,
+                bpm_override: if self.midi_bpm_override {
+                    Some(self.midi_bpm)
+                } else {
+                    None
+                },
+                metronome: self.midi_metronome,
+            },
+        }
+    }
+
+    /// Native tracker parameters reset to neutral (per-card Reset button).
+    fn reset_tracker(&mut self) {
+        self.trk_pitch_st = 0.0;
+        self.trk_tempo_pct = 100.0;
+        self.trk_separation = 100.0;
+        self.trk_interp = tracker::Interpolation::Default;
+    }
+
+    /// Native MIDI parameters reset to neutral (per-card Reset button).
+    fn reset_midi(&mut self) {
+        self.midi_transpose_st = 0.0;
+        self.midi_bpm = 120.0;
+        self.midi_bpm_override = false;
+        self.midi_metronome = false;
+    }
+}
+
+/// JS `Math.round`, which the reference app rounds every slider value with:
+/// exact halves go **up**, not away from zero (`Math.round(-2.5) === -2`).
+/// Rust's `f32::round` would give `-3` and land a whole semitone low on
+/// negative halves, so the rounding mode is ported explicitly.
+fn js_round(v: f32) -> f32 {
+    (v + 0.5).floor()
+}
+
+/// Musical quantization for the semitone sliders, matching the reference
+/// Electron app: `js/parameters/main.js` rounds every slider value before
+/// displaying it AND before sending it to the engine (`applyTapeSpeed` in
+/// `js/engines.js` re-integerizes with `| 0`), so whole semitones are the
+/// applied unit — not just the display unit. The reference has no sub-semitone
+/// adjustment: one semitone is the minimum move. `== 0.0` also normalizes
+/// `-0.0` so the `+0` readout never renders as `-0` (JS `-0 >= 0` is true,
+/// Rust prints `-0`).
+fn snap_semitones(v: f32) -> f32 {
+    snap_semitones_range(v, -12.0, 12.0)
+}
+
+/// `snap_semitones` for a different clamp range — the native tracker pitch
+/// slider spans libopenmpt's full ±24 semitones.
+fn snap_semitones_range(v: f32, min: f32, max: f32) -> f32 {
+    let r = js_round(v).clamp(min, max);
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
+}
+
+/// Whole-percent quantization for the unipolar tracker sliders (tempo,
+/// separation): one percent is the visible and applied unit.
+fn snap_percent(v: f32, min: f32, max: f32) -> f32 {
+    js_round(v).clamp(min, max)
+}
+
+/// Time-stretch quantization to whole percent: the reference slider spans
+/// `0.5..1.5` and displays `Math.round(v * 100)`, so 1% is the visible unit.
+fn snap_stretch(v: f32) -> f32 {
+    js_round(v * 100.0).clamp(50.0, 150.0) / 100.0
+}
+
+/// One wheel detent: `prev` advanced by exactly one visible unit, clamped to
+/// the slider range. `Ui::slider`'s own detent is 2.5% of the *range* (0.6 st
+/// on the ±12 sliders, 2.5% of the ratio slider), which lands between grid
+/// points and then alternates between one and two units once snapped. The
+/// reference app has no sub-unit adjustment at all, so a detent must move one
+/// unit — whole semitone, whole percent.
+fn wheel_step(prev: f32, wheel_y: f32, unit: f32, min: f32, max: f32) -> f32 {
+    (prev + unit * wheel_y.signum()).clamp(min, max)
+}
+
+/// `Ui::slider` with the detent replaced by `wheel_step` (see there). Drag,
+/// double-click / right-click reset and every visual stay the widget's; only a
+/// wheel notch is re-based on the unit grid. Callers snap afterwards and
+/// compare against their pre-call value so a detent at the range end pushes
+/// nothing to the engine.
+#[allow(clippy::too_many_arguments)]
+fn slider_one_unit(
+    ui: &mut Ui,
+    id: u32,
+    r: Rect,
+    val: &mut f32,
+    min: f32,
+    max: f32,
+    default_val: f32,
+    unit: f32,
+) -> bool {
+    let prev = *val;
+    let changed = ui.slider(id, r, "", val, min, max, default_val, "");
+    if changed && ui.state.wheel_y.abs() > 0.01 {
+        *val = wheel_step(prev, ui.state.wheel_y, unit, min, max);
+    }
+    changed
 }
 
 struct App {
@@ -75,15 +278,12 @@ struct App {
     open_window_spec: Option<&'static WindowSpec>,
 
     // Interactive player states
-    seg_pipeline: usize,
-    /// Previous pipeline selection, used to re-apply the parameter set.
-    last_pipeline: usize,
+    /// Playback parameters shown in the Parameters window (engine mode + the
+    /// per-engine sliders). See `ParamState`.
+    params: ParamState,
     selected_device: usize,
     selected_rate: usize,
-    pitch_semitones: f32,
-    tempo_ratio: f32,
     master_vol: f32,
-    chk_formant: bool,
     chk_locked: bool,
     sw_hq_mode: bool,
     sw_keep_tray: bool,
@@ -91,6 +291,11 @@ struct App {
     selected_track: usize,
     /// Master volume in `0.0..=2.0` (`1.0` = unity); persisted in `user.json`.
     pub show_controls: bool,
+
+    // MIDI source engine — SoundFonts available to the Parameters page and
+    // the selection index (persisted as `selected_soundfont`).
+    soundfonts: Vec<PathBuf>,
+    selected_soundfont: usize,
 
     // Phase 3.1 — player transport state (loop / shuffle).
     pub loop_enabled: bool,
@@ -150,10 +355,12 @@ const SAMPLE_RATES: &[&str] = &[
 const SPEC_PARAMETERS: WindowSpec = WindowSpec {
     key: "parameters",
     title: "SoundApp · Parameters [P]",
+    // Audio-page size. Native tracker/MIDI pages use a compact adjusted spec
+    // when opened (see `adjusted_window_spec`).
     width: 680.0,
-    height: 460.0,
-    min_width: 520.0,
-    min_height: 340.0,
+    height: 1076.0,
+    min_width: 480.0,
+    min_height: 1076.0,
     undecorated: true,
 };
 
@@ -357,20 +564,18 @@ fn draw_readout(ui: &mut Ui, r: Rect, label: &str, value: &str) {
 }
 
 /// One color segment of a VU meter, limited to the region above the `top` fill line.
-fn meter_segment(
-    ui: &mut Ui,
-    r: Rect,
-    top: f32,
-    lo_db: f32,
-    hi_db: f32,
-    color: (u8, u8, u8, u8),
-) {
+fn meter_segment(ui: &mut Ui, r: Rect, top: f32, lo_db: f32, hi_db: f32, color: (u8, u8, u8, u8)) {
     let db_to_y = |db: f32| r.y + r.h * (1.0 - ((db + 60.0) / 60.0).clamp(0.0, 1.0));
     let y_start = db_to_y(hi_db).max(top);
     let y_end = db_to_y(lo_db);
     if y_end > y_start + 0.5 {
-        ui.scene
-            .rect(r.x + 1.0, y_start, (r.w - 2.0).max(1.0), y_end - y_start, color);
+        ui.scene.rect(
+            r.x + 1.0,
+            y_start,
+            (r.w - 2.0).max(1.0),
+            y_end - y_start,
+            color,
+        );
     }
 }
 
@@ -518,18 +723,25 @@ fn master_volume_pill(ui: &mut Ui, r: Rect, vol: &mut f32, id: u32) {
     );
 }
 
-
 /// Every audio extension FFmpeg decodes that SoundApp treats as playable.
 const AUDIO_EXTS: &[&str] = &[
-    "mp3", "wav", "flac", "ogg", "opus", "m4a", "m4b", "aac", "mp4", "webm", "mpg", "mp2",
-    "aif", "aiff", "wma", "asf", "ape", "wv", "wvc", "tta", "mka", "amr", "3ga", "ac3",
-    "eac3", "dts", "dtshd", "caf", "au", "snd", "voc", "tak", "mpc",
+    "mp3", "wav", "flac", "ogg", "opus", "m4a", "m4b", "aac", "mp4", "webm", "mpg", "mp2", "aif",
+    "aiff", "wma", "asf", "ape", "wv", "wvc", "tta", "mka", "amr", "3ga", "ac3", "eac3", "dts",
+    "dtshd", "caf", "au", "snd", "voc", "tak", "mpc",
 ];
 
+/// Whether the path is playable: an FFmpeg-decoded audio format, a tracker
+/// module libopenmpt claims (the library itself is asked — its list cannot
+/// drift from the linked build, and it does not claim mp3/wav/flac), or a
+/// MIDI file the FluidSynth engine claims (mid/midi/rmi).
 fn is_supported_audio(p: &std::path::Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .map(|e| AUDIO_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+        .map(|e| {
+            AUDIO_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x))
+                || tracker::is_tracker_file(p)
+                || midi::is_midi_file(p)
+        })
         .unwrap_or(false)
 }
 
@@ -595,6 +807,11 @@ fn ribbon_color(ext: &str) -> (u8, u8, u8, u8) {
         "M4A" | "M4B" | "AAC" | "MP4" => rgb(7, 62, 145),
         "FLAC" => rgb(15, 104, 23),
         "OGG" | "OPUS" => rgb(145, 58, 7),
+        // Tracker modules (libopenmpt source engine) — violet family.
+        "MOD" | "S3M" | "XM" | "IT" | "MPTM" | "MO3" | "STM" | "MTM" | "MED" | "FAR" | "M15"
+        | "669" | "ULT" | "GDM" | "UMX" => rgb(88, 28, 135),
+        // MIDI (FluidSynth source engine) — teal family.
+        "MID" | "MIDI" | "RMI" => rgb(7, 94, 104),
         _ => rgb(100, 100, 100),
     }
 }
@@ -614,14 +831,8 @@ enum ScanJob {
 }
 
 enum ScanOutcome {
-    SingleFile {
-        files: Vec<PathBuf>,
-        idx: usize,
-    },
-    Folder {
-        files: Vec<PathBuf>,
-        append: bool,
-    },
+    SingleFile { files: Vec<PathBuf>, idx: usize },
+    Folder { files: Vec<PathBuf>, append: bool },
     MixerStems(usize),
 }
 
@@ -650,12 +861,16 @@ struct MainIntents {
     close: bool,
 }
 
-/// Intents produced by the Phase 3.2 adaptive Parameters window.
+/// Intents produced by the Parameters window, applied after the render borrow ends.
 #[derive(Default)]
 struct ParamsWindowIntents {
+    /// A slider / switch / per-card Reset changed a value — push the full set.
     params_changed: bool,
+    /// The engine card switched (tape ⇄ pitch/time) — push the new engine's set.
     pipeline_changed: bool,
-    reset_all: bool,
+    /// The SoundFont select moved — forward the new font to the engine (MIDI
+    /// sources adopt it live; others open the next MIDI track with it).
+    soundfont_idx: Option<usize>,
 }
 
 /// Small flat ghost icon button used by the minimalist top bar.
@@ -694,14 +909,7 @@ fn ghost_icon_btn(
 
 /// Flat square transport button (`rgb(52,52,52)` in dark / `rgb(180,180,180)` in light,
 /// blue when active — matching `SoundApp/css/main.css` `.controls .button`).
-fn player_icon_btn(
-    ui: &mut Ui,
-    id: u32,
-    r: Rect,
-    icon: &str,
-    active: bool,
-    scale: f32,
-) -> bool {
+fn player_icon_btn(ui: &mut Ui, id: u32, r: Rect, icon: &str, active: bool, scale: f32) -> bool {
     let dark = ui.theme.dark;
     ui.state.register_focusable(id);
     let hovered = ui.state.can_hover(id, r);
@@ -726,16 +934,8 @@ fn player_icon_btn(
     } else {
         rgb(180, 180, 180)
     };
-    ui.scene.rounded_rect(
-        r.x,
-        r.y,
-        r.w,
-        r.h,
-        2.0 * scale,
-        fill,
-        (0, 0, 0, 0),
-        0.0,
-    );
+    ui.scene
+        .rounded_rect(r.x, r.y, r.w, r.h, 2.0 * scale, fill, (0, 0, 0, 0), 0.0);
     let fg = if active {
         rgb(255, 255, 255)
     } else if dark {
@@ -805,6 +1005,756 @@ fn draw_meta_row(
     );
 }
 
+/// Parameters engine-card helpers — modelled on the reference Electron
+/// Parameters window (`docs/reference_ui/params_audio.png`): one card per
+/// engine, the inactive one dimmed, click-to-activate.
+
+/// Press/release hit for "click a dimmed engine card to activate it" (the
+/// reference activates a disabled section on any click inside it). Active cards
+/// never report a click — they are already the chosen engine.
+fn engine_card_hit(ui: &mut Ui, id: u32, r: Rect, active: bool) -> bool {
+    if active {
+        return false;
+    }
+    ui.state.register_focusable(id);
+    let hovered = ui.state.can_hover(id, r);
+    if hovered {
+        ui.state.hovered_id = Some(id);
+        if ui.state.mouse_pressed {
+            ui.state.active_id = Some(id);
+            ui.state.focused_id = Some(id);
+        }
+    }
+    hovered && ui.state.mouse_released && ui.state.active_id == Some(id)
+}
+
+/// Card title row: engine name left, blue check badge right when active.
+fn draw_card_title(ui: &mut Ui, r: Rect, title: &str, active: bool) {
+    let t = ui.theme;
+    let fs = t.font_medium();
+    ui.text_clipped(
+        FontFace::SemiBold,
+        ui.font_engine,
+        title,
+        r.x.round(),
+        (r.y + r.h * 0.5 + fs * 0.36).round(),
+        fs,
+        (r.w - fs * 2.0).max(0.0),
+        t.text,
+    );
+    if active {
+        ui.scene.icon_centered(
+            ui.text_sys,
+            ICON_CHECK,
+            (r.x + r.w - fs * 0.7).round(),
+            (r.y + r.h * 0.5).round(),
+            fs.round(),
+            t.highlight,
+        );
+    }
+}
+
+/// Large centered value readout: big number with a small unit beside it
+/// (`+0 semitones` / `100 %` in the reference Parameters cards).
+fn draw_value_readout(ui: &mut Ui, r: Rect, value: &str, unit: &str) {
+    draw_value_readout_scaled(ui, r, value, unit, 1.9);
+}
+
+fn draw_value_readout_scaled(ui: &mut Ui, r: Rect, value: &str, unit: &str, scale: f32) {
+    let t = ui.theme;
+    let vfs = (t.rem * scale).round();
+    let ufs = t.font_small();
+    let vw = ui
+        .text_sys
+        .measure(FontFace::SemiBold, ui.font_engine, value, vfs);
+    let uw = ui
+        .text_sys
+        .measure(FontFace::Regular, ui.font_engine, unit, ufs);
+    let gap = (t.rem * 0.4).round();
+    let x0 = r.x + (r.w - vw - gap - uw) * 0.5;
+    let cy = r.y + r.h * 0.5;
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::SemiBold,
+        ui.font_engine,
+        value,
+        x0.round(),
+        (cy + vfs * 0.36).round(),
+        vfs,
+        t.text,
+    );
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        unit,
+        (x0 + vw + gap).round(),
+        (cy + ufs * 0.36).round(),
+        ufs,
+        t.text_dim,
+    );
+}
+
+/// Non-interactive slider snapshot for a dimmed card: track, bipolar center
+/// tick, fill and thumb — same geometry as `Ui::slider`, no hit target.
+fn draw_static_slider(ui: &mut Ui, r: Rect, val: f32, min: f32, max: f32) {
+    let t = ui.theme;
+    let label_h = (t.rem * 1.25).round();
+    let track_area = Rect::new(r.x, r.y + label_h, r.w, r.h - label_h);
+    let thumb_r = (t.rem * 0.5).round();
+    let track_x0 = (r.x + thumb_r).round();
+    let track_w = (r.w - thumb_r * 2.0).round().max(1.0);
+    let track_h = (t.rem * 0.25).round().max(4.0);
+    let track_cy = (track_area.y + track_area.h * 0.5).round();
+    let track_bg = if t.dark {
+        rgba(255, 255, 255, 38)
+    } else {
+        rgba(0, 0, 0, 38)
+    };
+    ui.scene.rounded_rect(
+        track_x0,
+        track_cy - track_h * 0.5,
+        track_w,
+        track_h,
+        track_h * 0.5,
+        track_bg,
+        (0, 0, 0, 0),
+        0.0,
+    );
+    let norm = ((val - min) / (max - min)).clamp(0.0, 1.0);
+    let fill_w = track_w * norm;
+    if min < 0.0 && max > 0.0 {
+        let zero_norm = (0.0 - min) / (max - min);
+        let zx = (track_x0 + track_w * zero_norm).round();
+        let tick_h = (t.rem * 0.72).round();
+        ui.scene
+            .rect(zx - 1.0, track_cy - tick_h * 0.5, 2.0, tick_h, t.shade5);
+        let f0 = zx.min(track_x0 + fill_w);
+        let f1 = zx.max(track_x0 + fill_w);
+        if f1 > f0 {
+            ui.scene.rounded_rect(
+                f0,
+                track_cy - track_h * 0.5,
+                f1 - f0,
+                track_h,
+                track_h * 0.5,
+                t.highlight,
+                (0, 0, 0, 0),
+                0.0,
+            );
+        }
+    } else if fill_w > 0.5 {
+        ui.scene.rounded_rect(
+            track_x0,
+            track_cy - track_h * 0.5,
+            fill_w,
+            track_h,
+            track_h * 0.5,
+            t.highlight,
+            (0, 0, 0, 0),
+            0.0,
+        );
+    }
+    let d = (t.rem * 1.0).round();
+    ui.scene.rounded_rect(
+        (track_x0 + fill_w - d * 0.5).round(),
+        (track_cy - d * 0.5).round(),
+        d,
+        d,
+        d * 0.5,
+        t.highlight,
+        (0, 0, 0, 0),
+        0.0,
+    );
+}
+
+/// Scale labels under a slider: left edge / center / right edge, muted.
+fn draw_scale_labels(ui: &mut Ui, r: Rect, left: &str, mid: &str, right: &str) {
+    let t = ui.theme;
+    let fs = t.font_xsmall();
+    let baseline = (r.y + r.h * 0.5 + fs * 0.35).round();
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        left,
+        r.x.round(),
+        baseline,
+        fs,
+        t.text_muted,
+    );
+    let mw = ui
+        .text_sys
+        .measure(FontFace::Regular, ui.font_engine, mid, fs);
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        mid,
+        (r.x + (r.w - mw) * 0.5).round(),
+        baseline,
+        fs,
+        t.text_muted,
+    );
+    let rw = ui
+        .text_sys
+        .measure(FontFace::Regular, ui.font_engine, right, fs);
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        right,
+        (r.x + r.w - rw).round(),
+        baseline,
+        fs,
+        t.text_muted,
+    );
+}
+
+/// Static outline button snapshot (dimmed card) — no hit target.
+fn draw_ghost_button(ui: &mut Ui, r: Rect, label: &str) {
+    let t = ui.theme;
+    ui.scene.rounded_rect(
+        r.x.round(),
+        r.y.round(),
+        r.w.round(),
+        r.h.round(),
+        t.radius1(),
+        t.base,
+        t.border2,
+        1.0,
+    );
+    draw_centered_text(ui, r, label, FontFace::Regular, t.font_small(), t.text_dim);
+}
+
+/// Static switch snapshot (dimmed card): pill track + thumb + label, no hit target.
+fn draw_ghost_switch(ui: &mut Ui, r: Rect, label: &str, on: bool) {
+    let t = ui.theme;
+    let sw_h = (t.rem * 1.25).round();
+    let sw_w = (sw_h * 1.8).round();
+    let cy = r.y + r.h * 0.5;
+    let sy = (cy - sw_h * 0.5).round();
+    let track_col = if on { t.highlight } else { t.shade4 };
+    ui.scene.rounded_rect(
+        r.x.round(),
+        sy,
+        sw_w,
+        sw_h,
+        sw_h * 0.5,
+        track_col,
+        (0, 0, 0, 0),
+        0.0,
+    );
+    let pad = (sw_h * 0.16).round().max(2.0);
+    let d = sw_h - pad * 2.0;
+    let tx = if on { r.x + sw_w - pad - d } else { r.x + pad };
+    ui.scene.rounded_rect(
+        tx.round(),
+        sy + pad,
+        d,
+        d,
+        d * 0.5,
+        rgb(255, 255, 255),
+        (0, 0, 0, 0),
+        0.0,
+    );
+    let fs = t.font_small();
+    let ltx = r.x + sw_w + t.checkbox_gap();
+    ui.text_clipped(
+        FontFace::Regular,
+        ui.font_engine,
+        label,
+        ltx.round(),
+        (cy + fs * 0.33).round(),
+        fs,
+        (r.x + r.w - ltx).max(0.0),
+        t.text_dim,
+    );
+}
+
+/// Dim veil over an inactive engine card — the reference `disabled` section
+/// look (a translucent page-background wash over the whole card, like CSS
+/// `opacity` on the section).
+fn dim_card(ui: &mut Ui, r: Rect) {
+    let t = ui.theme;
+    let veil = if t.dark {
+        rgba(19, 19, 19, 150)
+    } else {
+        rgba(235, 235, 235, 150)
+    };
+    ui.scene.rounded_rect(
+        r.x + 1.0,
+        r.y + 1.0,
+        (r.w - 2.0).max(1.0),
+        (r.h - 2.0).max(1.0),
+        t.radius2(),
+        veil,
+        (0, 0, 0, 0),
+        0.0,
+    );
+}
+
+/// Tape Speed engine card body — AUDIO page only.
+fn draw_tape_speed_card(
+    ui: &mut Ui,
+    title: &str,
+    active: bool,
+    params: &mut ParamState,
+    intents: &mut ParamsWindowIntents,
+) {
+    let title_r = ui.take(Length::Rem(1.5));
+    draw_card_title(ui, title_r, title, active);
+    let body_r = ui.take(Length::Rem(5.9));
+    let vrem = Length::Rem(2.2).resolve(ui.theme.rem);
+    let srem = Length::Rem(2.6).resolve(ui.theme.rem);
+    let val_r = Rect::new(body_r.x, body_r.y, body_r.w, vrem);
+    let sl_r = Rect::new(body_r.x, body_r.y + vrem, body_r.w, srem);
+    let lab_r = Rect::new(
+        body_r.x,
+        body_r.y + vrem + srem,
+        body_r.w,
+        body_r.h - vrem - srem,
+    );
+    let v = format!("{:+.0}", params.tape_speed_st);
+    draw_value_readout(ui, val_r, &v, "semitones");
+    if active {
+        let prev = params.tape_speed_st;
+        if slider_one_unit(
+            ui,
+            1210,
+            sl_r,
+            &mut params.tape_speed_st,
+            -12.0,
+            12.0,
+            0.0,
+            1.0,
+        ) {
+            params.tape_speed_st = snap_semitones(params.tape_speed_st);
+            intents.params_changed |= params.tape_speed_st != prev;
+        }
+    } else {
+        draw_static_slider(ui, sl_r, params.tape_speed_st, -12.0, 12.0);
+    }
+    draw_scale_labels(ui, lab_r, "-12", "0", "+12");
+    let [_, btn_r] = ui.take_cols(
+        Length::Rem(1.9),
+        Length::rem(1.0),
+        [Length::fill(), Length::rem(6.5)],
+    );
+    if !active {
+        draw_ghost_button(ui, btn_r, "Reset");
+    } else if ui.button(1211, btn_r, "Reset", ICON_RESTART, ButtonVariant::Outline) {
+        params.tape_speed_st = 0.0;
+        intents.params_changed = true;
+    }
+}
+
+/// Rubber Band Pitch / Time engine card body — AUDIO page only.
+#[allow(clippy::too_many_arguments)]
+fn draw_pitch_time_card(
+    ui: &mut Ui,
+    title: &str,
+    active: bool,
+    params: &mut ParamState,
+    intents: &mut ParamsWindowIntents,
+) {
+    let theme = ui.theme;
+    let title_r = ui.take(Length::Rem(1.5));
+    draw_card_title(ui, title_r, title, active);
+    let fs = theme.font_small();
+    let sub_h = Length::Rem(1.0).resolve(theme.rem);
+    let val_h = Length::Rem(1.9).resolve(theme.rem);
+    let sl_h = Length::Rem(2.6).resolve(theme.rem);
+    // Pitch Shift group
+    let g1 = ui.take(Length::Rem(6.6));
+    let g1_sub = Rect::new(g1.x, g1.y, g1.w, sub_h);
+    let g1_val = Rect::new(g1.x, g1.y + sub_h, g1.w, val_h);
+    let g1_sl = Rect::new(g1.x, g1.y + sub_h + val_h, g1.w, sl_h);
+    let g1_lab = Rect::new(
+        g1.x,
+        g1.y + sub_h + val_h + sl_h,
+        g1.w,
+        g1.h - sub_h - val_h - sl_h,
+    );
+    ui.text_clipped(
+        FontFace::SemiBold,
+        ui.font_engine,
+        "Pitch Shift",
+        g1_sub.x.round(),
+        (g1_sub.y + g1_sub.h * 0.5 + fs * 0.35).round(),
+        fs,
+        g1_sub.w,
+        theme.text_dim,
+    );
+    let v = format!("{:+.0}", params.pitch_st);
+    draw_value_readout(ui, g1_val, &v, "semitones");
+    if active {
+        let prev = params.pitch_st;
+        if slider_one_unit(ui, 1220, g1_sl, &mut params.pitch_st, -12.0, 12.0, 0.0, 1.0) {
+            params.pitch_st = snap_semitones(params.pitch_st);
+            intents.params_changed |= params.pitch_st != prev;
+        }
+    } else {
+        draw_static_slider(ui, g1_sl, params.pitch_st, -12.0, 12.0);
+    }
+    draw_scale_labels(ui, g1_lab, "-12", "0", "+12");
+    // Time Stretch group
+    let g2 = ui.take(Length::Rem(6.6));
+    let g2_sub = Rect::new(g2.x, g2.y, g2.w, sub_h);
+    let g2_val = Rect::new(g2.x, g2.y + sub_h, g2.w, val_h);
+    let g2_sl = Rect::new(g2.x, g2.y + sub_h + val_h, g2.w, sl_h);
+    let g2_lab = Rect::new(
+        g2.x,
+        g2.y + sub_h + val_h + sl_h,
+        g2.w,
+        g2.h - sub_h - val_h - sl_h,
+    );
+    ui.text_clipped(
+        FontFace::SemiBold,
+        ui.font_engine,
+        "Time Stretch",
+        g2_sub.x.round(),
+        (g2_sub.y + g2_sub.h * 0.5 + fs * 0.35).round(),
+        fs,
+        g2_sub.w,
+        theme.text_dim,
+    );
+    let v = format!("{:.0}", params.stretch * 100.0);
+    draw_value_readout(ui, g2_val, &v, "%");
+    // Driven in a ±0.5 bias domain around 100%: the reference
+    // slider carries a center mark at 100% and fills outward
+    // from it (`<div class="center-mark">` in the Electron
+    // markup), which the widget only draws for a range that
+    // spans zero. `stretch` itself stays a 0.5..1.5 ratio.
+    if active {
+        let prev = params.stretch;
+        let mut bias = params.stretch - 1.0;
+        if slider_one_unit(ui, 1221, g2_sl, &mut bias, -0.5, 0.5, 0.0, 0.01) {
+            params.stretch = snap_stretch(bias + 1.0);
+            intents.params_changed |= params.stretch != prev;
+        }
+    } else {
+        draw_static_slider(ui, g2_sl, params.stretch - 1.0, -0.5, 0.5);
+    }
+    draw_scale_labels(ui, g2_lab, "50%", "100%", "150%");
+    let [sw_r, btn_r] = ui.take_cols(
+        Length::Rem(1.9),
+        Length::rem(1.0),
+        [Length::fill(), Length::rem(6.5)],
+    );
+    if !active {
+        draw_ghost_switch(ui, sw_r, "Preserve Formants", params.formant);
+        draw_ghost_button(ui, btn_r, "Reset");
+    } else {
+        if ui.switch(1222, sw_r, "Preserve Formants", &mut params.formant) {
+            intents.params_changed = true;
+        }
+        if ui.button(1223, btn_r, "Reset", ICON_RESTART, ButtonVariant::Outline) {
+            params.pitch_st = 0.0;
+            params.stretch = 1.0;
+            params.formant = false;
+            intents.params_changed = true;
+        }
+    }
+}
+
+/// Native tracker (libopenmpt) control labels for the interpolation select,
+/// index-aligned with `tracker::Interpolation::ALL`.
+const TRK_INTERP_OPTIONS: [&str; 5] = [
+    "Library Default",
+    "None (authentic)",
+    "Linear",
+    "Cubic",
+    "Sinc 8 (HQ)",
+];
+
+/// Native Tracker Engine card body — TRACKER page only. Pitch and tempo are
+/// the event-domain controls (samples transpose without speed change / rows
+/// speed up without transposition); separation and interpolation shape the
+/// module mixer. Always active: this card IS the source engine.
+fn draw_tracker_native_card(
+    ui: &mut Ui,
+    params: &mut ParamState,
+    intents: &mut ParamsWindowIntents,
+) {
+    let theme = ui.theme;
+    let title_r = ui.take(Length::Rem(1.5));
+    draw_card_title(ui, title_r, "Tracker Engine · native", true);
+    let fs = theme.font_small();
+    let sub_h = Length::Rem(1.0).resolve(theme.rem);
+    let val_h = Length::Rem(1.9).resolve(theme.rem);
+    let sl_h = Length::Rem(2.6).resolve(theme.rem);
+
+    let group_label = |ui: &mut Ui, r: Rect, label: &str| {
+        ui.text_clipped(
+            FontFace::SemiBold,
+            ui.font_engine,
+            label,
+            r.x.round(),
+            (r.y + r.h * 0.5 + fs * 0.35).round(),
+            fs,
+            r.w,
+            theme.text_dim,
+        );
+    };
+
+    // Each control group spans the full card width and the groups stack
+    // vertically, as on the reference page (`params_tracker.png`) — no
+    // half-width pitch/tempo or separation/interpolation pairing.
+    let full_group = |ui: &mut Ui, h: f32| -> (Rect, Rect, Rect, Rect) {
+        let g = ui.take(Length::Rem(h));
+        let sub = Rect::new(g.x, g.y, g.w, sub_h);
+        let val = Rect::new(g.x, g.y + sub_h, g.w, val_h);
+        let sl = Rect::new(g.x, g.y + sub_h + val_h, g.w, sl_h);
+        let lab = Rect::new(
+            g.x,
+            g.y + sub_h + val_h + sl_h,
+            g.w,
+            g.h - sub_h - val_h - sl_h,
+        );
+        (sub, val, sl, lab)
+    };
+
+    let (sub, val, sl, lab) = full_group(ui, 6.6);
+    group_label(ui, sub, "Pitch");
+    let v = format!("{:+.0}", params.trk_pitch_st);
+    draw_value_readout(ui, val, &v, "semitones");
+    {
+        let prev = params.trk_pitch_st;
+        if slider_one_unit(
+            ui,
+            1261,
+            sl,
+            &mut params.trk_pitch_st,
+            -24.0,
+            24.0,
+            0.0,
+            1.0,
+        ) {
+            params.trk_pitch_st = snap_semitones_range(params.trk_pitch_st, -24.0, 24.0);
+            intents.params_changed |= params.trk_pitch_st != prev;
+        }
+    }
+    draw_scale_labels(ui, lab, "-24", "0", "+24");
+
+    let (sub, val, sl, lab) = full_group(ui, 6.6);
+    group_label(ui, sub, "Tempo");
+    let v = format!("{:.0}", params.trk_tempo_pct);
+    draw_value_readout(ui, val, &v, "%");
+    {
+        let prev = params.trk_tempo_pct;
+        if slider_one_unit(
+            ui,
+            1263,
+            sl,
+            &mut params.trk_tempo_pct,
+            25.0,
+            400.0,
+            100.0,
+            1.0,
+        ) {
+            params.trk_tempo_pct = snap_percent(params.trk_tempo_pct, 25.0, 400.0);
+            intents.params_changed |= params.trk_tempo_pct != prev;
+        }
+    }
+    draw_scale_labels(ui, lab, "25%", "100%", "400%");
+
+    let (sub, val, sl, lab) = full_group(ui, 6.6);
+    group_label(ui, sub, "Stereo Separation");
+    let v = format!("{:.0}", params.trk_separation);
+    draw_value_readout(ui, val, &v, "%");
+    {
+        let prev = params.trk_separation;
+        if slider_one_unit(
+            ui,
+            1265,
+            sl,
+            &mut params.trk_separation,
+            0.0,
+            200.0,
+            100.0,
+            1.0,
+        ) {
+            params.trk_separation = snap_percent(params.trk_separation, 0.0, 200.0);
+            intents.params_changed |= params.trk_separation != prev;
+        }
+    }
+    draw_scale_labels(ui, lab, "0", "100", "200");
+
+    // Interpolation select — full width at standard control height, not the
+    // full value+slider span.
+    let sel_h = Length::Rem(2.2).resolve(theme.rem);
+    let g = ui.take(Length::Rem(4.3));
+    let sub = Rect::new(g.x, g.y, g.w, sub_h);
+    let sel = Rect::new(g.x, g.y + sub_h, g.w, sel_h);
+    let lab = Rect::new(g.x, g.y + sub_h + sel_h, g.w, g.h - sub_h - sel_h);
+    group_label(ui, sub, "Interpolation");
+    // Index into TRK_INTERP_OPTIONS == index into Interpolation::ALL.
+    let mut idx = tracker::Interpolation::ALL
+        .iter()
+        .position(|i| *i == params.trk_interp)
+        .unwrap_or(0);
+    if ui.select(1267, sel, &TRK_INTERP_OPTIONS, &mut idx) {
+        params.trk_interp = tracker::Interpolation::ALL[idx];
+        intents.params_changed = true;
+    }
+    let hint = format!("filter length {}", params.trk_interp.filter_length());
+    draw_scale_labels(ui, lab, &hint, "", "");
+
+    let [_, btn_r] = ui.take_cols(
+        Length::Rem(1.9),
+        Length::rem(1.0),
+        [Length::fill(), Length::rem(6.5)],
+    );
+    if ui.button(1268, btn_r, "Reset", ICON_RESTART, ButtonVariant::Outline) {
+        params.reset_tracker();
+        intents.params_changed = true;
+    }
+}
+
+/// Native MIDI Engine card body — MIDI page only. Transpose, BPM override
+/// and the metronome are applied by FluidSynth itself (live, no restart);
+/// the SoundFont select switches fonts without touching position.
+#[allow(clippy::too_many_arguments)]
+fn draw_midi_native_card(
+    ui: &mut Ui,
+    params: &mut ParamState,
+    fonts: &[PathBuf],
+    selected_font: &mut usize,
+    intents: &mut ParamsWindowIntents,
+) {
+    let theme = ui.theme;
+    let title_r = ui.take(Length::Rem(1.5));
+    draw_card_title(ui, title_r, "MIDI Engine · native", true);
+    let fs = theme.font_small();
+    let sub_h = Length::Rem(1.0).resolve(theme.rem);
+    let val_h = Length::Rem(1.9).resolve(theme.rem);
+    let sl_h = Length::Rem(2.6).resolve(theme.rem);
+
+    let group_label = |ui: &mut Ui, r: Rect, label: &str| {
+        ui.text_clipped(
+            FontFace::SemiBold,
+            ui.font_engine,
+            label,
+            r.x.round(),
+            (r.y + r.h * 0.5 + fs * 0.35).round(),
+            fs,
+            r.w,
+            theme.text_dim,
+        );
+    };
+
+    // Row 1: SoundFont select (full width).
+    let g0 = ui.take(Length::Rem(4.2));
+    let sub = Rect::new(g0.x, g0.y, g0.w, sub_h);
+    let sel_h = Length::Rem(2.2).resolve(theme.rem);
+    let sel = Rect::new(g0.x, g0.y + sub_h, g0.w, sel_h);
+    let hint = Rect::new(g0.x, g0.y + sub_h + sel_h, g0.w, g0.h - sub_h - sel_h);
+    group_label(ui, sub, "SoundFont");
+    let names: Vec<String> = fonts
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .collect();
+    let options: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut font_idx = (*selected_font).min(options.len().saturating_sub(1));
+    if ui.select(1271, sel, &options, &mut font_idx) {
+        *selected_font = font_idx;
+        intents.soundfont_idx = Some(font_idx);
+    }
+    draw_scale_labels(
+        ui,
+        hint,
+        &format!(
+            "{} font{} · FluidSynth 2.6",
+            fonts.len(),
+            if fonts.len() == 1 { "" } else { "s" }
+        ),
+        "",
+        "",
+    );
+
+    // Each control group spans the full card width and the groups stack
+    // vertically, as on the reference page (`params_midi.png`) — no
+    // half-width transpose/tempo pairing.
+    let full_group = |ui: &mut Ui, h: f32| -> (Rect, Rect, Rect, Rect) {
+        let g = ui.take(Length::Rem(h));
+        let sub = Rect::new(g.x, g.y, g.w, sub_h);
+        let val = Rect::new(g.x, g.y + sub_h, g.w, val_h);
+        let sl = Rect::new(g.x, g.y + sub_h + val_h, g.w, sl_h);
+        let lab = Rect::new(
+            g.x,
+            g.y + sub_h + val_h + sl_h,
+            g.w,
+            g.h - sub_h - val_h - sl_h,
+        );
+        (sub, val, sl, lab)
+    };
+
+    let (sub, val, sl, lab) = full_group(ui, 6.6);
+    group_label(ui, sub, "Transpose");
+    let v = format!("{:+.0}", params.midi_transpose_st);
+    draw_value_readout(ui, val, &v, "semitones");
+    {
+        let prev = params.midi_transpose_st;
+        if slider_one_unit(
+            ui,
+            1272,
+            sl,
+            &mut params.midi_transpose_st,
+            -24.0,
+            24.0,
+            0.0,
+            1.0,
+        ) {
+            params.midi_transpose_st = snap_semitones_range(params.midi_transpose_st, -24.0, 24.0);
+            intents.params_changed |= params.midi_transpose_st != prev;
+        }
+    }
+    draw_scale_labels(ui, lab, "-24", "0", "+24");
+
+    let (sub, val, sl, lab) = full_group(ui, 6.6);
+    group_label(ui, sub, "Tempo");
+    // "native" = the file's own tempo map; the override value is applied
+    // only while the switch below is on (separate visible domain, no copy).
+    if params.midi_bpm_override {
+        let v = format!("{:.0}", params.midi_bpm);
+        draw_value_readout(ui, val, &v, "BPM");
+        let prev = params.midi_bpm;
+        if slider_one_unit(ui, 1273, sl, &mut params.midi_bpm, 30.0, 300.0, 120.0, 1.0) {
+            params.midi_bpm = snap_percent(params.midi_bpm, 30.0, 300.0);
+            intents.params_changed |= params.midi_bpm != prev;
+        }
+    } else {
+        draw_value_readout_scaled(ui, val, "native", "", 1.2);
+        draw_static_slider(ui, sl, params.midi_bpm, 30.0, 300.0);
+    }
+    draw_scale_labels(ui, lab, "30", "120", "300");
+
+    // Switches stack full width too: one control per row.
+    let sw1 = ui.take(Length::Rem(2.2));
+    if ui.switch(1274, sw1, "BPM Override", &mut params.midi_bpm_override) {
+        intents.params_changed = true;
+    }
+    let sw2 = ui.take(Length::Rem(2.2));
+    if ui.switch(1275, sw2, "Metronome", &mut params.midi_metronome) {
+        intents.params_changed = true;
+    }
+
+    let [_, btn_r] = ui.take_cols(
+        Length::Rem(1.9),
+        Length::rem(1.0),
+        [Length::fill(), Length::rem(6.5)],
+    );
+    if ui.button(1276, btn_r, "Reset", ICON_RESTART, ButtonVariant::Outline) {
+        params.reset_midi();
+        intents.params_changed = true;
+    }
+}
+
 /// Three-zone drop overlay: add / replace / open-in-mixer. Returns the dropped
 /// path and the zone the pointer was over when it landed.
 fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathBuf, DropZone)> {
@@ -828,9 +1778,36 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
     ui.scene.rect(0.0, 0.0, pw, ph, rgba(20, 20, 20, 225));
 
     let zones = [
-        (Rect::new(6.0 * scale, 6.0 * scale, split_x - 12.0 * scale, mid_y - 12.0 * scale), DropZone::Add, "Add to current"),
-        (Rect::new(6.0 * scale, mid_y + 6.0 * scale, split_x - 12.0 * scale, ph - mid_y - 12.0 * scale), DropZone::Replace, "Replace playlist"),
-        (Rect::new(split_x + 6.0 * scale, 6.0 * scale, pw - split_x - 12.0 * scale, ph - 12.0 * scale), DropZone::Mixer, "Open in Mixer"),
+        (
+            Rect::new(
+                6.0 * scale,
+                6.0 * scale,
+                split_x - 12.0 * scale,
+                mid_y - 12.0 * scale,
+            ),
+            DropZone::Add,
+            "Add to current",
+        ),
+        (
+            Rect::new(
+                6.0 * scale,
+                mid_y + 6.0 * scale,
+                split_x - 12.0 * scale,
+                ph - mid_y - 12.0 * scale,
+            ),
+            DropZone::Replace,
+            "Replace playlist",
+        ),
+        (
+            Rect::new(
+                split_x + 6.0 * scale,
+                6.0 * scale,
+                pw - split_x - 12.0 * scale,
+                ph - 12.0 * scale,
+            ),
+            DropZone::Mixer,
+            "Open in Mixer",
+        ),
     ];
     let fs = (13.0 * scale).round();
     for (r, z, label) in zones {
@@ -841,8 +1818,16 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
             r.w,
             r.h,
             (4.0 * scale).round(),
-            if hot { rgba(76, 132, 229, 70) } else { rgba(255, 255, 255, 10) },
-            if hot { rgb(76, 132, 229) } else { rgba(255, 255, 255, 30) },
+            if hot {
+                rgba(76, 132, 229, 70)
+            } else {
+                rgba(255, 255, 255, 10)
+            },
+            if hot {
+                rgb(76, 132, 229)
+            } else {
+                rgba(255, 255, 255, 30)
+            },
             1.0,
         );
         draw_centered_text(
@@ -951,20 +1936,18 @@ impl App {
             pending_window_toggles: Vec::new(),
             open_window_spec: None,
 
-            seg_pipeline: 1,
-            last_pipeline: 1,
+            params: ParamState::default(),
             selected_device: 0,
             selected_rate: 0,
-            pitch_semitones: 0.0,
-            tempo_ratio: 1.0,
             master_vol: config.master_vol.clamp(0.0, 2.0),
-            chk_formant: true,
             chk_locked: config.chk_locked,
             sw_hq_mode: config.sw_hq_mode,
             sw_keep_tray: config.sw_keep_tray,
             scrub_frac: 0.0,
             selected_track: 0,
             show_controls: config.show_controls,
+            soundfonts: Vec::new(),
+            selected_soundfont: 0,
             loop_enabled: false,
             shuffle_enabled: false,
             playlist: Vec::new(),
@@ -997,6 +1980,7 @@ impl App {
         self.config.chk_locked = self.chk_locked;
         self.config.sw_hq_mode = self.sw_hq_mode;
         self.config.sw_keep_tray = self.sw_keep_tray;
+        self.config.selected_soundfont = self.selected_soundfont;
         match self.config.save() {
             Ok(()) => {
                 self.config_status = format!("Saved to {}", UserConfig::path().display());
@@ -1034,26 +2018,66 @@ impl App {
         self.apply_zoom();
     }
 
+    fn adjusted_window_spec(&self, spec: &WindowSpec) -> WindowSpec {
+        let mut adjusted = spec.clone();
+        if spec.key == "parameters" && (self.tracker_source_active() || self.midi_source_active()) {
+            adjusted.height = 560.0;
+            adjusted.min_height = 540.0;
+        }
+        adjusted
+    }
+
     /// The current UI parameter state as an engine `PlaybackParams`.
     fn playback_params(&self) -> PlaybackParams {
-        PlaybackParams {
-            mode_tape: self.seg_pipeline == 0,
-            pitch_semitones: self.pitch_semitones,
-            tempo_ratio: self.tempo_ratio,
-            hq: self.sw_hq_mode,
-            formant_preserve: self.chk_formant,
+        let params = self.params.engine_params(self.sw_hq_mode);
+        if self.tracker_source_active() || self.midi_source_active() {
+            params.for_native_source()
+        } else {
+            params
         }
     }
 
-    /// Re-apply the pipeline selection and push the full parameter set to the
-    /// engine. Parameters are applied entirely in the Rust pipeline, so no
-    /// engine reload is needed.
+    /// Whether the loaded track is a tracker module (libopenmpt source
+    /// engine). Asks the linked library, so recognition cannot drift from
+    /// the build; no file I/O — extension only.
+    fn tracker_source_active(&self) -> bool {
+        self.audio
+            .as_ref()
+            .and_then(|a| a.current_file())
+            .map(|p| tracker::is_tracker_file(&p))
+            .unwrap_or(false)
+    }
+
+    /// Whether the loaded track is a MIDI file (FluidSynth source engine).
+    /// Extension check only, mirroring `tracker_source_active`.
+    fn midi_source_active(&self) -> bool {
+        self.audio
+            .as_ref()
+            .and_then(|a| a.current_file())
+            .map(|p| midi::is_midi_file(&p))
+            .unwrap_or(false)
+    }
+
+    /// Push the full parameter set to the engine. Parameters are applied
+    /// entirely in the Rust pipeline, so no engine reload is needed.
     fn sync_pipeline_and_params(&mut self) {
         let params = self.playback_params();
-        self.last_pipeline = self.seg_pipeline;
         if let Some(a) = &self.audio {
             a.set_params(params);
         }
+    }
+
+    /// New-track rule: transient playback parameters reset to their defaults
+    /// unless "Lock Parameters Across Tracks" is set. The reset is pushed to
+    /// the engine in the same breath — `Cmd::SetParams` is queued before
+    /// `Cmd::Load`, so the decoder computes the new track's tape step from the
+    /// fresh values and no stale parameter set survives into the new track.
+    fn on_new_track(&mut self) {
+        if self.chk_locked {
+            return;
+        }
+        self.params = ParamState::default();
+        self.sync_pipeline_and_params();
     }
 
     /// Load the next playlist entry (wrapping only when `wrap` is set).
@@ -1080,10 +2104,7 @@ impl App {
             return;
         };
         self.selected_track = idx;
-        if !self.chk_locked {
-            self.pitch_semitones = 0.0;
-            self.tempo_ratio = 1.0;
-        }
+        self.on_new_track();
         self.scrub_frac = 0.0;
         self.track_meta = None;
         self.scene.clear_image();
@@ -1099,10 +2120,7 @@ impl App {
                 self.playlist.push(path);
                 return;
             }
-            if !self.chk_locked {
-                self.pitch_semitones = 0.0;
-                self.tempo_ratio = 1.0;
-            }
+            self.on_new_track();
             self.scrub_frac = 0.0;
             self.track_meta = None;
             self.scene.clear_image();
@@ -1261,7 +2279,10 @@ impl App {
         // Every string the metadata block shows, computed before the render borrow.
         let ext_lbl = file
             .as_ref()
-            .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_ascii_uppercase()))
+            .and_then(|p| {
+                p.extension()
+                    .map(|e| e.to_string_lossy().to_ascii_uppercase())
+            })
             .unwrap_or_default();
         let folder_lbl = file
             .as_ref()
@@ -1298,7 +2319,10 @@ impl App {
         } else {
             format!("{ext_lbl} (unknown codec)")
         };
-        let (sr, ch) = md.as_ref().map(|m| (m.sample_rate, m.channels)).unwrap_or((0, 0));
+        let (sr, ch) = md
+            .as_ref()
+            .map(|m| (m.sample_rate, m.channels))
+            .unwrap_or((0, 0));
         let ch_str = match ch {
             2 => "stereo".to_string(),
             1 => "mono".to_string(),
@@ -1605,19 +2629,89 @@ impl App {
             let gap_v = 7.0 * scale;
             let mut ry = 42.0 * scale;
             let baseline = |y: f32| (y + mfs * 0.95).round();
-            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Folder:", &folder_lbl, value_w);
+            draw_meta_row(
+                &mut ui,
+                rows_x,
+                label_w,
+                row_gap,
+                baseline(ry),
+                mfs,
+                "Folder:",
+                &folder_lbl,
+                value_w,
+            );
             ry += step;
-            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "File:", &file_lbl, value_w);
+            draw_meta_row(
+                &mut ui,
+                rows_x,
+                label_w,
+                row_gap,
+                baseline(ry),
+                mfs,
+                "File:",
+                &file_lbl,
+                value_w,
+            );
             ry += step + gap_v;
-            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Format:", &format_lbl, value_w);
+            draw_meta_row(
+                &mut ui,
+                rows_x,
+                label_w,
+                row_gap,
+                baseline(ry),
+                mfs,
+                "Format:",
+                &format_lbl,
+                value_w,
+            );
             ry += step;
-            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "", &format2_lbl, value_w);
+            draw_meta_row(
+                &mut ui,
+                rows_x,
+                label_w,
+                row_gap,
+                baseline(ry),
+                mfs,
+                "",
+                &format2_lbl,
+                value_w,
+            );
             ry += step + gap_v;
-            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Artist:", &artist_lbl, value_w);
+            draw_meta_row(
+                &mut ui,
+                rows_x,
+                label_w,
+                row_gap,
+                baseline(ry),
+                mfs,
+                "Artist:",
+                &artist_lbl,
+                value_w,
+            );
             ry += step;
-            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Album:", &album_lbl, value_w);
+            draw_meta_row(
+                &mut ui,
+                rows_x,
+                label_w,
+                row_gap,
+                baseline(ry),
+                mfs,
+                "Album:",
+                &album_lbl,
+                value_w,
+            );
             ry += step;
-            draw_meta_row(&mut ui, rows_x, label_w, row_gap, baseline(ry), mfs, "Title:", &title_lbl, value_w);
+            draw_meta_row(
+                &mut ui,
+                rows_x,
+                label_w,
+                row_gap,
+                baseline(ry),
+                mfs,
+                "Title:",
+                &title_lbl,
+                value_w,
+            );
 
             // ---- Row 3: flat progress bar + status line ----
             let bar_x = (14.0 * scale).round();
@@ -1812,7 +2906,14 @@ impl App {
                     (634u32, ICON_NEXT, false),
                 ];
                 for (id, icon, active) in defs {
-                    if player_icon_btn(&mut ui, id, Rect::new(tx.round(), by, bs, bs), icon, active, scale) {
+                    if player_icon_btn(
+                        &mut ui,
+                        id,
+                        Rect::new(tx.round(), by, bs, bs),
+                        icon,
+                        active,
+                        scale,
+                    ) {
                         match id {
                             630 => intents.loop_toggled = true,
                             631 => intents.shuffle_toggled = true,
@@ -1891,13 +2992,9 @@ impl App {
                 DropZone::Replace => self.open_path(path, false, recursive),
                 DropZone::Mixer => {
                     self.scan_gen = self.scan_gen.wrapping_add(1);
-                    let _ = self.scan_tx.send((
-                        self.scan_gen,
-                        ScanJob::MixerPath {
-                            path,
-                            recursive,
-                        },
-                    ));
+                    let _ = self
+                        .scan_tx
+                        .send((self.scan_gen, ScanJob::MixerPath { path, recursive }));
                     if !self.secondary_windows.is_visible("mixer") {
                         self.pending_window_toggles.push("mixer");
                     }
@@ -2007,8 +3104,9 @@ impl App {
                 continue;
             };
             // `show()` requests reveal + redraw itself, so no synchronous paint here.
+            let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
-                .toggle(event_loop, spec, self.prefer_backend);
+                .toggle(event_loop, &spec, self.prefer_backend);
         }
         // The toggle buttons' Primary/Outline variants follow visibility — refresh.
         if let Some(w) = &self.window {
@@ -2146,6 +3244,12 @@ impl App {
         // Phase 3.2 — intents queued by the Parameters window, applied after the
         // scene-build borrow ends (immediate engine forwarding).
         let mut params_intents = ParamsWindowIntents::default();
+        // Adaptive Parameters page: a tracker module swaps the source-engine
+        // section for the native libopenmpt card, a MIDI file for the native
+        // FluidSynth card (computed before the window borrow; the tracker
+        // check asks the linked library, the MIDI check its extensions).
+        let tracker_page = key == "parameters" && self.tracker_source_active();
+        let midi_page = key == "parameters" && !tracker_page && self.midi_source_active();
 
         // Phase 1 — build the scene (borrows: mw.scene/ui_state + self.text_sys).
         let (w, h, close_clicked, shot) = {
@@ -2154,6 +3258,20 @@ impl App {
             };
             let sz = mw.window.inner_size();
             let (w, h) = (sz.width, sz.height);
+            if key == "parameters" {
+                let min_h = if tracker_page || midi_page {
+                    540.0
+                } else {
+                    spec.min_height
+                };
+                mw.window
+                    .set_min_inner_size(Some(winit::dpi::LogicalSize::new(spec.min_width, min_h)));
+                if h < min_h as u32 {
+                    let _ = mw
+                        .window
+                        .request_inner_size(winit::dpi::LogicalSize::new(w as f64, min_h));
+                }
+            }
             mw.size = (w, h);
             if w == 0 || h == 0 {
                 return;
@@ -2177,9 +3295,7 @@ impl App {
             if key == "monitoring" {
                 let mut new_frames: Vec<(f32, f32)> = Vec::new();
                 if let Some(a) = &self.audio {
-                    let fp = a
-                        .frames_played
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let fp = a.frames_played.load(std::sync::atomic::Ordering::Relaxed);
                     let delta = fp.saturating_sub(self.last_dsp_frames) as usize;
                     self.last_dsp_frames = fp;
                     let tap = a.dsp_tap();
@@ -2208,139 +3324,134 @@ impl App {
 
                 let pw = w as f32;
                 let ph = h as f32;
-                let mut ui =
-                    Ui::new(ui_state, scene, &mut self.text_sys, self.font_engine, theme);
+                let mut ui = Ui::new(ui_state, scene, &mut self.text_sys, self.font_engine, theme);
 
                 // The Parameters window is audio-pipeline only now.
                 let mixer_badge = format!("{} STEMS", self.mixer_stems.len());
                 let (hdr_icon, hdr_title, hdr_badge): (&str, &str, &str) = if key == "parameters" {
-                    (ICON_TUNE, "PARAMETERS", "AUDIO")
+                    (
+                        ICON_TUNE,
+                        "PARAMETERS",
+                        if tracker_page {
+                            "TRACKER"
+                        } else if midi_page {
+                            "MIDI"
+                        } else {
+                            "AUDIO"
+                        },
+                    )
                 } else if key == "monitoring" {
                     (ICON_EQ, "AUDIO MONITORING", "REALTIME DSP")
                 } else if key == "mixer" {
                     (ICON_EQ, "MULTITRACK PREVIEW", &mixer_badge)
                 } else {
-                    (window_header_icon(key), spec.title, window_header_badge(key))
+                    (
+                        window_header_icon(key),
+                        spec.title,
+                        window_header_badge(key),
+                    )
                 };
-                let (hdr_h, close) =
-                    ui.secondary_window_header(pw, hdr_title, hdr_icon, hdr_badge);
+                let (hdr_h, close) = ui.secondary_window_header(pw, hdr_title, hdr_icon, hdr_badge);
                 close_clicked = close;
                 let m = Length::Rem(1.25).resolve(rem).round();
 
                 if key == "parameters" {
                     // ========================================================
-                    // Phase 3.2 — Parameters window: one audio card, footer below.
+                    // Parameters — adaptive page. AUDIO: Tape Speed and
+                    // Rubber Band Pitch/Time, with the inactive card dimmed.
+                    // TRACKER/MIDI: only the native source card and lock;
+                    // shared audio post-processing is bypassed for these
+                    // engines, matching the reference player.
                     // ========================================================
-                    let footer_h = Length::Rem(3.0).resolve(rem).round();
-                    let card_y = hdr_h + m;
-                    let card_h = (ph - Length::Rem(3.2).resolve(rem) - card_y).max(80.0);
-                    ui.nui_card(
-                        Rect::new(m, card_y, (pw - m * 2.0).max(0.0), card_h),
-                        |ui| {
-                            {
-                                    // ---- pipeline mode + speed/pitch/formants ----
-                                    let [lbl_r, ctl_r] = ui.take_cols(
-                                        Length::rem(2.0),
-                                        Length::rem(1.0),
-                                        [Length::rem(5.0), Length::fill()],
-                                    );
-                                    let fs = theme.font_small();
-                                    ui.text_clipped(
-                                        FontFace::Regular,
-                                        ui.font_engine,
-                                        "Mode",
-                                        lbl_r.x.round(),
-                                        (lbl_r.y + lbl_r.h * 0.5 + fs * 0.33).round(),
-                                        fs,
-                                        lbl_r.w,
-                                        theme.text_dim,
-                                    );
-                                    let half_w =
-                                        ((ctl_r.w - theme.space_half()) * 0.5).floor();
-                                    if ui.radio(
-                                        1110,
-                                        Rect::new(ctl_r.x, ctl_r.y, half_w, ctl_r.h),
-                                        "Normal (Tape)",
-                                        self.seg_pipeline == 0,
-                                    ) && self.seg_pipeline != 0
-                                    {
-                                        self.seg_pipeline = 0;
-                                        params_intents.pipeline_changed = true;
-                                    }
-                                    if ui.radio(
-                                        1111,
-                                        Rect::new(
-                                            ctl_r.x + half_w + theme.space_half(),
-                                            ctl_r.y,
-                                            (ctl_r.w - half_w - theme.space_half()).max(0.0),
-                                            ctl_r.h,
-                                        ),
-                                        "RubberBand (Pitch/Time)",
-                                        self.seg_pipeline == 1,
-                                    ) && self.seg_pipeline != 1
-                                    {
-                                        self.seg_pipeline = 1;
-                                        params_intents.pipeline_changed = true;
-                                    }
-                                    ui.spacer(Length::rem(0.35));
-                                    let speed_lbl = format!("{:.2}x", self.tempo_ratio);
-                                    let sp = ui.take(Length::rem(2.9));
-                                    if ui.slider(
-                                        1112,
-                                        sp,
-                                        "Playback Speed",
-                                        &mut self.tempo_ratio,
-                                        0.5,
-                                        2.0,
-                                        1.0,
-                                        &speed_lbl,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    let pitch_lbl = format!("{:+.1} st", self.pitch_semitones);
-                                    let pt = ui.take(Length::rem(2.9));
-                                    if ui.slider(
-                                        1113,
-                                        pt,
-                                        "Pitch",
-                                        &mut self.pitch_semitones,
-                                        -12.0,
-                                        12.0,
-                                        0.0,
-                                        &pitch_lbl,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                                    ui.spacer(Length::rem(0.35));
-                                    let sw = ui.take(Length::rem(2.0));
-                                    if ui.switch(
-                                        1114,
-                                        sw,
-                                        "Preserve Formants (Spectral Envelope)",
-                                        &mut self.chk_formant,
-                                    ) {
-                                        params_intents.params_changed = true;
-                                    }
-                            }
-                        },
-                    );
+                    let card_gap = theme.space_half();
+                    let card_w = (pw - m * 2.0).max(0.0);
+                    let native_h = Length::Rem(if midi_page { 23.0 } else { 22.2 })
+                        .resolve(rem)
+                        .round();
+                    let tape_h = Length::Rem(13.3).resolve(rem).round();
+                    let pt_h = Length::Rem(21.6).resolve(rem).round();
+                    let lock_h = Length::Rem(4.0).resolve(rem).round();
+                    let mut cy = hdr_h + m;
 
-                    // Footer bar: parameter lock (left) + Reset All (right).
-                    let fcy = ph - footer_h * 0.5;
-                    let lock_h = Length::Rem(2.0).resolve(rem);
-                    let lock_r = Rect::new(m, fcy - lock_h * 0.5, (pw * 0.55).max(0.0), lock_h);
-                    ui.switch(1190, lock_r, "Lock Parameters Across Tracks", &mut self.chk_locked);
-                    let btn_w = Length::Rem(7.0).resolve(rem).round();
-                    let btn_h = Length::Rem(1.85).resolve(rem).round();
-                    if ui.button(
-                        1191,
-                        Rect::new(pw - m - btn_w, fcy - btn_h * 0.5, btn_w, btn_h),
-                        "Reset All",
-                        ICON_RESTART,
-                        ButtonVariant::Outline,
-                    ) {
-                        params_intents.reset_all = true;
+                    if tracker_page {
+                        // ---- Tracker Engine card (native, always active) -----
+                        let native_r = Rect::new(m, cy, card_w, native_h);
+                        cy += native_h + card_gap;
+                        ui.nui_card(native_r, |ui| {
+                            draw_tracker_native_card(ui, &mut self.params, &mut params_intents);
+                        });
+                    } else if midi_page {
+                        // ---- MIDI Engine card (native, always active) -------
+                        let native_r = Rect::new(m, cy, card_w, native_h);
+                        cy += native_h + card_gap;
+                        ui.nui_card(native_r, |ui| {
+                            draw_midi_native_card(
+                                ui,
+                                &mut self.params,
+                                &self.soundfonts,
+                                &mut self.selected_soundfont,
+                                &mut params_intents,
+                            );
+                        });
                     }
+
+                    if !tracker_page && !midi_page {
+                        // ---- Tape Speed card (engine: tape) ------------------
+                        let tape_active = self.params.tape;
+                        let tape_r = Rect::new(m, cy, card_w, tape_h);
+                        cy += tape_h + card_gap;
+                        let tape_click = engine_card_hit(&mut ui, 1200, tape_r, tape_active);
+                        ui.nui_card(tape_r, |ui| {
+                            draw_tape_speed_card(
+                                ui,
+                                "Tape Speed",
+                                tape_active,
+                                &mut self.params,
+                                &mut params_intents,
+                            );
+                        });
+                        if tape_click {
+                            self.params.tape = true;
+                            params_intents.pipeline_changed = true;
+                        }
+                        if !tape_active {
+                            dim_card(&mut ui, tape_r);
+                        }
+
+                        // ---- Rubber Band Pitch / Time card (engine: pitchtime) ---
+                        let pt_active = !self.params.tape;
+                        let pt_r = Rect::new(m, cy, card_w, pt_h);
+                        cy += pt_h + card_gap;
+                        let pt_click = engine_card_hit(&mut ui, 1250, pt_r, pt_active);
+                        ui.nui_card(pt_r, |ui| {
+                            draw_pitch_time_card(
+                                ui,
+                                "Pitch / Time",
+                                pt_active,
+                                &mut self.params,
+                                &mut params_intents,
+                            );
+                        });
+                        if pt_click {
+                            self.params.tape = false;
+                            params_intents.pipeline_changed = true;
+                        }
+                        if !pt_active {
+                            dim_card(&mut ui, pt_r);
+                        }
+                    }
+
+                    // ---- Lock card (persists via user.json) ------------------
+                    let lock_r = Rect::new(m, cy, card_w, lock_h);
+                    ui.nui_card(lock_r, |ui| {
+                        let sw_r = ui.take(Length::Rem(2.0));
+                        ui.switch(
+                            1190,
+                            sw_r,
+                            "Lock Parameters Across Tracks",
+                            &mut self.chk_locked,
+                        );
+                    });
                 } else {
                     let body = Rect::new(
                         m,
@@ -2357,8 +3468,10 @@ impl App {
                             let snap = &self.dsp_snap;
                             let [top_row, bot_row] =
                                 ui.rows(body, Length::Px(gap), [Length::fill(), Length::fill()]);
-                            let [tl, tr] = ui.cols(top_row, Length::Px(gap), [Length::fill(), Length::fill()]);
-                            let [bl, br] = ui.cols(bot_row, Length::Px(gap), [Length::fill(), Length::fill()]);
+                            let [tl, tr] =
+                                ui.cols(top_row, Length::Px(gap), [Length::fill(), Length::fill()]);
+                            let [bl, br] =
+                                ui.cols(bot_row, Length::Px(gap), [Length::fill(), Length::fill()]);
 
                             // ---- Top-Left: 64-band logarithmic FFT spectrum ----
                             ui.card(tl, Length::Rem(0.85), Length::Rem(0.45), |ui| {
@@ -2395,14 +3508,24 @@ impl App {
                                 );
                                 let canvas = ui.take_rest();
                                 ui.scene.rounded_rect(
-                                    canvas.x, canvas.y, canvas.w, canvas.h, theme.radius1(),
-                                    theme.base, theme.border1, 1.0,
+                                    canvas.x,
+                                    canvas.y,
+                                    canvas.w,
+                                    canvas.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
                                 );
                                 ui.scene.push_clip(
-                                    canvas.x + 1.0, canvas.y + 1.0,
-                                    (canvas.w - 2.0).max(1.0), (canvas.h - 2.0).max(1.0),
+                                    canvas.x + 1.0,
+                                    canvas.y + 1.0,
+                                    (canvas.w - 2.0).max(1.0),
+                                    (canvas.h - 2.0).max(1.0),
                                 );
-                                for f in [50.0f32, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0] {
+                                for f in [
+                                    50.0f32, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+                                ] {
                                     let nx = (f / 20.0).ln() / (20000.0f32 / 20.0).ln();
                                     let gx = (canvas.x + nx * canvas.w).round();
                                     ui.scene.rect(gx, canvas.y, 1.0, canvas.h, theme.border1);
@@ -2421,8 +3544,14 @@ impl App {
                                     if h > 0.5 {
                                         let bx = canvas.x + i as f32 * (bw + bgap);
                                         ui.scene.rounded_rect(
-                                            bx, canvas.y + canvas.h - h, bw, h, 1.5,
-                                            theme.highlight, (0, 0, 0, 0), 0.0,
+                                            bx,
+                                            canvas.y + canvas.h - h,
+                                            bw,
+                                            h,
+                                            1.5,
+                                            theme.highlight,
+                                            (0, 0, 0, 0),
+                                            0.0,
                                         );
                                     }
                                 }
@@ -2444,25 +3573,48 @@ impl App {
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
                                 ui.text_clipped(
-                                    FontFace::SemiBold, ui.font_engine, "OSCILLOSCOPE",
-                                    hdr.x.round(), baseline, fs, hdr.w, theme.text_dim,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    "OSCILLOSCOPE",
+                                    hdr.x.round(),
+                                    baseline,
+                                    fs,
+                                    hdr.w,
+                                    theme.text_dim,
                                 );
                                 let rms_txt = format!("RMS: {:+.1} dB", snap.rms_db);
                                 let rtw = ui.text_sys.measure(
-                                    FontFace::SemiBold, ui.font_engine, &rms_txt, fs,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &rms_txt,
+                                    fs,
                                 );
                                 ui.scene.text(
-                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &rms_txt,
-                                    (hdr.x + hdr.w - rtw).round(), baseline, fs, theme.highlight,
+                                    ui.text_sys,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &rms_txt,
+                                    (hdr.x + hdr.w - rtw).round(),
+                                    baseline,
+                                    fs,
+                                    theme.highlight,
                                 );
                                 let canvas = ui.take_rest();
                                 ui.scene.rounded_rect(
-                                    canvas.x, canvas.y, canvas.w, canvas.h, theme.radius1(),
-                                    theme.base, theme.border1, 1.0,
+                                    canvas.x,
+                                    canvas.y,
+                                    canvas.w,
+                                    canvas.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
                                 );
                                 ui.scene.push_clip(
-                                    canvas.x + 1.0, canvas.y + 1.0,
-                                    (canvas.w - 2.0).max(1.0), (canvas.h - 2.0).max(1.0),
+                                    canvas.x + 1.0,
+                                    canvas.y + 1.0,
+                                    (canvas.w - 2.0).max(1.0),
+                                    (canvas.h - 2.0).max(1.0),
                                 );
                                 for ny in [0.75f32, 0.5, 0.25] {
                                     let gy = (canvas.y + (1.0 - ny) * canvas.h).round();
@@ -2478,25 +3630,47 @@ impl App {
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
                                 ui.text_clipped(
-                                    FontFace::SemiBold, ui.font_engine, "STEREO FIELD (GONIOMETER)",
-                                    hdr.x.round(), baseline, fs, hdr.w, theme.text_dim,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    "STEREO FIELD (GONIOMETER)",
+                                    hdr.x.round(),
+                                    baseline,
+                                    fs,
+                                    hdr.w,
+                                    theme.text_dim,
                                 );
                                 let corr_txt = format!("Correlation: {:+.2}", snap.correlation);
                                 let ctw = ui.text_sys.measure(
-                                    FontFace::SemiBold, ui.font_engine, &corr_txt, fs,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &corr_txt,
+                                    fs,
                                 );
                                 ui.scene.text(
-                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &corr_txt,
-                                    (hdr.x + hdr.w - ctw).round(), baseline, fs, theme.highlight,
+                                    ui.text_sys,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &corr_txt,
+                                    (hdr.x + hdr.w - ctw).round(),
+                                    baseline,
+                                    fs,
+                                    theme.highlight,
                                 );
                                 let rest = ui.take_rest();
                                 let [radar, corr] = ui.rows(
-                                    rest, Length::Px(theme.space_half()),
+                                    rest,
+                                    Length::Px(theme.space_half()),
                                     [Length::fill(), Length::rem(1.5)],
                                 );
                                 ui.scene.rounded_rect(
-                                    radar.x, radar.y, radar.w, radar.h, theme.radius1(),
-                                    theme.base, theme.border1, 1.0,
+                                    radar.x,
+                                    radar.y,
+                                    radar.w,
+                                    radar.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
                                 );
                                 let cx = radar.x + radar.w * 0.5;
                                 let cy = radar.y + radar.h * 0.5;
@@ -2506,16 +3680,23 @@ impl App {
                                     let a0 = i as f32 / 32.0 * tau;
                                     let a1 = (i + 1) as f32 / 32.0 * tau;
                                     ui.scene.line(
-                                        cx + rad * a0.cos(), cy + rad * a0.sin(),
-                                        cx + rad * a1.cos(), cy + rad * a1.sin(),
-                                        1.0, theme.border2,
+                                        cx + rad * a0.cos(),
+                                        cy + rad * a0.sin(),
+                                        cx + rad * a1.cos(),
+                                        cy + rad * a1.sin(),
+                                        1.0,
+                                        theme.border2,
                                     );
                                 }
                                 let d = rad * 0.7071;
-                                ui.scene.line(cx - d, cy + d, cx + d, cy - d, 1.0, theme.border1);
-                                ui.scene.line(cx - d, cy - d, cx + d, cy + d, 1.0, theme.border1);
-                                ui.scene.line(cx, cy - rad, cx, cy + rad, 1.0, theme.border1);
-                                ui.scene.line(cx - rad, cy, cx + rad, cy, 1.0, theme.border1);
+                                ui.scene
+                                    .line(cx - d, cy + d, cx + d, cy - d, 1.0, theme.border1);
+                                ui.scene
+                                    .line(cx - d, cy - d, cx + d, cy + d, 1.0, theme.border1);
+                                ui.scene
+                                    .line(cx, cy - rad, cx, cy + rad, 1.0, theme.border1);
+                                ui.scene
+                                    .line(cx - rad, cy, cx + rad, cy, 1.0, theme.border1);
                                 let lfs = theme.font_xsmall();
                                 for (lbl, lx, ly) in [
                                     ("L", cx - d - 12.0, cy - d + 4.0),
@@ -2524,19 +3705,37 @@ impl App {
                                     ("-S", cx + 3.0, cy + rad),
                                 ] {
                                     ui.scene.text(
-                                        ui.text_sys, FontFace::SemiBold, ui.font_engine, lbl,
-                                        lx.round(), ly.round(), lfs, theme.text_muted,
+                                        ui.text_sys,
+                                        FontFace::SemiBold,
+                                        ui.font_engine,
+                                        lbl,
+                                        lx.round(),
+                                        ly.round(),
+                                        lfs,
+                                        theme.text_muted,
                                     );
                                 }
                                 ui.polyline(radar, &snap.gonio_points, 1.5, theme.highlight);
 
                                 // Phase correlation bar: centre 0, fill toward ±1.
                                 ui.scene.rounded_rect(
-                                    corr.x, corr.y, corr.w, corr.h, theme.radius1(),
-                                    theme.base, theme.border1, 1.0,
+                                    corr.x,
+                                    corr.y,
+                                    corr.w,
+                                    corr.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
                                 );
                                 let mid = (corr.x + corr.w * 0.5).round();
-                                ui.scene.rect(mid - 1.0, corr.y + 2.0, 2.0, corr.h - 4.0, theme.border3);
+                                ui.scene.rect(
+                                    mid - 1.0,
+                                    corr.y + 2.0,
+                                    2.0,
+                                    corr.h - 4.0,
+                                    theme.border3,
+                                );
                                 let c = snap.correlation.clamp(-1.0, 1.0);
                                 let half = corr.w * 0.5;
                                 let (bx0, bwid) = if c >= 0.0 {
@@ -2545,18 +3744,34 @@ impl App {
                                     (mid + half * c, -half * c)
                                 };
                                 if bwid > 0.5 {
-                                    ui.scene.rect(bx0, corr.y + 2.0, bwid, corr.h - 4.0, theme.highlight);
+                                    ui.scene.rect(
+                                        bx0,
+                                        corr.y + 2.0,
+                                        bwid,
+                                        corr.h - 4.0,
+                                        theme.highlight,
+                                    );
                                 }
                                 let lfs2 = theme.font_xsmall();
                                 ui.scene.text(
-                                    ui.text_sys, FontFace::Regular, ui.font_engine, "-1",
-                                    (corr.x + 3.0).round(), (corr.y + corr.h * 0.5 + 4.0).round(),
-                                    lfs2, theme.text_muted,
+                                    ui.text_sys,
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    "-1",
+                                    (corr.x + 3.0).round(),
+                                    (corr.y + corr.h * 0.5 + 4.0).round(),
+                                    lfs2,
+                                    theme.text_muted,
                                 );
                                 ui.scene.text(
-                                    ui.text_sys, FontFace::Regular, ui.font_engine, "+1",
+                                    ui.text_sys,
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    "+1",
                                     (corr.x + corr.w - 16.0).round(),
-                                    (corr.y + corr.h * 0.5 + 4.0).round(), lfs2, theme.text_muted,
+                                    (corr.y + corr.h * 0.5 + 4.0).round(),
+                                    lfs2,
+                                    theme.text_muted,
                                 );
                             });
 
@@ -2566,64 +3781,123 @@ impl App {
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
                                 ui.text_clipped(
-                                    FontFace::SemiBold, ui.font_engine, "LEVELS & LOUDNESS (LUFS)",
-                                    hdr.x.round(), baseline, fs, hdr.w, theme.text_dim,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    "LEVELS & LOUDNESS (LUFS)",
+                                    hdr.x.round(),
+                                    baseline,
+                                    fs,
+                                    hdr.w,
+                                    theme.text_dim,
                                 );
                                 let int_txt = format!("Int: {:+.1} LUFS", snap.integrated_lufs);
                                 let itw = ui.text_sys.measure(
-                                    FontFace::SemiBold, ui.font_engine, &int_txt, fs,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &int_txt,
+                                    fs,
                                 );
                                 ui.scene.text(
-                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &int_txt,
-                                    (hdr.x + hdr.w - itw).round(), baseline, fs, theme.highlight,
+                                    ui.text_sys,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &int_txt,
+                                    (hdr.x + hdr.w - itw).round(),
+                                    baseline,
+                                    fs,
+                                    theme.highlight,
                                 );
                                 let rest = ui.take_rest();
                                 let [meters_r, lufs_r] = ui.cols(
-                                    rest, Length::Px(theme.space_half()),
+                                    rest,
+                                    Length::Px(theme.space_half()),
                                     [Length::rem(6.0), Length::fill()],
                                 );
                                 let [lm, sm, rm] = ui.cols(
-                                    meters_r, Length::Px(2.0),
+                                    meters_r,
+                                    Length::Px(2.0),
                                     [Length::fill(), Length::rem(1.5), Length::fill()],
                                 );
                                 draw_vu_meter(ui, lm, snap.vu_l_db, snap.peak_l_db, "L");
                                 draw_vu_meter(ui, rm, snap.vu_r_db, snap.peak_r_db, "R");
                                 let sfs = theme.font_xsmall();
                                 for (db, lbl) in [
-                                    (0.0f32, "0"), (-12.0, "-12"), (-24.0, "-24"),
-                                    (-36.0, "-36"), (-48.0, "-48"),
+                                    (0.0f32, "0"),
+                                    (-12.0, "-12"),
+                                    (-24.0, "-24"),
+                                    (-36.0, "-36"),
+                                    (-48.0, "-48"),
                                 ] {
-                                    let y = sm.y
-                                        + (1.0 - ((db + 60.0) / 60.0).clamp(0.0, 1.0)) * sm.h;
+                                    let y =
+                                        sm.y + (1.0 - ((db + 60.0) / 60.0).clamp(0.0, 1.0)) * sm.h;
                                     ui.scene.text(
-                                        ui.text_sys, FontFace::Regular, ui.font_engine, lbl,
-                                        sm.x.round(), (y + 3.0).round(), sfs, theme.text_muted,
+                                        ui.text_sys,
+                                        FontFace::Regular,
+                                        ui.font_engine,
+                                        lbl,
+                                        sm.x.round(),
+                                        (y + 3.0).round(),
+                                        sfs,
+                                        theme.text_muted,
                                     );
                                 }
                                 let [grid_r, btn_row] = ui.rows(
-                                    lufs_r, Length::Px(theme.space_half()),
+                                    lufs_r,
+                                    Length::Px(theme.space_half()),
                                     [Length::fill(), Length::rem(2.1)],
                                 );
                                 let [r0, r1] = ui.rows(
-                                    grid_r, Length::Px(theme.space_half()),
+                                    grid_r,
+                                    Length::Px(theme.space_half()),
                                     [Length::fill(), Length::fill()],
                                 );
                                 let [a0, a1] = ui.cols(
-                                    r0, Length::Px(theme.space_half()),
+                                    r0,
+                                    Length::Px(theme.space_half()),
                                     [Length::fill(), Length::fill()],
                                 );
                                 let [b0, b1] = ui.cols(
-                                    r1, Length::Px(theme.space_half()),
+                                    r1,
+                                    Length::Px(theme.space_half()),
                                     [Length::fill(), Length::fill()],
                                 );
-                                draw_readout(ui, a0, "MOMENTARY", &format!("{:+.1} LUFS", snap.momentary_lufs));
-                                draw_readout(ui, a1, "SHORT-TERM", &format!("{:+.1} LUFS", snap.short_term_lufs));
-                                draw_readout(ui, b0, "INTEGRATED", &format!("{:+.1} LUFS", snap.integrated_lufs));
-                                draw_readout(ui, b1, "TRUE PEAK", &format!("{:+.1} dBTP", snap.true_peak_dbtp));
+                                draw_readout(
+                                    ui,
+                                    a0,
+                                    "MOMENTARY",
+                                    &format!("{:+.1} LUFS", snap.momentary_lufs),
+                                );
+                                draw_readout(
+                                    ui,
+                                    a1,
+                                    "SHORT-TERM",
+                                    &format!("{:+.1} LUFS", snap.short_term_lufs),
+                                );
+                                draw_readout(
+                                    ui,
+                                    b0,
+                                    "INTEGRATED",
+                                    &format!("{:+.1} LUFS", snap.integrated_lufs),
+                                );
+                                draw_readout(
+                                    ui,
+                                    b1,
+                                    "TRUE PEAK",
+                                    &format!("{:+.1} dBTP", snap.true_peak_dbtp),
+                                );
                                 let bw2 = Length::Rem(8.0).resolve(rem).round();
-                                let btn = Rect::new(btn_row.x + btn_row.w - bw2, btn_row.y, bw2, btn_row.h);
+                                let btn = Rect::new(
+                                    btn_row.x + btn_row.w - bw2,
+                                    btn_row.y,
+                                    bw2,
+                                    btn_row.h,
+                                );
                                 if ui.button(
-                                    1290, btn, "RESET LUFS", ICON_RESTART, ButtonVariant::Outline,
+                                    1290,
+                                    btn,
+                                    "RESET LUFS",
+                                    ICON_RESTART,
+                                    ButtonVariant::Outline,
                                 ) {
                                     self.dsp.reset_lufs();
                                 }
@@ -2636,7 +3910,8 @@ impl App {
                         "mixer" => {
                             let pad = Length::Rem(1.25).resolve(rem).round();
                             let inner = Rect::new(
-                                pad, hdr_h + pad,
+                                pad,
+                                hdr_h + pad,
                                 (pw - pad * 2.0).max(0.0),
                                 (ph - hdr_h - pad * 2.0).max(0.0),
                             );
@@ -2649,15 +3924,41 @@ impl App {
                             let bh = Length::Rem(2.3).resolve(rem).round();
                             let bgap = Length::Rem(0.4).resolve(rem).round();
                             let by = toolbar.y + (toolbar.h - bh) * 0.5;
-                            let play_icon = if self.mixer_playing { ICON_PAUSE } else { ICON_PLAY };
-                            if ui.button(1301, Rect::new(toolbar.x, by, sq, bh), "", play_icon, ButtonVariant::Outline) {
+                            let play_icon = if self.mixer_playing {
+                                ICON_PAUSE
+                            } else {
+                                ICON_PLAY
+                            };
+                            if ui.button(
+                                1301,
+                                Rect::new(toolbar.x, by, sq, bh),
+                                "",
+                                play_icon,
+                                ButtonVariant::Outline,
+                            ) {
                                 self.mixer_playing = !self.mixer_playing;
                             }
-                            if ui.button(1302, Rect::new(toolbar.x + (sq + bgap), by, sq, bh), "", ICON_RESTART, ButtonVariant::Outline) {
+                            if ui.button(
+                                1302,
+                                Rect::new(toolbar.x + (sq + bgap), by, sq, bh),
+                                "",
+                                ICON_RESTART,
+                                ButtonVariant::Outline,
+                            ) {
                                 self.mixer_pos_frac = 0.0;
                             }
-                            let loop_var = if self.mixer_loop { ButtonVariant::Primary } else { ButtonVariant::Outline };
-                            if ui.button(1303, Rect::new(toolbar.x + (sq + bgap) * 2.0, by, sq, bh), "", ICON_LOOP, loop_var) {
+                            let loop_var = if self.mixer_loop {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Outline
+                            };
+                            if ui.button(
+                                1303,
+                                Rect::new(toolbar.x + (sq + bgap) * 2.0, by, sq, bh),
+                                "",
+                                ICON_LOOP,
+                                loop_var,
+                            ) {
                                 self.mixer_loop = !self.mixer_loop;
                             }
                             let vol_w = Length::Rem(15.0).resolve(rem).round();
@@ -2668,7 +3969,10 @@ impl App {
                             let matrix_y = toolbar.y + toolbar.h + gap;
                             let seek_y = inner.y + inner.h - seek_h;
                             let matrix = Rect::new(
-                                inner.x, matrix_y, inner.w, (seek_y - matrix_y - gap).max(40.0),
+                                inner.x,
+                                matrix_y,
+                                inner.w,
+                                (seek_y - matrix_y - gap).max(40.0),
                             );
                             let n = self.mixer_stems.len().max(1);
                             let col_gap = Length::Rem(0.4).resolve(rem).round();
@@ -2691,7 +3995,14 @@ impl App {
                                 let m_r = Rect::new(x, y, strip_w, m_h);
                                 y += m_h + cgap;
                                 let is_muted = self.mixer_stems[i].muted;
-                                if mixer_toggle_cell(&mut ui, m_r, 1310 + i as u32, "M", is_muted, theme.palette_alert) {
+                                if mixer_toggle_cell(
+                                    &mut ui,
+                                    m_r,
+                                    1310 + i as u32,
+                                    "M",
+                                    is_muted,
+                                    theme.palette_alert,
+                                ) {
                                     self.mixer_stems[i].muted = !is_muted;
                                 }
 
@@ -2699,7 +4010,14 @@ impl App {
                                 let s_r = Rect::new(x, y, strip_w, m_h);
                                 y += m_h + cgap;
                                 let is_solo = self.mixer_stems[i].solo;
-                                if mixer_toggle_cell(&mut ui, s_r, 1330 + i as u32, "S", is_solo, theme.palette_mark) {
+                                if mixer_toggle_cell(
+                                    &mut ui,
+                                    s_r,
+                                    1330 + i as u32,
+                                    "S",
+                                    is_solo,
+                                    theme.palette_mark,
+                                ) {
                                     self.mixer_stems[i].solo = !is_solo;
                                 }
 
@@ -2719,18 +4037,26 @@ impl App {
                                         ui.state.focused_id = Some(fid);
                                     }
                                     if ui.state.wheel_y.abs() > 0.01 {
-                                        gain = (gain + 0.05 * ui.state.wheel_y.signum()).clamp(0.0, 2.0);
+                                        gain = (gain + 0.05 * ui.state.wheel_y.signum())
+                                            .clamp(0.0, 2.0);
                                     }
                                 }
                                 if ui.state.active_id == Some(fid) && ui.state.mouse_down {
-                                    gain = ((1.0 - (ui.state.cursor.1 - fader_r.y) / fader_r.h) * 2.0)
+                                    gain = ((1.0 - (ui.state.cursor.1 - fader_r.y) / fader_r.h)
+                                        * 2.0)
                                         .clamp(0.0, 2.0);
                                 }
                                 self.mixer_stems[i].gain = gain;
 
                                 ui.scene.rounded_rect(
-                                    fader_r.x, fader_r.y, fader_r.w, fader_r.h, theme.radius1(),
-                                    theme.base, theme.border1, 1.0,
+                                    fader_r.x,
+                                    fader_r.y,
+                                    fader_r.w,
+                                    fader_r.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
                                 );
                                 let lvl = if self.mixer_stems[i].muted
                                     || (any_solo && !self.mixer_stems[i].solo)
@@ -2744,18 +4070,31 @@ impl App {
                                 let vu_h = (fader_r.h * lvl).clamp(0.0, fader_r.h);
                                 if vu_h > 1.0 {
                                     ui.scene.rect(
-                                        fader_r.x + 1.0, fader_r.y + fader_r.h - vu_h,
-                                        (fader_r.w - 2.0).max(1.0), vu_h, rgb(58, 175, 52),
+                                        fader_r.x + 1.0,
+                                        fader_r.y + fader_r.h - vu_h,
+                                        (fader_r.w - 2.0).max(1.0),
+                                        vu_h,
+                                        rgb(58, 175, 52),
                                     );
                                 }
                                 let line_y = (fader_r.y
                                     + fader_r.h * (1.0 - (gain / 2.0).clamp(0.0, 1.0)))
-                                    .round();
-                                ui.scene.rect(fader_r.x, line_y, fader_r.w, 1.5, rgb(230, 230, 230));
+                                .round();
+                                ui.scene.rect(
+                                    fader_r.x,
+                                    line_y,
+                                    fader_r.w,
+                                    1.5,
+                                    rgb(230, 230, 230),
+                                );
                                 draw_text_at(
-                                    &mut ui, fader_r.x + fader_r.w * 0.5, line_y - 5.0,
-                                    &format!("{:.2}", gain), FontFace::SemiBold,
-                                    theme.font_xsmall(), rgb(245, 245, 245),
+                                    &mut ui,
+                                    fader_r.x + fader_r.w * 0.5,
+                                    line_y - 5.0,
+                                    &format!("{:.2}", gain),
+                                    FontFace::SemiBold,
+                                    theme.font_xsmall(),
+                                    rgb(245, 245, 245),
                                 );
                                 ui.draw_focus_ring(fid, fader_r, theme.radius1());
 
@@ -2775,7 +4114,8 @@ impl App {
                                         ui.state.focused_id = Some(pid);
                                     }
                                     if ui.state.wheel_y.abs() > 0.01 {
-                                        pan = (pan + 0.05 * ui.state.wheel_y.signum()).clamp(-1.0, 1.0);
+                                        pan = (pan + 0.05 * ui.state.wheel_y.signum())
+                                            .clamp(-1.0, 1.0);
                                     }
                                 }
                                 if ui.state.active_id == Some(pid) && ui.state.mouse_down {
@@ -2784,38 +4124,64 @@ impl App {
                                 }
                                 self.mixer_stems[i].pan = pan;
                                 ui.scene.rounded_rect(
-                                    pan_r.x, pan_r.y, pan_r.w, pan_r.h, theme.radius1(),
-                                    theme.base, theme.border1, 1.0,
+                                    pan_r.x,
+                                    pan_r.y,
+                                    pan_r.w,
+                                    pan_r.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
                                 );
-                                let px = (pan_r.x + 4.0
-                                    + (pan_r.w - 8.0) * ((pan + 1.0) * 0.5))
-                                    .round();
+                                let px =
+                                    (pan_r.x + 4.0 + (pan_r.w - 8.0) * ((pan + 1.0) * 0.5)).round();
                                 let tick_h = pan_r.h * 0.55;
                                 ui.scene.rect(
-                                    px - 1.0, pan_r.y + (pan_r.h - tick_h) * 0.5,
-                                    2.0, tick_h, rgb(230, 230, 230),
+                                    px - 1.0,
+                                    pan_r.y + (pan_r.h - tick_h) * 0.5,
+                                    2.0,
+                                    tick_h,
+                                    rgb(230, 230, 230),
                                 );
 
                                 // Bottom label + remove ×
                                 let lbl_r = Rect::new(x, y, strip_w, lbl_h);
                                 ui.scene.rounded_rect(
-                                    lbl_r.x, lbl_r.y, lbl_r.w, lbl_r.h, theme.radius1(),
-                                    theme.base, theme.border1, 1.0,
+                                    lbl_r.x,
+                                    lbl_r.y,
+                                    lbl_r.w,
+                                    lbl_r.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
                                 );
                                 let lfs = theme.font_xsmall();
                                 let num = format!("{:02}", self.mixer_stems[i].number);
                                 ui.scene.text(
-                                    ui.text_sys, FontFace::SemiBold, ui.font_engine, &num,
+                                    ui.text_sys,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &num,
                                     (lbl_r.x + 5.0).round(),
                                     (lbl_r.y + lbl_r.h * 0.5 + lfs * 0.34).round(),
-                                    lfs, theme.text_dim,
+                                    lfs,
+                                    theme.text_dim,
                                 );
                                 let xbtn = (rem * 1.2).round();
                                 let xr = Rect::new(
                                     lbl_r.x + lbl_r.w - xbtn - 2.0,
-                                    lbl_r.y + (lbl_r.h - xbtn) * 0.5, xbtn, xbtn,
+                                    lbl_r.y + (lbl_r.h - xbtn) * 0.5,
+                                    xbtn,
+                                    xbtn,
                                 );
-                                if ui.button(1390 + i as u32, xr, "", ICON_CLOSE, ButtonVariant::Ghost) {
+                                if ui.button(
+                                    1390 + i as u32,
+                                    xr,
+                                    "",
+                                    ICON_CLOSE,
+                                    ButtonVariant::Ghost,
+                                ) {
                                     remove_i = Some(i);
                                 }
                             }
@@ -2827,15 +4193,17 @@ impl App {
                             }
 
                             // `+` add-stem column (up to 20 stems).
-                            let plus_r = Rect::new(
-                                matrix.x + matrix.w - plus_w, matrix.y, plus_w, matrix.h,
-                            );
+                            let plus_r =
+                                Rect::new(matrix.x + matrix.w - plus_w, matrix.y, plus_w, matrix.h);
                             if ui.button(1340, plus_r, "", ICON_ADD, ButtonVariant::Outline) {
                                 if self.mixer_stems.len() < 20 {
                                     let num = self.mixer_stems.len() + 1;
                                     self.mixer_stems.push(MixerStem {
-                                        number: num, gain: 1.0, pan: 0.0,
-                                        muted: false, solo: false,
+                                        number: num,
+                                        gain: 1.0,
+                                        pan: 0.0,
+                                        muted: false,
+                                        solo: false,
                                     });
                                 }
                             }
@@ -2844,14 +4212,26 @@ impl App {
                             let bar_h = 6.0f32;
                             let bar_r = Rect::new(inner.x, seek_y + 3.0, inner.w, bar_h);
                             ui.scene.rounded_rect(
-                                bar_r.x, bar_r.y, bar_r.w, bar_h, bar_h * 0.5,
-                                theme.base, theme.border1, 1.0,
+                                bar_r.x,
+                                bar_r.y,
+                                bar_r.w,
+                                bar_h,
+                                bar_h * 0.5,
+                                theme.base,
+                                theme.border1,
+                                1.0,
                             );
                             let played = bar_r.w * self.mixer_pos_frac.clamp(0.0, 1.0);
                             if played > 0.5 {
                                 ui.scene.rounded_rect(
-                                    bar_r.x, bar_r.y, played, bar_h, bar_h * 0.5,
-                                    rgb(180, 180, 180), (0, 0, 0, 0), 0.0,
+                                    bar_r.x,
+                                    bar_r.y,
+                                    played,
+                                    bar_h,
+                                    bar_h * 0.5,
+                                    rgb(180, 180, 180),
+                                    (0, 0, 0, 0),
+                                    0.0,
                                 );
                             }
                             let sid = 1305u32;
@@ -2868,14 +4248,28 @@ impl App {
                             let tfs = theme.font_xsmall();
                             let tbase = (seek_y + seek_h - 2.0).round();
                             ui.scene.text(
-                                ui.text_sys, FontFace::SemiBold, ui.font_engine, "2:34",
-                                inner.x.round(), tbase, tfs, theme.text_dim,
+                                ui.text_sys,
+                                FontFace::SemiBold,
+                                ui.font_engine,
+                                "2:34",
+                                inner.x.round(),
+                                tbase,
+                                tfs,
+                                theme.text_dim,
                             );
                             let tot = "3:26";
-                            let tw = ui.text_sys.measure(FontFace::SemiBold, ui.font_engine, tot, tfs);
+                            let tw =
+                                ui.text_sys
+                                    .measure(FontFace::SemiBold, ui.font_engine, tot, tfs);
                             ui.scene.text(
-                                ui.text_sys, FontFace::SemiBold, ui.font_engine, tot,
-                                (inner.x + inner.w - tw).round(), tbase, tfs, theme.text_dim,
+                                ui.text_sys,
+                                FontFace::SemiBold,
+                                ui.font_engine,
+                                tot,
+                                (inner.x + inner.w - tw).round(),
+                                tbase,
+                                tfs,
+                                theme.text_dim,
                             );
                         }
 
@@ -2887,33 +4281,67 @@ impl App {
                                 let sel_dev = ui.input_group("Default Output Device");
                                 let sel_rate = ui.input_group("Default Sample Rate");
                                 let [c1, c2] = ui.take_cols(
-                                    Length::rem(1.8), Length::rem(1.0),
+                                    Length::rem(1.8),
+                                    Length::rem(1.0),
                                     [Length::fill(), Length::fill()],
                                 );
-                                ui.checkbox(752, c1, "Keep Running in System Tray", &mut self.sw_keep_tray);
+                                ui.checkbox(
+                                    752,
+                                    c1,
+                                    "Keep Running in System Tray",
+                                    &mut self.sw_keep_tray,
+                                );
                                 ui.checkbox(753, c2, "HQ Oversampling", &mut self.sw_hq_mode);
                                 let [c3, c4] = ui.take_cols(
-                                    Length::rem(1.8), Length::rem(1.0),
+                                    Length::rem(1.8),
+                                    Length::rem(1.0),
                                     [Length::fill(), Length::fill()],
                                 );
-                                ui.checkbox(754, c3, "Lock Parameters Across Tracks", &mut self.chk_locked);
-                                ui.checkbox(755, c4, "Dark Mode (Accessibility Default)", &mut self.dark_mode);
+                                ui.checkbox(
+                                    754,
+                                    c3,
+                                    "Lock Parameters Across Tracks",
+                                    &mut self.chk_locked,
+                                );
+                                ui.checkbox(
+                                    755,
+                                    c4,
+                                    "Dark Mode (Accessibility Default)",
+                                    &mut self.dark_mode,
+                                );
                                 let [c5] = ui.take_cols(
-                                    Length::rem(1.8), Length::rem(1.0),
+                                    Length::rem(1.8),
+                                    Length::rem(1.0),
                                     [Length::fill()],
                                 );
-                                if ui.checkbox(757, c5, "Show transport controls [C]", &mut self.show_controls) {
+                                if ui.checkbox(
+                                    757,
+                                    c5,
+                                    "Show transport controls [C]",
+                                    &mut self.show_controls,
+                                ) {
                                     self.apply_zoom_req = true;
                                 }
                                 let [apply_r] = ui.take_form_row(true, [Length::fill()]);
-                                if ui.button(756, apply_r, "Save Configuration", ICON_SETTINGS, ButtonVariant::Primary) {
+                                if ui.button(
+                                    756,
+                                    apply_r,
+                                    "Save Configuration",
+                                    ICON_SETTINGS,
+                                    ButtonVariant::Primary,
+                                ) {
                                     self.save_config_req = true;
                                 }
                                 let fs = theme.font_xsmall();
                                 ui.text_clipped(
-                                    FontFace::Regular, ui.font_engine, &self.config_status,
-                                    apply_r.x.round(), (apply_r.y + apply_r.h + fs * 1.1).round(),
-                                    fs, apply_r.w, theme.text_muted,
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    &self.config_status,
+                                    apply_r.x.round(),
+                                    (apply_r.y + apply_r.h + fs * 1.1).round(),
+                                    fs,
+                                    apply_r.w,
+                                    theme.text_muted,
                                 );
                                 // Render selects last so open popups layer above siblings
                                 ui.select(760, sel_dev, DEVICES, &mut self.selected_device);
@@ -2926,32 +4354,57 @@ impl App {
                             ui.nui_card(body, |ui| {
                                 let table = ui.take_rest();
                                 let [lc, rc] = ui.cols(
-                                    table, Length::rem(1.25), [Length::fill(), Length::fill()],
+                                    table,
+                                    Length::rem(1.25),
+                                    [Length::fill(), Length::fill()],
                                 );
                                 let half = HELP_ROWS.len().div_ceil(2);
-                                let rh = (table.h / half.max(1) as f32).floor().min((rem * 2.0).round());
+                                let rh = (table.h / half.max(1) as f32)
+                                    .floor()
+                                    .min((rem * 2.0).round());
                                 let kfs = theme.font_xsmall();
                                 let dfs = theme.font_small();
                                 let kw = Length::Rem(8.5).resolve(rem).round();
                                 for (idx, &(k, v)) in HELP_ROWS.iter().enumerate() {
-                                    let (col, row) = if idx < half { (lc, idx) } else { (rc, idx - half) };
+                                    let (col, row) = if idx < half {
+                                        (lc, idx)
+                                    } else {
+                                        (rc, idx - half)
+                                    };
                                     let y = (col.y + row as f32 * rh).round();
                                     let kbd_h = (rh - 6.0).max(16.0);
                                     let kbd_y = (y + (rh - kbd_h) * 0.5).round();
                                     let kbd_w = (kw - 10.0).max(24.0);
                                     ui.scene.rounded_rect(
-                                        col.x, kbd_y, kbd_w, kbd_h, theme.radius1(),
-                                        theme.base, theme.border3, 1.0,
+                                        col.x,
+                                        kbd_y,
+                                        kbd_w,
+                                        kbd_h,
+                                        theme.radius1(),
+                                        theme.base,
+                                        theme.border3,
+                                        1.0,
                                     );
                                     let baseline = (y + rh * 0.5 + dfs * 0.34).round();
                                     ui.text_clipped(
-                                        FontFace::SemiBold, ui.font_engine, k,
-                                        (col.x + 6.0).round(), baseline, kfs, kbd_w - 12.0, theme.highlight,
+                                        FontFace::SemiBold,
+                                        ui.font_engine,
+                                        k,
+                                        (col.x + 6.0).round(),
+                                        baseline,
+                                        kfs,
+                                        kbd_w - 12.0,
+                                        theme.highlight,
                                     );
                                     ui.text_clipped(
-                                        FontFace::Regular, ui.font_engine, v,
-                                        (col.x + kw).round(), baseline, dfs,
-                                        (col.w - kw).max(0.0), theme.text,
+                                        FontFace::Regular,
+                                        ui.font_engine,
+                                        v,
+                                        (col.x + kw).round(),
+                                        baseline,
+                                        dfs,
+                                        (col.w - kw).max(0.0),
+                                        theme.text,
                                     );
                                 }
                             });
@@ -2979,21 +4432,21 @@ impl App {
             self.apply_zoom();
         }
 
-        // --- Phase 3.2 Parameters-window intents: forward every change to the
-        // engine immediately (same frame), then refresh the main window's
-        // speed/pitch overlay badge.
-        if params_intents.reset_all {
-            self.pitch_semitones = 0.0;
-            self.tempo_ratio = 1.0;
-            self.sync_pipeline_and_params();
-        }
+        // --- Parameters-window intents: forward every change to the engine
+        // immediately (same frame), then refresh the main window's redraw.
         if params_intents.params_changed || params_intents.pipeline_changed {
             self.sync_pipeline_and_params();
-        }
-        if params_intents.params_changed || params_intents.pipeline_changed || params_intents.reset_all
-        {
             if let Some(w) = &self.window {
                 w.request_redraw();
+            }
+        }
+        if let Some(idx) = params_intents.soundfont_idx {
+            self.selected_soundfont = idx;
+            self.config.selected_soundfont = idx;
+            if let Some(a) = &self.audio {
+                if let Some(p) = self.soundfonts.get(idx) {
+                    a.set_soundfont(p.clone());
+                }
             }
         }
 
@@ -3064,7 +4517,9 @@ impl ApplicationHandler for App {
         // Phase 1.5: `--open-window <key>` pops the requested secondary window at
         // startup; a `--screenshot` alongside it captures THAT window, not the primary.
         if let Some(spec) = self.open_window_spec {
-            self.secondary_windows.show(event_loop, spec, self.prefer_backend);
+            let spec = self.adjusted_window_spec(spec);
+            self.secondary_windows
+                .show(event_loop, &spec, self.prefer_backend);
             if let Some(path) = self.screenshot_path.take() {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(spec.key) {
                     w.screenshot_once = Some(path);
@@ -3129,11 +4584,7 @@ impl ApplicationHandler for App {
                 // While playing with animation on, the 60fps `about_to_wait` timer already
                 // redraws every frame — only force a redraw here for immediate drag feedback
                 // (mouse held) or when the timer is idle, so a 1000Hz mouse cannot spike FPS.
-                let playing = self
-                    .audio
-                    .as_ref()
-                    .map(|a| a.is_playing())
-                    .unwrap_or(false);
+                let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
                 if !(playing && self.animate) || self.ui_state.mouse_down {
                     if let Some(w) = &self.window {
                         w.request_redraw();
@@ -3151,8 +4602,7 @@ impl ApplicationHandler for App {
                         self.set_zoom(self.ui_zoom + step);
                     } else {
                         // Wheel anywhere in the main window trims the master volume.
-                        self.master_vol =
-                            (self.master_vol + 0.05 * dy.signum()).clamp(0.0, 2.0);
+                        self.master_vol = (self.master_vol + 0.05 * dy.signum()).clamp(0.0, 2.0);
                         if let Some(a) = &self.audio {
                             a.set_volume(self.master_vol);
                         }
@@ -3170,16 +4620,19 @@ impl ApplicationHandler for App {
                             // Undecorated window: dragging within the 6 px edge band or
                             // the 12 px corners resizes, like a native frame.
                             if let Some(w) = self.window.clone() {
-                                if nui::try_start_window_resize(&w, self.ui_state.cursor, self.size) {
+                                if nui::try_start_window_resize(&w, self.ui_state.cursor, self.size)
+                                {
                                     return;
                                 }
                             }
                             let scale = (cw / Self::WIDTH as f32)
-                                .min(ch / if self.show_controls {
-                                    Self::HEIGHT_WITH_CONTROLS as f32
-                                } else {
-                                    Self::HEIGHT_WITHOUT_CONTROLS as f32
-                                })
+                                .min(
+                                    ch / if self.show_controls {
+                                        Self::HEIGHT_WITH_CONTROLS as f32
+                                    } else {
+                                        Self::HEIGHT_WITHOUT_CONTROLS as f32
+                                    },
+                                )
                                 .max(0.5);
                             let top_h = (28.0 * scale).round();
                             let pw = self.size.0 as f32;
@@ -3287,16 +4740,24 @@ impl ApplicationHandler for App {
                                 self.ui_state.key_cmds.push(KeyCmd::Tab);
                             }
                         }
-                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("a") => {
+                        Key::Character(ch)
+                            if self.modifiers.control_key() && ch.eq_ignore_ascii_case("a") =>
+                        {
                             self.ui_state.key_cmds.push(KeyCmd::SelectAll);
                         }
-                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("c") => {
+                        Key::Character(ch)
+                            if self.modifiers.control_key() && ch.eq_ignore_ascii_case("c") =>
+                        {
                             self.ui_state.key_cmds.push(KeyCmd::Copy);
                         }
-                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("x") => {
+                        Key::Character(ch)
+                            if self.modifiers.control_key() && ch.eq_ignore_ascii_case("x") =>
+                        {
                             self.ui_state.key_cmds.push(KeyCmd::Cut);
                         }
-                        Key::Character(ch) if self.modifiers.control_key() && ch.eq_ignore_ascii_case("v") => {
+                        Key::Character(ch)
+                            if self.modifiers.control_key() && ch.eq_ignore_ascii_case("v") =>
+                        {
                             self.ui_state.key_cmds.push(KeyCmd::Paste);
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("b") => {
@@ -3313,13 +4774,21 @@ impl ApplicationHandler for App {
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("t") => {
                             self.dark_mode = !self.dark_mode;
                         }
-                        Key::Character(ch) if (!focused_text || self.modifiers.control_key()) && (ch == "+" || ch == "=") => {
+                        Key::Character(ch)
+                            if (!focused_text || self.modifiers.control_key())
+                                && (ch == "+" || ch == "=") =>
+                        {
                             self.set_zoom(self.ui_zoom + 0.1);
                         }
-                        Key::Character(ch) if (!focused_text || self.modifiers.control_key()) && (ch == "-" || ch == "_") => {
+                        Key::Character(ch)
+                            if (!focused_text || self.modifiers.control_key())
+                                && (ch == "-" || ch == "_") =>
+                        {
                             self.set_zoom(self.ui_zoom - 0.1);
                         }
-                        Key::Character(ch) if (!focused_text || self.modifiers.control_key()) && ch == "0" => {
+                        Key::Character(ch)
+                            if (!focused_text || self.modifiers.control_key()) && ch == "0" =>
+                        {
                             self.set_zoom(1.0);
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("l") => {
@@ -3376,7 +4845,8 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {        if let Some(q) = self.quit_at {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(q) = self.quit_at {
             if Instant::now() >= q {
                 if !self.quitting {
                     self.quitting = true;
@@ -3388,11 +4858,7 @@ impl ApplicationHandler for App {
         }
         self.poll_transport_and_scans();
 
-        let playing = self
-            .audio
-            .as_ref()
-            .map(|a| a.is_playing())
-            .unwrap_or(false);
+        let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         let pending_meta =
             self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
         // Widget transitions (hover fades, popups, dialogs) drive their own 60 fps
@@ -3420,7 +4886,11 @@ impl ApplicationHandler for App {
             self.secondary_windows.request_redraw_all();
         }
 
-        let mut next: Option<Instant> = if animating { Some(self.next_frame) } else { None };
+        let mut next: Option<Instant> = if animating {
+            Some(self.next_frame)
+        } else {
+            None
+        };
         if let Some(q) = self.quit_at {
             next = Some(match next {
                 Some(n) if n < q => n,
@@ -3442,6 +4912,7 @@ impl ApplicationHandler for App {
         self.config.chk_locked = self.chk_locked;
         self.config.sw_hq_mode = self.sw_hq_mode;
         self.config.sw_keep_tray = self.sw_keep_tray;
+        self.config.selected_soundfont = self.selected_soundfont;
         if let Err(e) = self.config.save() {
             eprintln!("[poc] config save failed: {e}");
         }
@@ -3465,9 +4936,15 @@ fn main() {
     let mut render_out: Option<String> = None;
     let mut render_pitch: f32 = 0.0;
     let mut render_tempo: f32 = 1.0;
-    let mut render_formant = true;
+    let mut render_formant = false;
     let mut render_tape: Option<f32> = None;
     let mut render_limit: Option<f64> = None;
+    // Native tracker (libopenmpt) render parameters — applied by the module
+    // engine itself; shared flags (--pitch/--tempo/--tape) affect FFmpeg only.
+    let mut trk_pitch: f32 = 0.0;
+    let mut trk_tempo: f32 = 1.0;
+    let mut trk_separation: f32 = 100.0;
+    let mut trk_interp: i32 = 0;
     let mut latency_probe = false;
 
     let mut args = std::env::args().skip(1);
@@ -3486,6 +4963,12 @@ fn main() {
             "--no-formant" => render_formant = false,
             "--tape" => render_tape = args.next().and_then(|v| v.parse().ok()),
             "--limit" => render_limit = args.next().and_then(|v| v.parse().ok()),
+            "--trk-pitch" => trk_pitch = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            "--trk-tempo" => trk_tempo = args.next().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            "--trk-separation" => {
+                trk_separation = args.next().and_then(|v| v.parse().ok()).unwrap_or(100.0)
+            }
+            "--trk-interp" => trk_interp = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--latency-probe" => latency_probe = true,
             "--backend" => {
                 if let Some(b) = args.next() {
@@ -3512,8 +4995,7 @@ fn main() {
         }
     }
     const DEFAULT_MURR: &str = r"Y:\Test Files\Murr_01.mp3";
-    const DEFAULT_START: &str =
-        r"D:\Work\_GIT\SoundApp\_Material\mixer_media\Again\01.m4a";
+    const DEFAULT_START: &str = r"D:\Work\_GIT\SoundApp\_Material\mixer_media\Again\01.m4a";
     // No file given → prefer the reference test track; its implicit folder
     // playlist then collects every playable file beside it. `--tone` / `--silence`
     // skip the startup path entirely.
@@ -3536,12 +5018,21 @@ fn main() {
     // window. Runs faster than realtime and exits.
     if let Some(in_path) = render_in {
         let out = render_out.unwrap_or_else(|| "render_out.wav".to_string());
+        let interp = tracker::Interpolation::from_filter_length(trk_interp)
+            .unwrap_or(tracker::Interpolation::Default);
         let params = PlaybackParams {
             mode_tape: render_tape.is_some(),
             pitch_semitones: render_tape.unwrap_or(render_pitch),
             tempo_ratio: render_tempo,
             hq: true,
             formant_preserve: render_formant,
+            tracker: tracker::TrackerParams {
+                pitch_semitones: trk_pitch,
+                tempo_ratio: trk_tempo,
+                stereo_separation: trk_separation,
+                interpolation: interp,
+            },
+            midi: midi::MidiParams::default(),
         };
         match audio::render_offline(
             &PathBuf::from(in_path),
@@ -3549,15 +5040,20 @@ fn main() {
             &PathBuf::from(&out),
             render_limit,
             48_000,
+            &PathBuf::from(midi::DEFAULT_SOUNDFONT),
         ) {
             Ok(r) => {
                 println!(
-                    "[render] in={:.3}s out={:.3}s mode={} pitch={:+.1} tempo={:.2} -> {}",
+                    "[render] in={:.3}s out={:.3}s mode={} pitch={:+.1} tempo={:.2} trk(pitch={:+.1} tempo={:.2} sep={:.0} interp={}) -> {}",
                     r.in_secs,
                     r.out_secs,
                     if params.mode_tape { "tape" } else { "pitchtime" },
                     params.pitch_semitones,
                     params.tempo_ratio,
+                    params.tracker.pitch_semitones,
+                    params.tracker.tempo_ratio,
+                    params.tracker.stereo_separation,
+                    params.tracker.interpolation.filter_length(),
                     out
                 );
                 std::process::exit(0);
@@ -3606,10 +5102,7 @@ fn main() {
             );
         }
         a.seek(30.0);
-        println!(
-            "[probe] seek(30) at t={:.2}s",
-            t0.elapsed().as_secs_f32()
-        );
+        println!("[probe] seek(30) at t={:.2}s", t0.elapsed().as_secs_f32());
         for _ in 0..2 {
             std::thread::sleep(std::time::Duration::from_millis(500));
             println!(
@@ -3725,6 +5218,20 @@ mod playlist_tests {
     }
 
     #[test]
+    fn tracker_modules_are_playlist_eligible() {
+        // libopenmpt claims these — the playlist scan must list them so a
+        // module dropped into a music folder shows up beside the mp3s.
+        for ext in ["mod", "s3m", "xm", "it", "XM", "MO3"] {
+            let name = format!("track.{ext}");
+            let p = std::path::Path::new(&name);
+            assert!(is_supported_audio(p), "{ext} must be playable");
+        }
+        // FFmpeg formats the library does not claim stay routed to FFmpeg.
+        assert!(is_supported_audio(std::path::Path::new("x.mp3")));
+        assert!(is_supported_audio(std::path::Path::new("x.wav")));
+    }
+
+    #[test]
     fn single_file_collects_siblings_and_finds_index() {
         let dir = temp_dir("single");
         for name in ["01.m4a", "02.m4a", "notes.txt"] {
@@ -3758,5 +5265,315 @@ mod playlist_tests {
         assert_eq!(list, vec![file]);
         assert_eq!(idx, 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod params_tests {
+    use super::*;
+
+    fn modified() -> ParamState {
+        ParamState {
+            tape: false,
+            tape_speed_st: 5.0,
+            pitch_st: 7.0,
+            stretch: 1.5,
+            formant: true,
+            trk_pitch_st: 3.0,
+            trk_tempo_pct: 150.0,
+            trk_separation: 140.0,
+            trk_interp: tracker::Interpolation::Cubic,
+            midi_transpose_st: 2.0,
+            midi_bpm: 90.0,
+            midi_bpm_override: true,
+            midi_metronome: true,
+        }
+    }
+
+    #[test]
+    fn defaults_are_tape_neutral() {
+        let p = ParamState::default();
+        assert!(p.tape);
+        assert_eq!(p.tape_speed_st, 0.0);
+        assert_eq!(p.pitch_st, 0.0);
+        assert_eq!(p.stretch, 1.0);
+        assert!(!p.formant);
+        let e = p.engine_params(true);
+        assert!(e.mode_tape);
+        assert_eq!(e.tempo_ratio, 1.0);
+        assert_eq!(e.pitch_semitones, 0.0);
+        assert!(!e.formant_preserve);
+    }
+
+    #[test]
+    fn tape_semitones_map_exponentially() {
+        let up = ParamState {
+            tape_speed_st: 12.0,
+            ..ParamState::default()
+        };
+        assert!((up.tape_ratio() - 2.0).abs() < 1e-4);
+        let down = ParamState {
+            tape_speed_st: -12.0,
+            ..ParamState::default()
+        };
+        assert!((down.tape_ratio() - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tape_engine_ignores_pitchtime_sliders() {
+        let p = ParamState {
+            pitch_st: 7.0,
+            stretch: 1.5,
+            formant: true,
+            ..ParamState::default()
+        };
+        let e = p.engine_params(false);
+        assert!(e.mode_tape);
+        assert_eq!(e.pitch_semitones, 0.0);
+        assert_eq!(e.tempo_ratio, 1.0);
+    }
+
+    #[test]
+    fn pitchtime_engine_passes_sliders_through() {
+        let p = ParamState {
+            tape: false,
+            pitch_st: -3.0,
+            stretch: 1.25,
+            formant: true,
+            ..ParamState::default()
+        };
+        let e = p.engine_params(true);
+        assert!(!e.mode_tape);
+        assert_eq!(e.pitch_semitones, -3.0);
+        assert_eq!(e.tempo_ratio, 1.25);
+        assert!(e.formant_preserve);
+    }
+
+    #[test]
+    fn rounding_follows_js_math_round_not_rust_round() {
+        // JS `Math.round` sends exact halves up; `f32::round` sends them away
+        // from zero, so a ported `round()` would read a semitone low at every
+        // negative half position.
+        assert_eq!(js_round(2.5), 3.0);
+        assert_eq!(js_round(-2.5), -2.0);
+        assert_eq!(js_round(-2.6), -3.0);
+        assert_eq!(js_round(-0.5), 0.0);
+        assert_eq!(js_round(0.49), 0.0);
+    }
+
+    #[test]
+    fn snap_semitones_quantizes_to_musical_steps() {
+        assert_eq!(snap_semitones(3.47), 3.0);
+        assert_eq!(snap_semitones(-2.5), -2.0); // JS Math.round: halves go up
+        assert_eq!(snap_semitones(2.5), 3.0);
+        assert_eq!(snap_semitones(0.4), 0.0);
+        assert_eq!(snap_semitones(13.0), 12.0); // clamp even if the caller didn't
+                                                // -0 must never render as "-0"; the reference shows "+0".
+        assert_eq!(snap_semitones(-0.4), 0.0);
+        assert_eq!(format!("{:+.0}", snap_semitones(-0.4)), "+0");
+    }
+
+    #[test]
+    fn snap_stretch_quantizes_to_whole_percent() {
+        assert_eq!(snap_stretch(1.034), 1.03);
+        assert_eq!(snap_stretch(1.256), 1.26);
+        assert_eq!(snap_stretch(0.5), 0.5);
+        assert_eq!(snap_stretch(1.6), 1.5); // slider clamp range
+                                            // Quantization is idempotent — stored values stay on the grid.
+        let s = snap_stretch(1.234);
+        assert_eq!(snap_stretch(s), s);
+        // Display is exact: whole percent, no rounding drift.
+        assert_eq!(format!("{:.0}", s * 100.0), "123");
+    }
+
+    #[test]
+    fn snapped_values_map_exactly_to_engine_params() {
+        // Tape: whole semitones in, 2^(st/12) tempo ratio out (pitch rides
+        // the resample — no independent pitch).
+        let p = ParamState {
+            tape_speed_st: snap_semitones(2.8),
+            ..ParamState::default()
+        };
+        assert_eq!(p.tape_speed_st, 3.0);
+        assert!((p.tape_ratio() - 2.0f32.powf(3.0 / 12.0)).abs() < 1e-6);
+        let e = p.engine_params(true);
+        assert!(e.mode_tape);
+        assert!((e.tempo_ratio - 2.0f32.powf(0.25)).abs() < 1e-6);
+        assert_eq!(e.pitch_semitones, 0.0);
+
+        // Pitch/Time: independent whole-semitone pitch and whole-percent tempo.
+        let pt = ParamState {
+            tape: false,
+            pitch_st: snap_semitones(-4.6),
+            stretch: snap_stretch(1.07),
+            ..ParamState::default()
+        };
+        let e = pt.engine_params(true);
+        assert_eq!(e.pitch_semitones, -5.0);
+        assert_eq!(e.tempo_ratio, 1.07);
+    }
+
+    #[test]
+    fn wheel_detent_moves_exactly_one_visible_unit() {
+        // The widget's own detent is 2.5% of the range (0.6 st here) — snapped
+        // it would read as one semitone, but 2.5% of the ratio slider would
+        // alternate 2%/3%. A detent is re-based on the visible unit instead.
+        for st in [-11.0, -7.0, 0.0, 5.0, 11.0] {
+            let up = snap_semitones(wheel_step(st, 1.0, 1.0, -12.0, 12.0));
+            let down = snap_semitones(wheel_step(st, -1.0, 1.0, -12.0, 12.0));
+            assert_eq!(up, st + 1.0, "one notch up from {st}");
+            assert_eq!(down, st - 1.0, "one notch down from {st}");
+        }
+        // Range ends clamp and stay on the grid.
+        assert_eq!(
+            snap_semitones(wheel_step(12.0, 1.0, 1.0, -12.0, 12.0)),
+            12.0
+        );
+        assert_eq!(
+            snap_semitones(wheel_step(-12.0, -1.0, 1.0, -12.0, 12.0)),
+            -12.0
+        );
+    }
+
+    #[test]
+    fn wheel_detent_moves_time_stretch_one_percent() {
+        // Stretch is driven in a ±0.5 bias domain around 100%; a detent is 1%
+        // and never alternates between 2% and 3%.
+        let bias = |pct: f32| pct / 100.0 - 1.0;
+        let apply = |b: f32| snap_stretch(b + 1.0);
+        assert_eq!(apply(wheel_step(bias(100.0), 1.0, 0.01, -0.5, 0.5)), 1.01);
+        assert_eq!(apply(wheel_step(bias(103.0), 1.0, 0.01, -0.5, 0.5)), 1.04);
+        assert_eq!(apply(wheel_step(bias(103.0), -1.0, 0.01, -0.5, 0.5)), 1.02);
+        assert_eq!(apply(wheel_step(bias(150.0), 1.0, 0.01, -0.5, 0.5)), 1.50);
+        assert_eq!(apply(wheel_step(bias(50.0), -1.0, 0.01, -0.5, 0.5)), 0.50);
+    }
+
+    #[test]
+    fn drag_across_the_track_visits_every_semitone_once() {
+        // Absolute drag over a 240 px track spanning ±12 st: exactly 25 values,
+        // each reached once and no fractional values in between.
+        let mut seen: Vec<f32> = Vec::new();
+        for px in 0..=240 {
+            let v = snap_semitones(-12.0 + (px as f32 / 240.0) * 24.0);
+            if seen.last() != Some(&v) {
+                seen.push(v);
+            }
+        }
+        assert_eq!(seen.len(), 25);
+        assert_eq!(seen.first(), Some(&-12.0));
+        assert_eq!(seen.last(), Some(&12.0));
+        assert!(seen.windows(2).all(|w| (w[1] - w[0] - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn tempo_sweep_visits_every_percent_once() {
+        let mut seen: Vec<f32> = Vec::new();
+        for px in 0..=100 {
+            let bias = -0.5 + (px as f32 / 100.0);
+            let v = snap_stretch(bias + 1.0);
+            if seen.last() != Some(&v) {
+                seen.push(v);
+            }
+        }
+        assert_eq!(seen.len(), 101);
+        assert_eq!(seen.first(), Some(&0.5));
+        assert_eq!(seen.last(), Some(&1.5));
+    }
+
+    fn test_app() -> App {
+        App::new(
+            None,
+            false,
+            None,
+            BackendKind::Gpu,
+            FontEngine::Swash,
+            UserConfig::default(),
+        )
+    }
+
+    #[test]
+    fn unlocked_new_track_resets_params_to_defaults() {
+        let mut app = test_app();
+        app.chk_locked = false;
+        app.playlist = vec![PathBuf::from("Z:/soundapp-test-missing.mp3")];
+        app.params = modified();
+        app.load_playlist_index(0);
+        assert_eq!(app.params, ParamState::default());
+        // The engine-facing view of the reset state must be neutral too —
+        // shared AND native tracker domains.
+        let e = app.playback_params();
+        assert!(e.mode_tape);
+        assert_eq!(e.tempo_ratio, 1.0);
+        assert_eq!(e.pitch_semitones, 0.0);
+        assert_eq!(e.tracker, tracker::TrackerParams::default());
+    }
+
+    #[test]
+    fn locked_new_track_keeps_params() {
+        let mut app = test_app();
+        app.chk_locked = true;
+        app.playlist = vec![PathBuf::from("Z:/soundapp-test-missing.mp3")];
+        app.params = modified();
+        let before = app.params;
+        app.load_playlist_index(0);
+        assert_eq!(app.params, before);
+    }
+
+    #[test]
+    fn auto_advance_follows_the_same_reset_rule_as_explicit_load() {
+        let mut app = test_app();
+        app.chk_locked = false;
+        app.playlist = vec![
+            PathBuf::from("Z:/soundapp-test-missing-1.mp3"),
+            PathBuf::from("Z:/soundapp-test-missing-2.mp3"),
+        ];
+        app.params = modified();
+        assert!(app.advance_track(false));
+        assert_eq!(app.params, ParamState::default());
+    }
+
+    #[test]
+    fn tracker_params_map_to_the_engine_domain() {
+        // UI percent domain → engine ratio domain; interpolation passes through.
+        let e = modified().engine_params(true);
+        assert_eq!(e.tracker.pitch_semitones, 3.0);
+        assert_eq!(e.tracker.tempo_ratio, 1.5);
+        assert_eq!(e.tracker.stereo_separation, 140.0);
+        assert_eq!(e.tracker.interpolation, tracker::Interpolation::Cubic);
+        // Neutral defaults must hold on the engine side as well.
+        let n = ParamState::default().engine_params(true);
+        assert_eq!(n.tracker, tracker::TrackerParams::default());
+    }
+
+    #[test]
+    fn native_tracker_sliders_quantize_like_the_reference() {
+        // Whole semitones across libopenmpt's full ±24 range, ±0 normalized.
+        assert_eq!(snap_semitones_range(2.5, -24.0, 24.0), 3.0);
+        assert_eq!(snap_semitones_range(-2.5, -24.0, 24.0), -2.0);
+        assert_eq!(snap_semitones_range(30.0, -24.0, 24.0), 24.0);
+        assert_eq!(snap_semitones_range(-0.4, -24.0, 24.0), 0.0);
+        let s = snap_semitones_range(-0.0, -24.0, 24.0).to_string();
+        assert_eq!(s, "0");
+        // Whole percent on the unipolar trackers; clamped at both ends.
+        assert_eq!(snap_percent(99.5, 25.0, 400.0), 100.0);
+        assert_eq!(snap_percent(10.0, 25.0, 400.0), 25.0);
+        assert_eq!(snap_percent(999.0, 25.0, 400.0), 400.0);
+        assert_eq!(snap_percent(140.4, 0.0, 200.0), 140.0);
+        // One wheel detent = exactly one unit everywhere.
+        assert_eq!(snap_percent(100.0 + 1.0, 25.0, 400.0), 101.0);
+        assert_eq!(snap_semitones_range(5.0 + 1.0, -24.0, 24.0), 6.0);
+    }
+
+    #[test]
+    fn reset_tracker_returns_the_native_domain_to_neutral() {
+        let mut p = modified();
+        p.reset_tracker();
+        assert_eq!(p.trk_pitch_st, 0.0);
+        assert_eq!(p.trk_tempo_pct, 100.0);
+        assert_eq!(p.trk_separation, 100.0);
+        assert_eq!(p.trk_interp, tracker::Interpolation::Default);
+        // Shared controls are untouched by the native reset.
+        assert_eq!(p.tape_speed_st, 5.0);
+        assert_eq!(p.stretch, 1.5);
     }
 }

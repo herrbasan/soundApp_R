@@ -1,17 +1,27 @@
 // Audio engine: transport control + a cpal callback that drains a lock-free
 // rtrb ring buffer, fed by a decoder thread.
 //
-// FFmpeg (universal formats + metadata) via the native `sa_ffmpeg_*` bridge is
-// the only playback engine. MIDI / SoundFont synthesis and ProTracker modules
-// are parked (the source files remain on disk; their modules are not built).
+// Two source engines feed the same raw-stereo pipeline:
+//   * FFmpeg (universal formats + metadata) via the native `sa_ffmpeg_*` bridge;
+//   * libopenmpt 0.8.9 (`crate::tracker`) for tracker modules — MOD/S3M/XM/IT…
+//     rendered natively at the device rate with its own event-domain pitch /
+//     tempo / separation / interpolation controls.
+// Both push raw interleaved-stereo frames into the 8 s source ring; everything
+// downstream is shared. MIDI / SoundFont synthesis remains parked.
 //
-// Pitch / tempo / formant are applied in the pipeline itself, so they work
-// identically on every source:
-//   * "Tape" mode resamples the raw stream at a variable rate — pitch and tempo
-//     move together.
-//   * "PitchTime" mode runs the stream through `RealTimePitchShifter`
-//     (granular / WSOLA time-stretch + resample + formant tilt), so pitch and
-//     tempo are independent and parameter changes glide without clicking.
+// Pitch / tempo / formant are applied at the audible edge — downstream of the
+// 8 s decode ring, inside the stretcher thread — so they work identically on
+// every source and parameter changes are audible within the ~85 ms output
+// ring, in BOTH modes:
+//   * "Tape" mode resamples the raw stream at a variable rate in the
+//     stretcher thread (`TapeResampler`) — pitch and tempo move together.
+//   * "PitchTime" mode runs the stream through Rubber Band v4.0.0 (R3
+//     "finer" engine, real-time mode — spectral pitch shift + time-stretch),
+//     so pitch and tempo are independent and parameter changes glide without
+//     clicking. Formant preservation is the R3 engine's true formant
+//     preservation.
+// The ring therefore always holds raw decoded frames: a mode switch never
+// re-processes audio the previous mode already shaped.
 //
 // Two state machines keep playback clean:
 //   * The callback owns a cosine-fade machine — 12 ms out on pause/seek, 15 ms
@@ -121,12 +131,7 @@ fn read_handle_metadata(handle: *mut c_void, path: &Path) -> Option<TrackMetadat
     let mut m: SaAudioMeta = unsafe { std::mem::zeroed() };
     let mut cover_buf = vec![0u8; (COVER_SIDE * COVER_SIDE * 4) as usize];
     let ok = unsafe {
-        sa_ffmpeg_read_handle_metadata(
-            handle,
-            &mut m,
-            cover_buf.as_mut_ptr(),
-            COVER_SIDE as c_int,
-        )
+        sa_ffmpeg_read_handle_metadata(handle, &mut m, cover_buf.as_mut_ptr(), COVER_SIDE as c_int)
     };
     if ok == 0 {
         return None;
@@ -172,7 +177,11 @@ pub enum Source {
     Tone { hz: f32 },
 }
 
-/// The full playback parameter set driving the pitch/tempo/formant pipeline.
+/// The shared tape/Rubber-Band parameters apply only to FFmpeg audio at the
+/// audible edge. `tracker` and `midi` are the NATIVE source-engine parameter
+/// sets — applied by the decoder thread to the owning engine only and ignored
+/// by the other sources. Native sources bypass the shared post chain entirely,
+/// matching the reference player.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlaybackParams {
     /// `true` = Tape mode (pitch & tempo coupled); `false` = PitchTime mode.
@@ -181,6 +190,23 @@ pub struct PlaybackParams {
     pub tempo_ratio: f32,
     pub hq: bool,
     pub formant_preserve: bool,
+    pub tracker: crate::tracker::TrackerParams,
+    pub midi: crate::midi::MidiParams,
+}
+
+impl PlaybackParams {
+    /// Native tracker/MIDI engines expose their own pitch and tempo controls;
+    /// force the shared post stage to raw passthrough regardless of audio-page
+    /// state carried by parameter locking.
+    pub fn for_native_source(&self) -> Self {
+        Self {
+            mode_tape: false,
+            pitch_semitones: 0.0,
+            tempo_ratio: 1.0,
+            formant_preserve: false,
+            ..*self
+        }
+    }
 }
 
 impl Default for PlaybackParams {
@@ -190,7 +216,9 @@ impl Default for PlaybackParams {
             pitch_semitones: 0.0,
             tempo_ratio: 1.0,
             hq: true,
-            formant_preserve: true,
+            formant_preserve: false,
+            tracker: crate::tracker::TrackerParams::default(),
+            midi: crate::midi::MidiParams::default(),
         }
     }
 }
@@ -199,6 +227,10 @@ enum Cmd {
     Seek(f64),
     Load(PathBuf),
     SetParams(PlaybackParams),
+    /// Switch the SoundFont (MIDI sources). Applied live by the decoder
+    /// thread — never restarts the track. Non-MIDI engines just record it
+    /// as the font for the next MIDI open.
+    SetSoundfont(PathBuf),
 }
 
 /// Shared atomics + mutex-guarded results, cloned into the callback and the
@@ -239,6 +271,10 @@ struct Shared {
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
+    /// Active SoundFont for MIDI sources. Written by the decoder thread
+    /// (after a live `set_soundfont` succeeds, or directly when no MIDI
+    /// engine is running); read at every MIDI open.
+    soundfont: Arc<Mutex<PathBuf>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,10 +331,14 @@ pub struct Audio {
     loop_enabled: Arc<AtomicBool>,
     track_ended: Arc<AtomicBool>,
     dsp_enabled: Arc<AtomicBool>,
+    /// Audibility anchor for parameter-latency measurements (tests).
+    #[allow(dead_code)]
+    out_played: Arc<AtomicU64>,
     cmd_tx: mpsc::Sender<Cmd>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
+    soundfont: Arc<Mutex<PathBuf>>,
 }
 
 impl Audio {
@@ -316,6 +356,12 @@ impl Audio {
     }
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::SeqCst)
+    }
+    /// Frames the cpal callback has actually emitted to the device. The
+    /// audibility anchor: parameter-latency measurements compare against it.
+    #[allow(dead_code)]
+    pub fn out_played_frames(&self) -> u64 {
+        self.out_played.load(Ordering::Relaxed)
     }
     pub fn set_loop(&self, enabled: bool) {
         self.loop_enabled.store(enabled, Ordering::Release);
@@ -377,6 +423,17 @@ impl Audio {
     pub fn set_params(&self, params: PlaybackParams) {
         let _ = self.cmd_tx.send(Cmd::SetParams(params));
     }
+    /// Switch the SoundFont. A playing MIDI engine adopts it live (no
+    /// restart); otherwise it becomes the font the next MIDI track opens
+    /// with. A font the synth rejects is logged and NOT published — the
+    /// active font stays until a valid one is chosen.
+    pub fn set_soundfont(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::SetSoundfont(path));
+    }
+    /// The SoundFont the decoder thread has published as active.
+    pub fn soundfont(&self) -> PathBuf {
+        self.soundfont.lock().unwrap().clone()
+    }
     pub fn metadata(&self) -> Option<TrackMetadata> {
         self.meta.lock().unwrap().clone()
     }
@@ -390,6 +447,12 @@ impl Audio {
 }
 
 const RING_SECONDS: usize = 8;
+/// Maximum source-ring fill allowed for NATIVE synth engines (Openmpt/Midi).
+/// Their parameters apply at the engine, upstream of this ring, so every
+/// buffered frame is audio a parameter change can no longer reach — without
+/// this cap a native control trails by up to RING_SECONDS. FFmpeg is exempt:
+/// its decoder reads from disk/SMB and needs the deep backlog.
+const NATIVE_HIGH_WATER_SECS: f64 = 0.100;
 /// Depth of the post-stretcher output ring: the maximum audio latency between
 /// a parameter change and the speakers (Phase B target ≤ 100 ms).
 const OUT_RING_SECONDS: f64 = 0.08;
@@ -402,7 +465,9 @@ const LOOKAHEAD: usize = 4;
 
 pub fn start(src: Source) -> Result<Audio, String> {
     let host = cpal::default_host();
-    let device = host.default_output_device().ok_or("no default output device")?;
+    let device = host
+        .default_output_device()
+        .ok_or("no default output device")?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
     let rate = config.sample_rate();
     let out_ch = config.channels() as usize;
@@ -437,6 +502,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
         dsp: Arc::new(Mutex::new(DspTap::new(rate))),
         meta: Arc::new(Mutex::new(None)),
         current: Arc::new(Mutex::new(None)),
+        soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -618,10 +684,12 @@ pub fn start(src: Source) -> Result<Audio, String> {
         loop_enabled: shared.loop_enabled.clone(),
         track_ended: shared.track_ended.clone(),
         dsp_enabled: shared.dsp_enabled.clone(),
+        out_played: shared.out_played.clone(),
         cmd_tx,
         meta: shared.meta.clone(),
         current: shared.current.clone(),
         dsp: shared.dsp.clone(),
+        soundfont: shared.soundfont.clone(),
     })
 }
 
@@ -633,209 +701,247 @@ enum Fade {
 }
 
 // ---------------------------------------------------------------------------
-// Real-time pitch / tempo / formant shifter
+// Rubber Band FFI + PitchStage implementation
 // ---------------------------------------------------------------------------
 
-/// A streaming granular (WSOLA-style) time-stretcher followed by a fractional
-/// resampler, plus an optional formant-spectrum tilt. Pitch and tempo are
-/// independent; parameter changes glide at grain boundaries instead of
-/// flushing, so dragging a slider never clicks.
-pub struct RealTimePitchShifter {
-    rate: f32,
-    pitch_semitones: f32,
-    tempo_ratio: f32,
-    formant_preserve: bool,
-    grain: usize,
-    hop: usize,
-    window: Vec<f32>,
-    /// Pending interleaved-stereo input, with the absolute frame index of its
-    /// front element.
-    inq: VecDeque<f32>,
-    in_front: u64,
-    next_anchor: u64,
-    /// Windowed output of the previous grain (interleaved stereo, `grain` frames).
-    prev_grain: Vec<f32>,
-    have_prev: bool,
-    /// Stretched interleaved-stereo output waiting to be resampled.
-    stq: VecDeque<f32>,
-    st_front: u64,
-    st_read: f64,
-    lp_l: f32,
-    lp_r: f32,
+/// Minimal bindings over the vendored Rubber Band Library v4.0.0 shim
+/// (`vendor/rubberband/shim.cpp`, compiled with the full upstream library
+/// into the FFmpeg-bridge static lib by `build.rs`). Buffers are
+/// de-interleaved float, lengths are frames on the C side; the stage converts.
+/// License: GPL-2.0-or-later or commercial (see the vendor dir).
+mod rubberband {
+    /// Public `RubberBandStretcher::Options` bits used here.
+    pub const OPTION_PROCESS_REAL_TIME: u32 = 0x0000_0001;
+    pub const OPTION_CHANNELS_TOGETHER: u32 = 0x1000_0000;
+    pub const OPTION_ENGINE_FINER: u32 = 0x2000_0000;
+
+    #[repr(C)]
+    pub struct RbHandle {
+        _private: [u8; 0],
+    }
+
+    extern "C" {
+        fn rb_create(sample_rate: u32, channels: u32, options: u32) -> *mut RbHandle;
+        fn rb_destroy(handle: *mut RbHandle);
+        fn rb_reset(handle: *mut RbHandle);
+        fn rb_set_time_ratio(handle: *mut RbHandle, ratio: f64);
+        fn rb_set_pitch_scale(handle: *mut RbHandle, scale: f64);
+        fn rb_set_formant_preserved(handle: *mut RbHandle, preserved: i32);
+        fn rb_get_start_delay(handle: *mut RbHandle) -> usize;
+        fn rb_available(handle: *mut RbHandle) -> i32;
+        fn rb_process(
+            handle: *mut RbHandle,
+            in_l: *const f32,
+            in_r: *const f32,
+            frames: usize,
+            final_: i32,
+        );
+        fn rb_retrieve(
+            handle: *mut RbHandle,
+            out_l: *mut f32,
+            out_r: *mut f32,
+            frames: usize,
+        ) -> usize;
+    }
+
+    /// Owned engine handle, destroyed on drop. `Send` because the raw handle
+    /// is only ever touched from the owning thread.
+    pub struct Engine {
+        handle: *mut RbHandle,
+    }
+
+    unsafe impl Send for Engine {}
+
+    impl Engine {
+        pub fn new(sample_rate: u32, channels: u32, options: u32) -> Engine {
+            let handle = unsafe { rb_create(sample_rate, channels, options) };
+            assert!(!handle.is_null(), "rb_create returned null");
+            Engine { handle }
+        }
+
+        pub fn reset(&mut self) {
+            unsafe { rb_reset(self.handle) }
+        }
+
+        pub fn set_time_ratio(&mut self, ratio: f64) {
+            unsafe { rb_set_time_ratio(self.handle, ratio) }
+        }
+
+        pub fn set_pitch_scale(&mut self, scale: f64) {
+            unsafe { rb_set_pitch_scale(self.handle, scale) }
+        }
+
+        pub fn set_formant_preserved(&mut self, preserved: bool) {
+            unsafe { rb_set_formant_preserved(self.handle, preserved as i32) }
+        }
+
+        /// Output-domain pipeline delay in frames (RT mode). Depends on the
+        /// current ratios; re-query after ratio changes.
+        pub fn start_delay(&self) -> usize {
+            unsafe { rb_get_start_delay(self.handle) }
+        }
+
+        /// Frames retrievable now; -1 once a final flush has fully drained.
+        pub fn available(&self) -> i32 {
+            unsafe { rb_available(self.handle) }
+        }
+
+        /// Feed one de-interleaved stereo block; `final_` marks end of stream
+        /// (frames may be 0 then).
+        pub fn process(&mut self, in_l: &[f32], in_r: &[f32], final_: bool) {
+            debug_assert_eq!(in_l.len(), in_r.len());
+            unsafe {
+                rb_process(
+                    self.handle,
+                    in_l.as_ptr(),
+                    in_r.as_ptr(),
+                    in_l.len(),
+                    final_ as i32,
+                )
+            }
+        }
+
+        /// Pull up to `out_l.len()` de-interleaved stereo frames; returns the
+        /// frame count actually retrieved.
+        pub fn retrieve(&mut self, out_l: &mut [f32], out_r: &mut [f32]) -> usize {
+            debug_assert_eq!(out_l.len(), out_r.len());
+            unsafe {
+                rb_retrieve(
+                    self.handle,
+                    out_l.as_mut_ptr(),
+                    out_r.as_mut_ptr(),
+                    out_l.len(),
+                )
+            }
+        }
+    }
+
+    impl Drop for Engine {
+        fn drop(&mut self) {
+            unsafe { rb_destroy(self.handle) }
+        }
+    }
 }
 
-impl RealTimePitchShifter {
-    /// Build a shifter for `rate`.
-    pub fn new(rate: u32) -> Self {
-        let grain = ((0.021 * rate as f32) as usize).max(64) & !1;
-        let hop = grain / 2;
-        let window: Vec<f32> = (0..grain)
-            .map(|i| {
-                let p = i as f32 / grain as f32;
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * p).cos())
-            })
-            .collect();
+/// Streaming pitch/tempo/formant stage over Rubber Band v4.0.0, R3 "finer"
+/// engine in real-time mode with linked stereo processing.
+///
+/// Tempo drives the library time ratio (tempo 2.0 → time ratio 0.5); pitch is
+/// the library pitch scale. Formant preserve maps to `OptionFormantPreserved`
+/// — the R3 engine's true formant preservation. Real-time mode deliberately
+/// skips the start-pad/output-trim protocol: the library's own RT choice
+/// ("better to start with a swoosh than introduce more latency"), so engine
+/// activation is instant and ratio changes never gap the output.
+struct RubberBandStage {
+    engine: rubberband::Engine,
+    tempo: f32,
+    /// Latch: the final-flush drain must not be repeated until reset.
+    drained: bool,
+    /// De-interleave/interleave scratch, owned so steady-state process()
+    /// cycles don't allocate.
+    in_l: Vec<f32>,
+    in_r: Vec<f32>,
+    out_l: Vec<f32>,
+    out_r: Vec<f32>,
+}
+
+/// Frames pulled per retrieve cycle at most.
+const RB_RETRIEVE: usize = 8192;
+
+impl RubberBandStage {
+    fn new(rate: u32) -> Self {
+        let options = rubberband::OPTION_PROCESS_REAL_TIME
+            | rubberband::OPTION_CHANNELS_TOGETHER
+            | rubberband::OPTION_ENGINE_FINER;
+        let engine = rubberband::Engine::new(rate, 2, options);
         Self {
-            rate: rate as f32,
-            pitch_semitones: 0.0,
-            tempo_ratio: 1.0,
-            formant_preserve: true,
-            grain,
-            hop,
-            window,
-            inq: VecDeque::new(),
-            in_front: 0,
-            next_anchor: 0,
-            prev_grain: vec![0.0; grain * 2],
-            have_prev: false,
-            stq: VecDeque::new(),
-            st_front: 0,
-            st_read: 0.0,
-            lp_l: 0.0,
-            lp_r: 0.0,
+            engine,
+            tempo: 1.0,
+            drained: false,
+            in_l: Vec::new(),
+            in_r: Vec::new(),
+            out_l: vec![0.0; RB_RETRIEVE],
+            out_r: vec![0.0; RB_RETRIEVE],
         }
     }
 
-    pub fn set_pitch(&mut self, semitones: f32) {
-        self.pitch_semitones = semitones.clamp(-12.0, 12.0);
-    }
-    pub fn set_tempo(&mut self, ratio: f32) {
-        self.tempo_ratio = ratio.clamp(0.5, 2.0);
-    }
-    pub fn set_formant(&mut self, preserve: bool) {
-        self.formant_preserve = preserve;
-    }
-
-    /// Drop all buffered state (used on track change).
-    pub fn reset(&mut self) {
-        self.inq.clear();
-        self.in_front = 0;
-        self.next_anchor = 0;
-        self.have_prev = false;
-        self.stq.clear();
-        self.st_front = 0;
-        self.st_read = 0.0;
-        self.lp_l = 0.0;
-        self.lp_r = 0.0;
-        self.prev_grain.iter_mut().for_each(|v| *v = 0.0);
-    }
-
-    /// Feed interleaved-stereo `input`, appending interleaved-stereo output to
-    /// `out`. `out` is expected to be empty on entry.
-    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        self.inq.extend(input.iter().copied());
-        self.pump_stretch();
-        self.pump_resample(out);
-    }
-
-    fn pitch_ratio(&self) -> f64 {
-        2f64.powf(self.pitch_semitones as f64 / 12.0)
-    }
-
-    fn pump_stretch(&mut self) {
-        let grain = self.grain;
-        let hop = self.hop;
+    /// Pull everything currently retrievable, interleaving into `out`.
+    fn pull(&mut self, out: &mut Vec<f32>) {
         loop {
-            let avail = (self.inq.len() / 2) as u64;
-            let have = self.in_front + avail;
-            let need = self.next_anchor + grain as u64;
-            if need > have {
+            let avail = self.engine.available();
+            if avail <= 0 {
                 break;
             }
-            let base = (self.next_anchor - self.in_front) as usize;
-            if (base + grain) * 2 > self.inq.len() {
+            let want = (avail as usize).min(RB_RETRIEVE);
+            let got = self
+                .engine
+                .retrieve(&mut self.out_l[..want], &mut self.out_r[..want]);
+            if got == 0 {
                 break;
             }
-            let mut cur = vec![0.0f32; grain * 2];
-            for i in 0..grain {
-                let w = self.window[i];
-                let o = (base + i) * 2;
-                cur[i * 2] = self.inq[o] * w;
-                cur[i * 2 + 1] = self.inq[o + 1] * w;
-            }
-
-            if self.have_prev {
-                for i in 0..hop {
-                    for c in 0..2 {
-                        let v = self.prev_grain[(hop + i) * 2 + c] + cur[i * 2 + c];
-                        self.stq.push_back(v);
-                    }
-                }
-            } else {
-                for i in 0..hop {
-                    for c in 0..2 {
-                        self.stq.push_back(cur[i * 2 + c]);
-                    }
-                }
-                self.have_prev = true;
-            }
-            self.prev_grain.copy_from_slice(&cur);
-
-            // Advance the analysis anchor: `hop` output frames per grain, but the
-            // input is consumed at rate `tempo / pitch_ratio` (stretch = r/tempo).
-            let r = self.pitch_ratio();
-            let analysis_hop = (hop as f64 * self.tempo_ratio as f64 / r).max(1.0);
-            self.next_anchor += analysis_hop as u64;
-
-            let drop_frames = (self.next_anchor - self.in_front) as usize;
-            let avail = self.inq.len() / 2;
-            let d = drop_frames.min(avail);
-            if d > 0 {
-                self.inq.drain(0..d * 2);
-                self.in_front += d as u64;
+            let start = out.len();
+            out.resize(start + got * 2, 0.0);
+            for i in 0..got {
+                out[start + i * 2] = self.out_l[i];
+                out[start + i * 2 + 1] = self.out_r[i];
             }
         }
     }
+}
 
-    fn pump_resample(&mut self, out: &mut Vec<f32>) {
-        let r = self.pitch_ratio();
-        let st_frames = (self.stq.len() / 2) as u64;
-        loop {
-            let rel = self.st_read - self.st_front as f64;
-            if rel + 2.0 >= st_frames as f64 {
-                break;
-            }
-            let i0 = rel.floor() as usize;
-            let frac = (rel - i0 as f64) as f32;
-            for c in 0..2 {
-                let v = cubic_q(&self.stq, i0, frac, c);
-                let v = if self.formant_preserve {
-                    self.tilt(c, v, r as f32)
-                } else {
-                    v
-                };
-                out.push(v.clamp(-1.0, 1.0));
-            }
-            self.st_read += r;
+impl PitchStage for RubberBandStage {
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let frames = input.len() / 2;
+        if frames == 0 {
+            return;
         }
-
-        // Drop consumed stretched frames, keeping a small look-behind margin.
-        let drop_to = (self.st_read.floor() as u64).saturating_sub(2);
-        if drop_to > self.st_front {
-            let have = (self.stq.len() / 2) as u64;
-            let n = (drop_to - self.st_front).min(have.saturating_sub(4)) as usize;
-            if n > 0 {
-                self.stq.drain(0..n * 2);
-                self.st_front += n as u64;
-            }
-        }
+        self.in_l.clear();
+        self.in_r.clear();
+        self.in_l.extend(input.chunks_exact(2).map(|f| f[0]));
+        self.in_r.extend(input.chunks_exact(2).map(|f| f[1]));
+        self.engine.process(&self.in_l, &self.in_r, false);
+        self.pull(out);
     }
 
-    /// A gentle first-order spectral tilt that counteracts the envelope shift a
-    /// pure resampler introduces (a lightweight formant-preservation
-    /// approximation — no phase-vocoder envelope extraction).
-    fn tilt(&mut self, c: usize, x: f32, r: f32) -> f32 {
-        // Keep the one-pole cutoff roughly constant across sample rates.
-        let coef = (0.15 * 48_000.0 / self.rate).clamp(0.03, 0.4);
-        let lp = if c == 0 {
-            self.lp_l += coef * (x - self.lp_l);
-            self.lp_l
-        } else {
-            self.lp_r += coef * (x - self.lp_r);
-            self.lp_r
-        };
-        let g = 0.6 * (1.0 - 1.0 / r.max(0.001));
-        x + g * lp
+    fn set_pitch(&mut self, semitones: f32) {
+        let s = semitones.clamp(-12.0, 12.0);
+        self.engine.set_pitch_scale(2f64.powf(s as f64 / 12.0));
+    }
+
+    fn set_tempo(&mut self, ratio: f32) {
+        self.tempo = ratio.clamp(0.5, 2.0);
+        // tempo 2.0 = play twice as fast = output duration halved = library
+        // time ratio 1/2.
+        self.engine.set_time_ratio(1.0 / self.tempo as f64);
+    }
+
+    fn set_formant(&mut self, preserve: bool) {
+        self.engine.set_formant_preserved(preserve);
+    }
+
+    fn reset(&mut self) {
+        self.engine.reset();
+        self.drained = false;
+        self.in_l.clear();
+        self.in_r.clear();
+    }
+
+    fn latency_frames(&self, tempo: f32) -> usize {
+        // getStartDelay is output-domain pipeline delay; media frames =
+        // output frames x tempo (output frames per media frame is 1/tempo).
+        (self.engine.start_delay() as f64 * tempo.max(0.1) as f64).round() as usize
+    }
+
+    fn drain(&mut self, out: &mut Vec<f32>) {
+        if self.drained {
+            return;
+        }
+        self.drained = true;
+        // RT-mode EOF: an empty final block flushes the engine; the remaining
+        // output then drains until available() reports completion (-1) or
+        // stops yielding.
+        self.engine.process(&[], &[], true);
+        self.pull(out);
     }
 }
 
@@ -843,10 +949,209 @@ impl RealTimePitchShifter {
 // PitchStage trait (Phase B)
 // ---------------------------------------------------------------------------
 
+/// Streaming fractional-index resampler for Tape mode: pitch and tempo are
+/// the single coupled ratio `tempo x 2^(pitch/12)` (media frames consumed per
+/// output frame). It runs at the audible edge in the stretcher thread — the
+/// 8 s source ring always holds raw media frames — so tape speed changes
+/// become audible within the output-ring depth, exactly like Pitch/Time
+/// changes, instead of draining the ring first.
+///
+/// Reuses the decoder's historical interpolators (8-tap Lanczos in HQ mode,
+/// Catmull-Rom otherwise) so tape output is mathematically identical to the
+/// former decode-side resampling.
+struct TapeResampler {
+    /// Interleaved media frames received but not yet emitted, with the
+    /// `LOOKAHEAD` tail the interpolators read past the play head.
+    hist: Vec<f32>,
+    /// Fractional play head in frames, relative to `hist` start.
+    pos: f64,
+    pitch_semitones: f32,
+    tempo_ratio: f32,
+    hq: bool,
+}
+
+impl TapeResampler {
+    fn new() -> Self {
+        Self {
+            hist: Vec::new(),
+            pos: 0.0,
+            pitch_semitones: 0.0,
+            tempo_ratio: 1.0,
+            hq: true,
+        }
+    }
+
+    fn step(&self) -> f64 {
+        self.tempo_ratio as f64 * 2f64.powf(self.pitch_semitones as f64 / 12.0)
+    }
+}
+
+impl PitchStage for TapeResampler {
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        self.hist.extend_from_slice(input);
+        let avail = self.hist.len() / 2;
+        // Emit while a full interpolation window is available past the head.
+        // `sinc8` reads i0-3 ..= i0+4; `cubic` reads i0-1 ..= i0+2 — LOOKAHEAD
+        // (+1 for the fractional part) covers both.
+        while (avail as f64 - self.pos) > LOOKAHEAD as f64 + 1.0 {
+            let i0 = self.pos.floor() as usize;
+            let frac = (self.pos - i0 as f64) as f32;
+            let v_l = if self.hq {
+                sinc8(&self.hist, i0, frac, 0)
+            } else {
+                cubic(&self.hist, i0, frac, 0)
+            };
+            let v_r = if self.hq {
+                sinc8(&self.hist, i0, frac, 1)
+            } else {
+                cubic(&self.hist, i0, frac, 1)
+            };
+            out.push(v_l);
+            out.push(v_r);
+            self.pos += self.step();
+        }
+        let consumed = self.pos.floor() as usize;
+        if consumed > 0 {
+            self.hist.drain(0..consumed * 2);
+            self.pos -= consumed as f64;
+        }
+    }
+
+    fn set_pitch(&mut self, semitones: f32) {
+        self.pitch_semitones = semitones.clamp(-12.0, 12.0);
+    }
+
+    fn set_tempo(&mut self, ratio: f32) {
+        self.tempo_ratio = ratio.clamp(0.5, 2.0);
+    }
+
+    fn set_formant(&mut self, _preserve: bool) {}
+
+    fn reset(&mut self) {
+        self.hist.clear();
+        self.pos = 0.0;
+    }
+
+    /// Media frames held but not yet emitted (interpolation window + any
+    /// residue when the output ring throttled consumption).
+    fn latency_frames(&self, _tempo: f32) -> usize {
+        (self.hist.len() / 2).saturating_sub(self.pos.floor() as usize)
+    }
+
+    fn drain(&mut self, out: &mut Vec<f32>) {
+        // The interpolatable tail at the current ratio; at most the last
+        // LOOKAHEAD+1 frames are unresolvable without future input (~0.1 ms).
+        self.process(&[], out);
+    }
+}
+
+/// Which stage currently owns the audible edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StageKind {
+    /// Pitch/Time with neutral parameters: raw passthrough.
+    Pass,
+    /// Tape mode: coupled resampling at the audible edge.
+    Tape,
+    /// Pitch/Time with active parameters: Rubber Band R3.
+    R3,
+}
+
+impl StageKind {
+    fn of(params: &PlaybackParams) -> Self {
+        let neutral =
+            params.pitch_semitones.abs() < 1e-4 && (params.tempo_ratio - 1.0).abs() < 1e-4;
+        if params.mode_tape {
+            StageKind::Tape
+        } else if neutral {
+            StageKind::Pass
+        } else {
+            StageKind::R3
+        }
+    }
+}
+
+/// Mode-dispatching pitch/tempo chain: the single DSP funnel shared by the
+/// live stretcher thread and `render_offline`. Entering a stage resets it so
+/// no stale spectral/interpolation history bleeds across mode switches, and
+/// the raw source ring means a switch never re-processes already-processed
+/// audio.
+struct PitchChain {
+    rb: RubberBandStage,
+    tape: TapeResampler,
+    kind: StageKind,
+}
+
+impl PitchChain {
+    fn new(rate: u32) -> Self {
+        Self {
+            rb: RubberBandStage::new(rate),
+            tape: TapeResampler::new(),
+            kind: StageKind::Pass,
+        }
+    }
+
+    /// Feed interleaved-stereo `raw` (media frames); returns the frames to
+    /// emit. Bounded-latency contract: everything returned was produced from
+    /// the current parameter set.
+    fn process<'a>(
+        &mut self,
+        params: &PlaybackParams,
+        raw: &'a [f32],
+        post: &'a mut Vec<f32>,
+    ) -> &'a [f32] {
+        let kind = StageKind::of(params);
+        if kind != self.kind {
+            match kind {
+                StageKind::Tape => self.tape.reset(),
+                StageKind::R3 => self.rb.reset(),
+                StageKind::Pass => {}
+            }
+            self.kind = kind;
+        }
+        match kind {
+            StageKind::Pass => raw,
+            StageKind::Tape => {
+                self.tape.set_pitch(params.pitch_semitones);
+                self.tape.set_tempo(params.tempo_ratio);
+                self.tape.hq = params.hq;
+                post.clear();
+                self.tape.process(raw, post);
+                post
+            }
+            StageKind::R3 => {
+                self.rb.set_pitch(params.pitch_semitones);
+                self.rb.set_tempo(params.tempo_ratio);
+                self.rb.set_formant(params.formant_preserve);
+                post.clear();
+                self.rb.process(raw, post);
+                post
+            }
+        }
+    }
+
+    /// Media frames held internally but not yet emitted — position correction.
+    fn latency_media_frames(&self, params: &PlaybackParams) -> usize {
+        match StageKind::of(params) {
+            StageKind::Pass => 0,
+            StageKind::Tape => self.tape.latency_frames(params.tempo_ratio),
+            StageKind::R3 => self.rb.latency_frames(params.tempo_ratio),
+        }
+    }
+
+    /// Emit the end-of-stream tail of the active stage (decoder EOF).
+    fn drain(&mut self, params: &PlaybackParams, out: &mut Vec<f32>) {
+        match StageKind::of(params) {
+            StageKind::Pass => {}
+            StageKind::Tape => self.tape.drain(out),
+            StageKind::R3 => self.rb.drain(out),
+        }
+    }
+}
+
 /// Swappable streaming pitch/tempo/formant engine. The consumer-side stretcher
 /// thread drives one implementation; `render_offline` drives the same trait so
-/// offline renders exercise the identical DSP. First implementation: the
-/// granular OLA shifter above; a future phase plugs in Signalsmith Stretch.
+/// offline renders exercise the identical DSP. Implementation: Rubber Band
+/// v4.0.0, R3 "finer" engine, real-time mode (see `RubberBandStage` above).
 pub trait PitchStage: Send {
     /// Feed interleaved-stereo `input`, appending interleaved-stereo frames to
     /// `out`. Input is buffered internally; `out` is expected to be empty on
@@ -860,47 +1165,9 @@ pub trait PitchStage: Send {
     /// Source frames currently held by the engine that have not yet been
     /// emitted to `out` — for position-display correction only.
     fn latency_frames(&self, tempo: f32) -> usize;
-}
-
-impl PitchStage for RealTimePitchShifter {
-    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        RealTimePitchShifter::process(self, input, out)
-    }
-    fn set_pitch(&mut self, semitones: f32) {
-        RealTimePitchShifter::set_pitch(self, semitones)
-    }
-    fn set_tempo(&mut self, ratio: f32) {
-        RealTimePitchShifter::set_tempo(self, ratio)
-    }
-    fn set_formant(&mut self, preserve: bool) {
-        RealTimePitchShifter::set_formant(self, preserve)
-    }
-    fn reset(&mut self) {
-        RealTimePitchShifter::reset(self)
-    }
-    fn latency_frames(&self, tempo: f32) -> usize {
-        // inq is source-domain; stq is stretched-domain (stretched = src * r/t).
-        let stq_src = (self.stq.len() / 2) as f64 * tempo as f64 / self.pitch_ratio();
-        self.inq.len() / 2 + stq_src as usize
-    }
-}
-
-fn cubic_q(q: &VecDeque<f32>, i0: usize, frac: f32, c: usize) -> f32 {
-    let at = |i: isize| -> f32 {
-        if i < 0 {
-            0.0
-        } else {
-            q.get(i as usize * 2 + c).copied().unwrap_or(0.0)
-        }
-    };
-    let p0 = at(i0 as isize - 1);
-    let p1 = at(i0 as isize);
-    let p2 = at(i0 as isize + 1);
-    let p3 = at(i0 as isize + 2);
-    let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
-    let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
-    let cc = -0.5 * p0 + 0.5 * p2;
-    ((a * frac + b) * frac + cc) * frac + p1
+    /// Emit the end-of-stream tail (decoder EOF). After this, the engine holds
+    /// no more pending audio.
+    fn drain(&mut self, out: &mut Vec<f32>);
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +1177,27 @@ fn cubic_q(q: &VecDeque<f32>, i0: usize, frac: f32, c: usize) -> f32 {
 enum Engine {
     None,
     Ffmpeg(*mut c_void),
+    /// Owned by the decoder thread exclusively (`TrackerEngine: Send`, single
+    /// owner handoff). The cpal callback and UI never touch libopenmpt.
+    Openmpt(crate::tracker::TrackerEngine),
+    /// FluidSynth MIDI engine — same single-owner contract as `Openmpt`
+    /// (`MidiEngine` is `!Send` by construction; created inside the decoder
+    /// thread at open, never shared).
+    Midi(crate::midi::MidiEngine),
+}
+
+fn effective_params_for_engine(engine: &Engine, params: PlaybackParams) -> PlaybackParams {
+    if matches!(engine, Engine::Openmpt(_) | Engine::Midi(_)) {
+        params.for_native_source()
+    } else {
+        params
+    }
+}
+
+fn publish_decoder_params(sh: &Shared, engine: &Engine, requested: PlaybackParams) {
+    let effective = effective_params_for_engine(engine, requested);
+    *sh.params.lock().unwrap() = effective;
+    sh.params_gen.fetch_add(1, Ordering::SeqCst);
 }
 
 fn close_engine(engine: &mut Engine) {
@@ -918,6 +1206,7 @@ fn close_engine(engine: &mut Engine) {
             unsafe { sa_ffmpeg_close(*h) };
         }
     }
+    // Engine::Openmpt drops TrackerEngine → openmpt_module_destroy.
     *engine = Engine::None;
 }
 
@@ -1027,14 +1316,29 @@ fn decoder_thread(
     sh: Shared,
 ) {
     let mut engine = Engine::None;
-    let mut params = PlaybackParams::default();
-    let mut step = 1.0f64;
+    let mut requested_params = *sh.params.lock().unwrap();
+
+    // Source-ring geometry for the native high-water gate. The decoder sees only
+    // FREE space, so occupancy needs the total capacity: read it from the ring
+    // itself and check it against the allocation constant. A stale constant
+    // would silently understate the backlog (the exact bug this gate fixes),
+    // so the mismatch is fatal instead.
+    let src_ring_frames = producer.buffer().capacity() / out_ch;
+    assert_eq!(
+        src_ring_frames,
+        out_rate as usize * RING_SECONDS,
+        "source ring capacity disagrees with RING_SECONDS"
+    );
+    let native_high_water = (out_rate as f64 * NATIVE_HIGH_WATER_SECS) as usize;
 
     // FFmpeg state.
     let mut in_buf: Vec<f32> = Vec::new();
     let mut read_pos = 0.0f64;
     let mut eof = false;
     let mut tmp = vec![0.0f32; 8192 * 2];
+    // Planar scratch for the MIDI engine (render is de-interleaved).
+    let mut midi_l = vec![0.0f32; CHUNK_FRAMES];
+    let mut midi_r = vec![0.0f32; CHUNK_FRAMES];
 
     // Scratch buffers reused across iterations.
     let mut raw: Vec<f32> = Vec::new();
@@ -1060,6 +1364,7 @@ fn decoder_thread(
         let mut latest_load: Option<PathBuf> = None;
         let mut latest_seek: Option<f64> = None;
         let mut latest_params: Option<PlaybackParams> = None;
+        let mut latest_soundfont: Option<PathBuf> = None;
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Cmd::Load(p) => {
@@ -1072,32 +1377,95 @@ fn decoder_thread(
                 Cmd::SetParams(p) => {
                     latest_params = Some(p);
                 }
+                Cmd::SetSoundfont(p) => {
+                    latest_soundfont = Some(p);
+                }
             }
         }
         if let Some(p) = latest_params {
-            params = p;
-            step = compute_step(&params);
-            // Publish to the stretcher thread; it applies pitch/tempo at the
-            // audible edge and reports the actual change latency.
-            *sh.params.lock().unwrap() = params;
-            sh.params_gen.fetch_add(1, Ordering::SeqCst);
+            requested_params = p;
+            // Keep the requested audio-page values across source switches;
+            // only the published effective set is neutralized for native
+            // engines. This must not depend on the UI's current-file timing.
+            publish_decoder_params(&sh, &engine, requested_params);
+            // Native tracker parameters are decoder-side: applied to the
+            // libopenmpt module directly. A native tempo change also changes
+            // the output-timeline duration, so total_frames follows.
+            if let Engine::Openmpt(eng) = &mut engine {
+                if eng.params() != p.tracker {
+                    if let Err(e) = eng.apply_params(p.tracker) {
+                        eprintln!("[audio] native tracker params rejected: {e}");
+                    } else if let Some(dur) = eng.duration_secs() {
+                        sh.total_frames
+                            .store((dur * out_rate as f64) as u64, Ordering::SeqCst);
+                    }
+                }
+            }
+            // Native MIDI parameters are decoder-side too — transpose, BPM
+            // override and the metronome all apply live (no restart); a BPM
+            // change rescales the output timeline, so total_frames follows.
+            if let Engine::Midi(eng) = &mut engine {
+                let mp = p.midi;
+                if eng.transpose() != mp.transpose_semitones {
+                    eng.set_transpose(mp.transpose_semitones);
+                }
+                if eng.bpm_override() != mp.bpm_override {
+                    eng.set_bpm(mp.bpm_override);
+                }
+                if eng.metronome() != mp.metronome {
+                    eng.set_metronome(mp.metronome);
+                }
+                sh.total_frames
+                    .store((eng.duration() * out_rate as f64) as u64, Ordering::SeqCst);
+            }
+        }
+        if let Some(p) = latest_soundfont {
+            match &mut engine {
+                Engine::Midi(eng) => match eng.set_soundfont(&p) {
+                    Ok(()) => {
+                        *sh.soundfont.lock().unwrap() = p;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[audio] SoundFont switch to {} failed ({e}) — keeping {}",
+                            p.display(),
+                            sh.soundfont.lock().unwrap().display()
+                        );
+                    }
+                },
+                _ => {
+                    *sh.soundfont.lock().unwrap() = p;
+                }
+            }
         }
         if let Some(p) = latest_load {
             let t0 = Instant::now();
             load_path = p.clone();
             load_t0 = Some(t0);
             first_chunk_logged = false;
-            meta_pending = true;
             in_buf.clear();
             read_pos = 0.0;
             eof = false;
             silence = false;
             tone_hz = None;
-            open_ffmpeg(&mut engine, &p, out_rate, &params, &mut step, &sh);
+            if crate::tracker::is_tracker_file(&p) {
+                // libopenmpt reads metadata in-memory at create; publish at open.
+                meta_pending = false;
+                open_tracker(&mut engine, &p, out_rate, &sh);
+            } else if crate::midi::is_midi_file(&p) {
+                // FluidSynth parses the whole SMF at create; publish at open.
+                meta_pending = false;
+                open_midi(&mut engine, &p, out_rate, &sh);
+            } else {
+                // FFmpeg metadata follows the first decoded chunk.
+                meta_pending = true;
+                open_ffmpeg(&mut engine, &p, out_rate, &sh);
+            }
+            publish_decoder_params(&sh, &engine, requested_params);
         }
         if let Some(secs) = latest_seek {
-            if let Engine::Ffmpeg(handle) = engine {
-                if !handle.is_null() {
+            match &mut engine {
+                Engine::Ffmpeg(handle) if !handle.is_null() => {
                     // The stretcher re-bases its position accounting from this
                     // before it drains the rings on the flush below.
                     sh.seek_target
@@ -1105,7 +1473,7 @@ fn decoder_thread(
                     let flush_target = pre_load(&sh);
                     sh.decoder_eof.store(false, Ordering::Release);
                     sh.track_ended.store(false, Ordering::Release);
-                    let ok = unsafe { sa_ffmpeg_seek(handle, secs) };
+                    let ok = unsafe { sa_ffmpeg_seek(*handle, secs) };
                     in_buf.clear();
                     read_pos = 0.0;
                     eof = false;
@@ -1115,6 +1483,37 @@ fn decoder_thread(
                     sh.flushing.store(false, Ordering::SeqCst);
                     sh.transport_gen.fetch_add(1, Ordering::SeqCst);
                 }
+                Engine::Openmpt(eng) => {
+                    sh.seek_target
+                        .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
+                    let flush_target = pre_load(&sh);
+                    sh.decoder_eof.store(false, Ordering::Release);
+                    sh.track_ended.store(false, Ordering::Release);
+                    if let Err(e) = eng.seek(secs) {
+                        eprintln!("[audio] tracker seek rejected: {e}");
+                    }
+                    eof = false;
+                    wait_flush_ack(&sh, flush_target);
+                    sh.fade_out.store(false, Ordering::SeqCst);
+                    sh.flushing.store(false, Ordering::SeqCst);
+                    sh.transport_gen.fetch_add(1, Ordering::SeqCst);
+                }
+                Engine::Midi(eng) => {
+                    sh.seek_target
+                        .store((secs * out_rate as f64) as u64, Ordering::SeqCst);
+                    let flush_target = pre_load(&sh);
+                    sh.decoder_eof.store(false, Ordering::Release);
+                    sh.track_ended.store(false, Ordering::Release);
+                    // Engine clamps to 0..=duration; a seek after EOF restarts
+                    // the player internally.
+                    eng.seek(secs);
+                    eof = false;
+                    wait_flush_ack(&sh, flush_target);
+                    sh.fade_out.store(false, Ordering::SeqCst);
+                    sh.flushing.store(false, Ordering::SeqCst);
+                    sh.transport_gen.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
             }
         }
 
@@ -1137,7 +1536,22 @@ fn decoder_thread(
             thread::sleep(Duration::from_millis(3));
             continue;
         }
-        let cap = free_frames.min(CHUNK_FRAMES);
+        let mut cap = free_frames.min(CHUNK_FRAMES);
+
+        // Native high-water: `producer.slots()` is FREE space, so occupancy is
+        // capacity minus free. Derived from the live ring state each pass, it
+        // automatically accounts for audio still buffered across a track
+        // open / engine switch whose pre-load flush ack raced the 30 ms
+        // deadline: rendering simply waits until the stale backlog drains
+        // below the mark (it keeps playing — nothing is dropped).
+        if matches!(engine, Engine::Openmpt(_) | Engine::Midi(_)) {
+            let occupied = src_ring_frames - free_frames;
+            if occupied >= native_high_water {
+                thread::sleep(Duration::from_millis(3));
+                continue;
+            }
+            cap = cap.min(native_high_water - occupied);
+        }
 
         raw.clear();
         let produced: usize;
@@ -1200,7 +1614,7 @@ fn decoder_thread(
                 }
 
                 let avail = in_buf.len() / 2;
-                produced = produce_ffmpeg(&in_buf, avail, cap, &mut read_pos, step, params.hq, &mut raw);
+                produced = copy_frames(&in_buf, avail, cap, &mut read_pos, &mut raw);
 
                 if read_pos > 32768.0 {
                     let consumed = read_pos.floor() as usize;
@@ -1214,6 +1628,95 @@ fn decoder_thread(
                     sh.decoder_eof.store(true, Ordering::Release);
                     thread::sleep(Duration::from_millis(5));
                     continue;
+                }
+            }
+            Engine::Openmpt(eng) => {
+                // Native loop follows the shared loop intent; libopenmpt loops
+                // pattern-accurately, so no seam crossfade is needed (that is
+                // FFmpeg-encoder-padding surgery only).
+                let want_loop = sh.loop_enabled.load(Ordering::Relaxed);
+                if eng.looping() != want_loop {
+                    if let Err(e) = eng.set_loop(want_loop) {
+                        eprintln!("[audio] tracker set_loop({want_loop}) failed: {e}");
+                    }
+                }
+                // EOF with loop enabled after the fact: rewind explicitly — a
+                // repeat_count set after the song ended stays ended.
+                if eof {
+                    if want_loop {
+                        sh.decoder_eof.store(false, Ordering::Release);
+                        if let Err(e) = eng.seek(0.0) {
+                            eprintln!("[audio] tracker loop rewind failed: {e}");
+                        }
+                        eof = false;
+                    } else {
+                        sh.decoder_eof.store(true, Ordering::Release);
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
+                let frames = cap.min(tmp.len() / 2);
+                let n = eng.render(&mut tmp[..frames * 2]);
+                if !first_chunk_logged && n > 0 {
+                    first_chunk_logged = true;
+                    if let Some(t0) = load_t0 {
+                        println!(
+                            "[audio] first samples rendered in {:.1} ms for {}",
+                            t0.elapsed().as_secs_f64() * 1000.0,
+                            load_path.display()
+                        );
+                    }
+                }
+                if n == 0 {
+                    eof = true;
+                    produced = 0;
+                } else {
+                    raw.extend_from_slice(&tmp[..n * 2]);
+                    produced = n;
+                }
+            }
+            Engine::Midi(eng) => {
+                // Loop intent mirrors the tracker arm: the player loops inside
+                // FluidSynth (tick-accurate), so no seam surgery. Loop enabled
+                // after EOF: rewind explicitly — a loop set after the song
+                // ended stays ended.
+                let want_loop = sh.loop_enabled.load(Ordering::Relaxed);
+                if eng.looping() != want_loop {
+                    eng.set_loop(want_loop);
+                }
+                if eng.eof() {
+                    if want_loop {
+                        sh.decoder_eof.store(false, Ordering::Release);
+                        eng.seek(0.0);
+                        eof = false;
+                    } else {
+                        sh.decoder_eof.store(true, Ordering::Release);
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
+                let frames = cap.min(midi_l.len());
+                let n = eng.render(&mut midi_l[..frames], &mut midi_r[..frames]);
+                if !first_chunk_logged && n > 0 {
+                    first_chunk_logged = true;
+                    if let Some(t0) = load_t0 {
+                        println!(
+                            "[audio] first samples rendered in {:.1} ms for {}",
+                            t0.elapsed().as_secs_f64() * 1000.0,
+                            load_path.display()
+                        );
+                    }
+                }
+                if n == 0 {
+                    // eof latched inside the engine (timeline + tail drained)
+                    eof = true;
+                    produced = 0;
+                } else {
+                    for i in 0..n {
+                        raw.push(midi_l[i]);
+                        raw.push(midi_r[i]);
+                    }
+                    produced = n;
                 }
             }
             Engine::None => {
@@ -1254,6 +1757,8 @@ fn decoder_thread(
                     *sh.meta.lock().unwrap() = Some(m);
                 }
             }
+            // Engine::Openmpt publishes its metadata at open (open_tracker) —
+            // libopenmpt reads everything in-memory during create.
         }
     }
 }
@@ -1268,10 +1773,10 @@ fn decoder_thread(
 /// the speakers, parameter changes become audible within one buffer fill — no
 /// flush, no fade, and the 8 s decode buffer stays valid.
 ///
-/// Runs on its own thread rather than inside the cpal callback: the OLA stage
-/// uses VecDeque/Vec scratch (allocation on growth) and a future engine
-/// (Signalsmith Stretch) has heavier setup, while an 80 ms output ring absorbs
-/// any scheduling hiccup that would glitch a true RT callback.
+/// Runs on its own thread rather than inside the cpal callback: Rubber Band's
+/// R3 engine has non-trivial per-block compute and heap use, while an 80 ms
+/// output ring absorbs any scheduling hiccup that would glitch a true RT
+/// callback.
 fn stretcher_thread(
     mut src: rtrb::Consumer<f32>,
     mut out: rtrb::Producer<f32>,
@@ -1279,7 +1784,7 @@ fn stretcher_thread(
     out_ch: usize,
     sh: Shared,
 ) {
-    let mut stage: Box<dyn PitchStage> = Box::new(RealTimePitchShifter::new(out_rate));
+    let mut chain = PitchChain::new(out_rate);
     let mut params = PlaybackParams::default();
     let mut seen_gen = sh.params_gen.load(Ordering::Acquire);
     let mut seen_flush = sh.flush_gen.load(Ordering::Acquire);
@@ -1304,12 +1809,12 @@ fn stretcher_thread(
             seen_gen = g;
             let p = *sh.params.lock().unwrap();
             if p != params {
-                let pending = out_produced
-                    .saturating_sub(sh.out_played.load(Ordering::Relaxed));
+                let pending = out_produced.saturating_sub(sh.out_played.load(Ordering::Relaxed));
                 eprintln!(
-                    "[latency] pitch={:+.1} tempo={:.2} applied; {:.0} ms of processed audio buffered ahead",
+                    "[latency] pitch={:+.1} tempo={:.2}{} applied; {:.0} ms of processed audio buffered ahead",
                     p.pitch_semitones,
                     p.tempo_ratio,
+                    if p.mode_tape { " tape" } else { "" },
                     pending as f64 / out_rate as f64 * 1000.0
                 );
             }
@@ -1321,7 +1826,9 @@ fn stretcher_thread(
         if f != seen_flush {
             seen_flush = f;
             while src.pop().is_ok() {}
-            stage.reset();
+            chain.rb.reset();
+            chain.tape.reset();
+            chain.kind = StageKind::Pass;
             scratch.clear();
             carry.clear();
             base = sh.seek_target.load(Ordering::Acquire);
@@ -1332,10 +1839,6 @@ fn stretcher_thread(
             sh.frames_played.store(base, Ordering::Release);
             sh.stage_ack.store(f, Ordering::Release);
         }
-
-        let neutral =
-            params.pitch_semitones.abs() < 1e-4 && (params.tempo_ratio - 1.0).abs() < 1e-4;
-        let bypass = params.mode_tape || neutral;
 
         // Older carry goes out first (counted — it is audible output too).
         out_produced += push_frames_fit(&mut out, &mut carry, out_ch) as u64;
@@ -1354,14 +1857,11 @@ fn stretcher_thread(
             let frames = scratch.len() / 2;
             if frames > 0 {
                 did_work = true;
-                media_consumed += frames as f64 * compute_step(&params);
-                if bypass {
-                    carry.extend_from_slice(&scratch);
-                } else {
-                    let src_out: &[f32] =
-                        apply_pitch_stage(&params, stage.as_mut(), &scratch, &mut post);
-                    carry.extend_from_slice(src_out);
-                }
+                // Ring frames are raw media frames in every mode (tape
+                // resamples downstream at the audible edge) — 1:1 accounting.
+                media_consumed += frames as f64;
+                let src_out = chain.process(&params, &scratch, &mut post);
+                carry.extend_from_slice(src_out);
                 out_produced += push_frames_fit(&mut out, &mut carry, out_ch) as u64;
             }
         }
@@ -1369,12 +1869,10 @@ fn stretcher_thread(
         // Input dry: either idle, or end-of-track draining.
         if !did_work && carry.is_empty() {
             if sh.decoder_eof.load(Ordering::Acquire) && src.slots() == 0 && !eof_seen {
-                if !bypass {
-                    post.clear();
-                    stage.process(&[], &mut post);
-                    carry.extend_from_slice(&post);
-                    out_produced += push_frames_fit(&mut out, &mut carry, out_ch) as u64;
-                }
+                post.clear();
+                chain.drain(&params, &mut post);
+                carry.extend_from_slice(&post);
+                out_produced += push_frames_fit(&mut out, &mut carry, out_ch) as u64;
                 if carry.is_empty() {
                     eof_seen = true;
                     sh.stage_eof.store(true, Ordering::Release);
@@ -1385,7 +1883,7 @@ fn stretcher_thread(
         }
 
         // --- Publish the audible media position. -----------------------------
-        // Everything pulled but not yet heard: engine-internal latency (source
+        // Everything pulled but not yet heard: stage-internal latency (media
         // frames) plus carry + output-ring fill (output frames -> media via
         // the effective output/media rate).
         let played = sh.out_played.load(Ordering::Relaxed);
@@ -1395,17 +1893,14 @@ fn stretcher_thread(
         } else {
             params.tempo_ratio as f64
         };
-        let lat_media = if bypass {
-            0.0
-        } else {
-            stage.latency_frames(params.tempo_ratio) as f64
-        };
+        let lat_media = chain.latency_media_frames(&params) as f64;
         let pos = base as f64 + media_consumed - lat_media - pending * eff;
-        sh.frames_played.store(pos.max(base as f64) as u64, Ordering::Release);
+        sh.frames_played
+            .store(pos.max(base as f64) as u64, Ordering::Release);
 
-        // Anomaly trace (1 Hz): the stage is active, source is available, but
+        // Anomaly trace (1 Hz): a stage is active, source is available, but
         // nothing is queued ahead — the callback is running on fumes.
-        if !bypass
+        if StageKind::of(&params) != StageKind::Pass
             && pending == 0.0
             && src.slots() > 0
             && sh.playing.load(Ordering::Relaxed)
@@ -1413,11 +1908,10 @@ fn stretcher_thread(
         {
             last_trace = Instant::now();
             eprintln!(
-                "[stretch] starving: out_produced={} played={} carry={}f lat={}f src={}f",
+                "[stretch] starving: out_produced={} played={} carry={}f src={}f",
                 out_produced,
                 played,
                 carry.len() / 2,
-                stage.latency_frames(params.tempo_ratio),
                 src.slots() / out_ch
             );
         }
@@ -1428,15 +1922,14 @@ fn stretcher_thread(
     }
 }
 
-
-/// Produce up to `cap` interleaved-stereo frames by resampling `in_buf`.
-fn produce_ffmpeg(
+/// Copy up to `cap` interleaved-stereo frames from `in_buf` starting at the
+/// fractional `read_pos`. All pitch/tempo shaping (tape resampling included)
+/// happens downstream at the audible edge, so this is a plain 1:1 advance.
+fn copy_frames(
     in_buf: &[f32],
     avail: usize,
     cap: usize,
     read_pos: &mut f64,
-    step: f64,
-    hq: bool,
     raw: &mut Vec<f32>,
 ) -> usize {
     let mut produced = 0usize;
@@ -1445,43 +1938,12 @@ fn produce_ffmpeg(
         if i0 + 1 >= avail {
             break;
         }
-        let frac = (*read_pos - i0 as f64) as f32;
-        for c in 0..2 {
-            let v = if step == 1.0 {
-                frame_at(in_buf, i0 as isize, c)
-            } else if hq {
-                sinc8(in_buf, i0, frac, c)
-            } else {
-                cubic(in_buf, i0, frac, c)
-            };
-            raw.push(v);
-        }
-        *read_pos += step;
+        raw.push(frame_at(in_buf, i0 as isize, 0));
+        raw.push(frame_at(in_buf, i0 as isize, 1));
+        *read_pos += 1.0;
         produced += 1;
     }
     produced
-}
-
-/// The pitch/tempo/formant stage shared by the consumer-side stretcher thread
-/// and offline rendering (`render_offline`): tape/neutral bypass, or the
-/// streaming `PitchStage`. Returns the interleaved-stereo frames to emit.
-fn apply_pitch_stage<'a>(
-    params: &PlaybackParams,
-    stage: &mut dyn PitchStage,
-    raw: &'a [f32],
-    post: &'a mut Vec<f32>,
-) -> &'a [f32] {
-    let neutral = params.pitch_semitones.abs() < 1e-4 && (params.tempo_ratio - 1.0).abs() < 1e-4;
-    if params.mode_tape || neutral {
-        raw
-    } else {
-        stage.set_pitch(params.pitch_semitones);
-        stage.set_tempo(params.tempo_ratio);
-        stage.set_formant(params.formant_preserve);
-        post.clear();
-        stage.process(raw, post);
-        post
-    }
 }
 
 /// Push as many interleaved-stereo frames of `src` as fit; the remainder stays
@@ -1498,14 +1960,7 @@ fn push_frames_fit(producer: &mut rtrb::Producer<f32>, src: &mut Vec<f32>, out_c
     fits
 }
 
-fn open_ffmpeg(
-    engine: &mut Engine,
-    path: &Path,
-    out_rate: u32,
-    params: &PlaybackParams,
-    step: &mut f64,
-    sh: &Shared,
-) {
+fn open_ffmpeg(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
     close_engine(engine);
     // New track: the stretcher re-bases its position accounting to zero when
     // it services the flush below.
@@ -1527,9 +1982,184 @@ fn open_ffmpeg(
 
     *sh.current.lock().unwrap() = Some(path.to_path_buf());
     *sh.meta.lock().unwrap() = None;
-    *step = compute_step(params);
     *engine = Engine::Ffmpeg(handle);
     post_load(sh, total, flush_target);
+}
+
+/// Map libopenmpt's module metadata onto the UI's `TrackMetadata` (the FFmpeg
+/// shape — same fields the player window renders, no cover art).
+fn tracker_track_metadata(
+    path: &Path,
+    md: &crate::tracker::TrackerMetadata,
+    out_rate: u32,
+    duration_secs: Option<f64>,
+) -> TrackMetadata {
+    let dur = duration_secs.unwrap_or(0.0);
+    // libopenmpt reports no bitrate; derive one from file size over duration
+    // so the UI's kbps readout is real rather than zero.
+    let bitrate = if dur > 0.0 {
+        (md.file_size_bytes as f64 * 8.0 / dur / 1000.0).round() as i32
+    } else {
+        0
+    };
+    // Honest filename fallback: modules with no title tag show the file stem,
+    // never an invented name.
+    let title = if md.title.trim().is_empty() {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string()
+    } else {
+        md.title.clone()
+    };
+    TrackMetadata {
+        title,
+        artist: md.artist.clone(),
+        album: String::new(),
+        genre: String::new(),
+        codec: md.format.clone(),
+        format: if md.container.is_empty() {
+            md.format.clone()
+        } else {
+            md.container.clone()
+        },
+        codec_long_name: md.format_long.clone(),
+        format_long_name: md.tracker.clone(),
+        duration: dur,
+        bitrate,
+        sample_rate: out_rate as i32,
+        channels: 2,
+        bits_per_sample: 32,
+        has_cover_art: false,
+        cover_rgba: None,
+        file_size_bytes: md.file_size_bytes,
+    }
+}
+
+/// Open a tracker module on the decoder thread. Native loop state and the
+/// pending native parameter set (the locked-across-tracks case — `SetParams`
+/// is queued before `Load` and already published to `sh.params`) are applied
+/// to the fresh module before any audio flows.
+fn open_tracker(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
+    close_engine(engine);
+    sh.seek_target.store(0, Ordering::SeqCst);
+    let flush_target = pre_load(sh);
+
+    *sh.current.lock().unwrap() = Some(path.to_path_buf());
+    *sh.meta.lock().unwrap() = None;
+
+    match crate::tracker::TrackerEngine::open(path, out_rate) {
+        Ok(mut eng) => {
+            let params = *sh.params.lock().unwrap();
+            if let Err(e) = eng.apply_params(params.tracker) {
+                eprintln!("[audio] native tracker params rejected at open: {e}");
+            }
+            if let Err(e) = eng.set_loop(sh.loop_enabled.load(Ordering::Relaxed)) {
+                eprintln!("[audio] tracker set_loop at open failed: {e}");
+            }
+            let meta = tracker_track_metadata(path, eng.metadata(), out_rate, eng.duration_secs());
+            // u64::MAX marks a module with no finite end (the tone source uses
+            // the same marker); at_track_end then never fires.
+            let total = eng
+                .duration_secs()
+                .map(|d| (d * out_rate as f64) as u64)
+                .unwrap_or(u64::MAX);
+            *sh.meta.lock().unwrap() = Some(meta);
+            *engine = Engine::Openmpt(eng);
+            post_load(sh, total, flush_target);
+        }
+        Err(e) => {
+            eprintln!("[audio] libopenmpt open failed for {}: {e}", path.display());
+            *engine = Engine::None;
+            post_load(sh, 0, flush_target);
+        }
+    }
+}
+
+/// Map the parsed SMF onto the UI's `TrackMetadata`. SMF carries no title/
+/// artist tags in a form this app parses, so the title is the honest filename
+/// fallback — never an invented name. Duration is the ACTIVE engine timeline
+/// (native tempo map, or the override at open).
+fn midi_track_metadata(
+    path: &Path,
+    info: &crate::midi::SmfInfo,
+    duration_secs: f64,
+    out_rate: u32,
+) -> TrackMetadata {
+    let file_size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // Same derived-bitrate convention as the tracker card: byte rate of the
+    // source file over its rendered duration.
+    let bitrate = if duration_secs > 0.0 {
+        (file_size_bytes as f64 * 8.0 / duration_secs / 1000.0).round() as i32
+    } else {
+        0
+    };
+    TrackMetadata {
+        title: path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("MIDI")
+            .to_string(),
+        artist: String::new(),
+        album: String::new(),
+        genre: String::new(),
+        codec: path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mid")
+            .to_lowercase(),
+        format: format!("SMF format {}", info.format),
+        codec_long_name: format!(
+            "Standard MIDI File · {} track{} · {} PPQ",
+            info.track_count,
+            if info.track_count == 1 { "" } else { "s" },
+            info.ppq
+        ),
+        format_long_name: "FluidSynth SoundFont synthesis".to_string(),
+        duration: duration_secs,
+        bitrate,
+        sample_rate: out_rate as i32,
+        channels: 2,
+        bits_per_sample: 32,
+        has_cover_art: false,
+        cover_rgba: None,
+        file_size_bytes,
+    }
+}
+
+/// Open a MIDI file on the decoder thread. The pending native parameter set
+/// (the locked-across-tracks case) and the loop intent are applied before any
+/// audio flows; the SoundFont comes from `sh.soundfont` (last published).
+fn open_midi(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
+    close_engine(engine);
+    sh.seek_target.store(0, Ordering::SeqCst);
+    let flush_target = pre_load(sh);
+
+    *sh.current.lock().unwrap() = Some(path.to_path_buf());
+    *sh.meta.lock().unwrap() = None;
+
+    let soundfont = sh.soundfont.lock().unwrap().clone();
+    match crate::midi::MidiEngine::open(path, out_rate, &soundfont) {
+        Ok(mut eng) => {
+            let params = *sh.params.lock().unwrap();
+            eng.apply_params(params.midi);
+            eng.set_loop(sh.loop_enabled.load(Ordering::Relaxed));
+            let dur = eng.duration();
+            let meta = midi_track_metadata(path, eng.info(), dur, out_rate);
+            *sh.meta.lock().unwrap() = Some(meta);
+            *engine = Engine::Midi(eng);
+            post_load(sh, (dur * out_rate as f64) as u64, flush_target);
+        }
+        Err(e) => {
+            eprintln!(
+                "[audio] FluidSynth open failed for {} (font {}): {e}",
+                path.display(),
+                soundfont.display()
+            );
+            *engine = Engine::None;
+            post_load(sh, 0, flush_target);
+        }
+    }
 }
 
 fn compute_step(p: &PlaybackParams) -> f64 {
@@ -1599,13 +2229,7 @@ fn sinc8(buf: &[f32], i0: usize, frac: f32, ch: usize) -> f32 {
 }
 
 /// Push one chunk of muted tone samples (UI/pipeline test signal).
-fn push_tone(
-    producer: &mut rtrb::Producer<f32>,
-    sh: &Shared,
-    _hz: f32,
-    _rate: u32,
-    out_ch: usize,
-) {
+fn push_tone(producer: &mut rtrb::Producer<f32>, sh: &Shared, _hz: f32, _rate: u32, out_ch: usize) {
     sh.total_frames.store(u64::MAX, Ordering::Relaxed);
     let free_frames = producer.slots() / out_ch;
     let n = free_frames.min(CHUNK_FRAMES);
@@ -1660,85 +2284,238 @@ fn write_wav_f32(path: &Path, rate: u32, ch: u16, samples: &[f32]) -> Result<(),
     std::fs::write(path, &w).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// Render `path` through the exact live DSP path — FFmpeg decode → tape-mode
-/// Lanczos resample (`compute_step`) → `RealTimePitchShifter` via
-/// `apply_pitch_stage` — as fast as the CPU allows, with no audio device and
-/// no ring buffer, and write a float32 WAV. `limit_secs` caps the decoded
-/// input duration (for long files under test).
+/// Raw-stereo chunk source for offline rendering: FFmpeg file decode,
+/// native libopenmpt render or native FluidSynth render. One shared
+/// processing loop consumes all three, so a rendered tracker or MIDI file
+/// passes through the exact shared post chain (tape/Rubber Band) that live
+/// playback uses.
+enum OfflineDecoder {
+    Ffmpeg {
+        handle: *mut c_void,
+        in_buf: Vec<f32>,
+        read_pos: f64,
+        eof: bool,
+        tmp: Vec<f32>,
+        in_frames_read: u64,
+        in_limit_frames: Option<u64>,
+    },
+    Openmpt {
+        eng: crate::tracker::TrackerEngine,
+        tmp: Vec<f32>,
+        limit_secs: Option<f64>,
+    },
+    Midi {
+        eng: crate::midi::MidiEngine,
+        left: Vec<f32>,
+        right: Vec<f32>,
+        /// Rendered-seconds cap (the timeline, not the engine's tail).
+        rendered_secs: f64,
+        limit_secs: Option<f64>,
+    },
+}
+
+impl OfflineDecoder {
+    /// Fill `raw` with up to `cap` interleaved-stereo frames. Returns the
+    /// frame count produced; `0` means the source is exhausted.
+    fn next_chunk(&mut self, cap: usize, raw: &mut Vec<f32>) -> usize {
+        match self {
+            Self::Ffmpeg {
+                handle,
+                in_buf,
+                read_pos,
+                eof,
+                tmp,
+                in_frames_read,
+                in_limit_frames,
+            } => {
+                let h = *handle;
+                loop {
+                    let want_in = read_pos.ceil() as usize + LOOKAHEAD + 1;
+                    while !*eof && in_buf.len() / 2 < want_in {
+                        if let Some(lim) = in_limit_frames {
+                            if *in_frames_read >= *lim {
+                                *eof = true;
+                                break;
+                            }
+                        }
+                        let n = unsafe { sa_ffmpeg_read(h, tmp.as_mut_ptr(), tmp.len() as c_int) };
+                        if n <= 0 {
+                            *eof = true;
+                            break;
+                        }
+                        *in_frames_read += n as u64 / 2;
+                        in_buf.extend_from_slice(&tmp[..n as usize]);
+                    }
+                    let avail = in_buf.len() / 2;
+                    if avail < 2 {
+                        if *eof {
+                            return 0;
+                        }
+                        continue;
+                    }
+                    let produced = copy_frames(in_buf, avail, cap, read_pos, raw);
+                    if *read_pos > 32768.0 {
+                        let consumed = read_pos.floor() as usize;
+                        in_buf.drain(0..consumed * 2);
+                        *read_pos -= consumed as f64;
+                    }
+                    if produced == 0 {
+                        if *eof {
+                            return 0;
+                        }
+                        continue;
+                    }
+                    return produced;
+                }
+            }
+            Self::Openmpt {
+                eng,
+                tmp,
+                limit_secs,
+            } => {
+                if let Some(lim) = limit_secs {
+                    if eng.position_secs() >= *lim {
+                        return 0;
+                    }
+                }
+                let frames = cap.min(tmp.len() / 2);
+                let n = eng.render(&mut tmp[..frames * 2]);
+                raw.extend_from_slice(&tmp[..n * 2]);
+                n
+            }
+            Self::Midi {
+                eng,
+                left,
+                right,
+                rendered_secs,
+                limit_secs,
+            } => {
+                if let Some(lim) = limit_secs {
+                    if *rendered_secs >= *lim {
+                        return 0;
+                    }
+                }
+                let frames = cap.min(left.len()).min(right.len());
+                let n = eng.render(&mut left[..frames], &mut right[..frames]);
+                *rendered_secs += n as f64 / eng.rate() as f64;
+                for i in 0..n {
+                    raw.push(left[i]);
+                    raw.push(right[i]);
+                }
+                n
+            }
+        }
+    }
+}
+
+impl Drop for OfflineDecoder {
+    fn drop(&mut self) {
+        if let Self::Ffmpeg { handle, .. } = self {
+            if !handle.is_null() {
+                unsafe { sa_ffmpeg_close(*handle) };
+            }
+        }
+    }
+}
+
+/// Render `path` through the exact live DSP path — FFmpeg decode, native
+/// libopenmpt render or native FluidSynth render → the `PitchChain` (tape
+/// resampling or Rubber Band R3) at the audible edge — as fast as the CPU
+/// allows, with no audio device and no ring buffer, and write a float32 WAV.
+/// `limit_secs` caps the source duration (for long files under test).
+/// Tracker/MIDI files apply only their native parameter set; shared audio
+/// post-processing is bypassed. `soundfont` is used for MIDI sources only.
 pub fn render_offline(
     path: &Path,
     params: &PlaybackParams,
     out_path: &Path,
     limit_secs: Option<f64>,
     rate: u32,
+    soundfont: &Path,
 ) -> Result<RenderResult, String> {
-    let mut handle: *mut c_void = std::ptr::null_mut();
-    if let Some(c) = path_cstring(path) {
-        handle = unsafe { sa_ffmpeg_open(c.as_ptr(), rate as c_int) };
-    }
-    if handle.is_null() {
-        return Err(format!("FFmpeg open failed for {}", path.display()));
-    }
+    let native_source = crate::tracker::is_tracker_file(path) || crate::midi::is_midi_file(path);
+    let source_params = if native_source {
+        params.for_native_source()
+    } else {
+        *params
+    };
+    let params = &source_params;
+    let (mut dec, in_secs) = if crate::tracker::is_tracker_file(path) {
+        let mut eng = crate::tracker::TrackerEngine::open(path, rate)
+            .map_err(|e| format!("libopenmpt open {}: {e}", path.display()))?;
+        if let Err(e) = eng.apply_params(params.tracker) {
+            return Err(format!("native tracker params: {e}"));
+        }
+        let full = eng.duration_secs().unwrap_or(0.0);
+        (
+            OfflineDecoder::Openmpt {
+                eng,
+                tmp: vec![0.0f32; 8192 * 2],
+                limit_secs,
+            },
+            limit_secs.map(|l| l.min(full)).unwrap_or(full),
+        )
+    } else if crate::midi::is_midi_file(path) {
+        let mut eng = crate::midi::MidiEngine::open(path, rate, soundfont)
+            .map_err(|e| format!("FluidSynth open {}: {e}", path.display()))?;
+        eng.apply_params(params.midi);
+        let full = eng.duration();
+        (
+            OfflineDecoder::Midi {
+                eng,
+                left: vec![0.0f32; 8192],
+                right: vec![0.0f32; 8192],
+                rendered_secs: 0.0,
+                limit_secs,
+            },
+            limit_secs.map(|l| l.min(full)).unwrap_or(full),
+        )
+    } else {
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if let Some(c) = path_cstring(path) {
+            handle = unsafe { sa_ffmpeg_open(c.as_ptr(), rate as c_int) };
+        }
+        if handle.is_null() {
+            return Err(format!("FFmpeg open failed for {}", path.display()));
+        }
+        let full_dur = unsafe { sa_ffmpeg_duration(handle) };
+        let in_secs = limit_secs.map(|l| l.min(full_dur)).unwrap_or(full_dur);
+        (
+            OfflineDecoder::Ffmpeg {
+                handle,
+                in_buf: Vec::new(),
+                read_pos: 0.0,
+                eof: false,
+                tmp: vec![0.0f32; 8192 * 2],
+                in_frames_read: 0,
+                in_limit_frames: limit_secs.map(|l| (l * rate as f64) as u64),
+            },
+            in_secs,
+        )
+    };
 
-    let full_dur = unsafe { sa_ffmpeg_duration(handle) };
-    let in_secs = limit_secs.map(|l| l.min(full_dur)).unwrap_or(full_dur);
-
-    let step = compute_step(params);
-    let mut shifter = RealTimePitchShifter::new(rate);
-
-    let mut in_buf: Vec<f32> = Vec::new();
-    let mut read_pos = 0.0f64;
-    let mut eof = false;
-    let mut tmp = vec![0.0f32; 8192 * 2];
+    let mut chain = PitchChain::new(rate);
     let mut raw: Vec<f32> = Vec::new();
     let mut post: Vec<f32> = Vec::new();
     let mut pcm: Vec<f32> = Vec::new();
 
-    let in_limit_frames = limit_secs.map(|l| (l * rate as f64) as u64);
-    let mut in_frames_read: u64 = 0;
-
     loop {
         raw.clear();
-        let want_in = read_pos.ceil() as usize + LOOKAHEAD + 1;
-        while !eof && in_buf.len() / 2 < want_in {
-            if let Some(lim) = in_limit_frames {
-                if in_frames_read >= lim {
-                    eof = true;
-                    break;
-                }
-            }
-            let n = unsafe { sa_ffmpeg_read(handle, tmp.as_mut_ptr(), tmp.len() as c_int) };
-            if n <= 0 {
-                eof = true;
-                break;
-            }
-            in_frames_read += n as u64 / 2;
-            in_buf.extend_from_slice(&tmp[..n as usize]);
-        }
-        let avail = in_buf.len() / 2;
-        if avail < 2 {
-            if eof {
-                break;
-            }
-            continue;
-        }
-        let produced = produce_ffmpeg(&in_buf, avail, CHUNK_FRAMES, &mut read_pos, step, params.hq, &mut raw);
-        if read_pos > 32768.0 {
-            let consumed = read_pos.floor() as usize;
-            in_buf.drain(0..consumed * 2);
-            read_pos -= consumed as f64;
-        }
+        let produced = dec.next_chunk(CHUNK_FRAMES, &mut raw);
         if produced == 0 {
-            if eof {
-                break;
-            }
-            continue;
+            break;
         }
-        let src = apply_pitch_stage(params, &mut shifter, &raw, &mut post);
+        let src = chain.process(params, &raw, &mut post);
         pcm.extend_from_slice(src);
     }
 
-    unsafe { sa_ffmpeg_close(handle) };
+    // Active stage: emit the tail so the render covers the full input.
+    if StageKind::of(params) != StageKind::Pass {
+        post.clear();
+        chain.drain(params, &mut post);
+        pcm.extend_from_slice(&post);
+    }
+
     write_wav_f32(out_path, rate, 2, &pcm)?;
     Ok(RenderResult {
         in_secs,
@@ -1746,11 +2523,136 @@ pub fn render_offline(
     })
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_source_params_force_shared_post_passthrough() {
+        let params = PlaybackParams {
+            mode_tape: true,
+            pitch_semitones: 12.0,
+            tempo_ratio: 2.0,
+            formant_preserve: true,
+            ..Default::default()
+        };
+        let native = params.for_native_source();
+        assert_eq!(StageKind::of(&native), StageKind::Pass);
+        assert_eq!(native.tracker, params.tracker);
+        assert_eq!(native.midi, params.midi);
+    }
+
+    /// Stage-level quality gate: 3 s of 440 Hz at -9 dBFS at pitch +5
+    /// through `RubberBandStage` with formant shifted (the default mode).
+    /// Guards the R3 wiring end-to-end: deinterleave, ratios, retrieve,
+    /// interleave. True formant preservation legitimately changes a pure
+    /// sine's level (it re-aligns the spectral envelope), so the gate pins
+    /// the shifted mode where a clean +5 semitone tone must come through.
+    #[test]
+    fn r3_stage_pitch_quality_gate() {
+        let rate = 48_000u32;
+        let frames = rate as usize * 3;
+        let f0 = 440.0f64;
+        let semi = 5.0f64;
+        let expect = f0 * 2f64.powf(semi / 12.0);
+
+        let params = PlaybackParams {
+            pitch_semitones: 5.0,
+            tempo_ratio: 1.0,
+            formant_preserve: false,
+            ..Default::default()
+        };
+        // Output-domain pipeline delay for the report (ratio-dependent).
+        {
+            let mut eng = rubberband::Engine::new(
+                rate,
+                2,
+                rubberband::OPTION_PROCESS_REAL_TIME
+                    | rubberband::OPTION_CHANNELS_TOGETHER
+                    | rubberband::OPTION_ENGINE_FINER,
+            );
+            eng.set_time_ratio(1.0);
+            eng.set_pitch_scale(2f64.powf(semi / 12.0));
+            let d_shift = eng.start_delay();
+            eng.set_time_ratio(2.0);
+            let d_stretch = eng.start_delay();
+            eprintln!(
+                "[quality] r3 start delay: {:.1} ms @ pitch+5 tempo1, {:.1} ms @ pitch+5 tempo0.5",
+                d_shift as f64 / rate as f64 * 1000.0,
+                d_stretch as f64 / rate as f64 * 1000.0,
+            );
+        }
+        let mut stage = RubberBandStage::new(rate);
+        let mut mono: Vec<f32> = Vec::new();
+        let mut post: Vec<f32> = Vec::new();
+        let mut phase = 0.0f64;
+        let block = CHUNK_FRAMES;
+        let mut fed = 0usize;
+        while fed < frames {
+            let mut raw = Vec::with_capacity(block * 2);
+            for _ in 0..block {
+                let v = (phase * 2.0 * std::f64::consts::PI).sin() as f32 * 0.35355;
+                phase += f0 / rate as f64;
+                if phase >= 1.0 {
+                    phase -= 1.0;
+                }
+                raw.push(v);
+                raw.push(v);
+            }
+            stage.set_pitch(params.pitch_semitones);
+            stage.set_tempo(params.tempo_ratio);
+            stage.set_formant(params.formant_preserve);
+            post.clear();
+            stage.process(&raw, &mut post);
+            mono.extend(post.chunks_exact(2).map(|f| f[0]));
+            fed += block;
+        }
+        post.clear();
+        stage.drain(&mut post);
+        mono.extend(post.chunks_exact(2).map(|f| f[0]));
+        let n = mono.len();
+        let rms =
+            (mono.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n.max(1) as f64).sqrt();
+        let g = |f: f64| -> f64 {
+            let mid = &mono[(n / 2).min(n.saturating_sub(rate as usize))..];
+            let mid = &mid[..mid.len().min(rate as usize)];
+            if mid.is_empty() {
+                return 0.0;
+            }
+            let k = 2.0 * std::f64::consts::PI * f / rate as f64;
+            let coeff = 2.0 * k.cos();
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &v in mid {
+                let s0 = v as f64 + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            ((s1 * s1 + s2 * s2 - coeff * s1 * s2) / (mid.len() as f64).powi(2)).sqrt()
+        };
+        eprintln!(
+            "[quality] r3 shifted: out={n}f rms={:+.1}dBFS g({expect:.0}Hz)={:.4} g({f0:.0}Hz)={:.4}",
+            20.0 * rms.log10(),
+            g(expect),
+            g(f0),
+        );
+        assert!(
+            mono.iter().all(|v| v.is_finite()),
+            "stage produced non-finite samples"
+        );
+        assert!(n > frames, "stage produced no meaningful output");
+        let rms_db = 20.0 * rms.log10();
+        assert!(rms_db > -16.0, "output level collapsed: {rms_db:.1} dBFS");
+        assert!(
+            g(expect) > 0.12,
+            "shifted tone missing: g({expect:.0}Hz)={:.4}",
+            g(expect)
+        );
+        assert!(
+            g(f0) < 0.005,
+            "residual at original pitch too high: {:.4}",
+            g(f0)
+        );
+    }
 
     #[test]
     fn sinc_passthrough_at_integer_positions() {
@@ -1797,8 +2699,8 @@ mod tests {
     }
 
     #[test]
-    fn pitch_shifter_is_neutral_at_unity_and_preserves_length() {
-        let mut s = RealTimePitchShifter::new(48_000);
+    fn pitch_stage_is_neutral_at_unity_and_preserves_length() {
+        let mut s = RubberBandStage::new(48_000);
         s.set_pitch(0.0);
         s.set_tempo(1.0);
         // A steady 440 Hz sine over ~0.5 s.
@@ -1814,12 +2716,1702 @@ mod tests {
         for chunk in input.chunks(2048) {
             s.process(chunk, &mut out);
         }
-        assert!(out.len() > 0, "shifter produced no output");
         assert!(
             out.iter().all(|v| v.is_finite()),
-            "shifter produced non-finite samples"
+            "stage produced non-finite samples"
+        );
+        let produced = out.len() / 2;
+        assert!(produced > 0, "stage produced no output while streaming");
+        // At unity ratios the stream length must hold within one engine
+        // window (RT mode has no pad/trim compensation).
+        s.drain(&mut out);
+        let total = out.len() / 2;
+        assert!(total >= produced, "drain removed audio");
+        assert!(
+            (total as isize - frames as isize).abs() <= 16_384,
+            "unity stream length not preserved: in {frames} out {total}"
         );
         let energy: f32 = out.iter().map(|v| v * v).sum();
         assert!(energy > 0.0);
+    }
+
+    #[test]
+    fn drain_is_oneshot_until_reset() {
+        let mut s = RubberBandStage::new(48_000);
+        s.set_pitch(5.0);
+        s.set_tempo(1.0);
+        let input = vec![0.1f32; 24_000 * 2];
+        let mut out = Vec::new();
+        for chunk in input.chunks(4096) {
+            s.process(chunk, &mut out);
+        }
+        s.drain(&mut out);
+        let after_first = out.len();
+        assert!(after_first > 0, "streaming + drain produced no audio");
+        // The final-flush drain latches: a second call must not emit more
+        // audio (the stretcher thread's eof_seen depends on it).
+        s.drain(&mut out);
+        assert_eq!(after_first, out.len(), "second drain emitted more audio");
+        s.reset();
+        let mut again = Vec::new();
+        for chunk in input.chunks(4096) {
+            s.process(chunk, &mut again);
+        }
+        s.drain(&mut again);
+        assert!(again.len() > 0, "reset did not re-arm the stage");
+    }
+
+    #[test]
+    fn stretcher_thread_reaches_stage_eof_with_active_engine() {
+        // Regression: an engine whose drain() can emit repeatedly must not
+        // stall the EOF path — stage_eof has to latch once the tail is out.
+        let rate = 48_000u32;
+        let sh = Shared {
+            playing: Arc::new(AtomicBool::new(true)),
+            fade_out: Arc::new(AtomicBool::new(false)),
+            flushing: Arc::new(AtomicBool::new(false)),
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            transport_gen: Arc::new(AtomicU64::new(0)),
+            flush_gen: Arc::new(AtomicU64::new(0)),
+            flush_ack: Arc::new(AtomicU64::new(0)),
+            stage_ack: Arc::new(AtomicU64::new(0)),
+            params: Arc::new(Mutex::new(PlaybackParams {
+                pitch_semitones: 5.0,
+                ..Default::default()
+            })),
+            params_gen: Arc::new(AtomicU64::new(0)),
+            seek_target: Arc::new(AtomicU64::new(0)),
+            out_played: Arc::new(AtomicU64::new(0)),
+            total_frames: Arc::new(AtomicU64::new(0)),
+            frames_played: Arc::new(AtomicU64::new(0)),
+            started: Arc::new(AtomicBool::new(false)),
+            loop_enabled: Arc::new(AtomicBool::new(false)),
+            decoder_eof: Arc::new(AtomicBool::new(false)),
+            stage_eof: Arc::new(AtomicBool::new(false)),
+            track_ended: Arc::new(AtomicBool::new(false)),
+            dsp_enabled: Arc::new(AtomicBool::new(false)),
+            dsp: Arc::new(Mutex::new(DspTap::new(rate))),
+            meta: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+        };
+        let (mut src_prod, src_cons) = RingBuffer::<f32>::new(48_000 * 2);
+        let (out_prod, mut out_cons) = RingBuffer::<f32>::new(4096 * 2);
+        for _ in 0..12_000 {
+            let _ = src_prod.push(0.25);
+            let _ = src_prod.push(-0.25);
+        }
+        drop(src_prod);
+        sh.decoder_eof.store(true, Ordering::Release);
+        {
+            let sh = sh.clone();
+            thread::spawn(move || stretcher_thread(src_cons, out_prod, rate, 2, sh));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sh.stage_eof.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "stage_eof never fired — EOF drain did not terminate"
+            );
+            // Play the role of the cpal callback so the ring keeps draining.
+            while out_cons.pop().is_ok() {}
+            thread::sleep(Duration::from_millis(2));
+        }
+        while out_cons.pop().is_ok() {}
+    }
+
+    /// Build the same `Shared` bundle `start()` wires up, for live-topology
+    /// tests that spawn the real threads.
+    fn test_shared(rate: u32) -> Shared {
+        Shared {
+            playing: Arc::new(AtomicBool::new(true)),
+            fade_out: Arc::new(AtomicBool::new(false)),
+            flushing: Arc::new(AtomicBool::new(false)),
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            transport_gen: Arc::new(AtomicU64::new(0)),
+            flush_gen: Arc::new(AtomicU64::new(0)),
+            flush_ack: Arc::new(AtomicU64::new(0)),
+            stage_ack: Arc::new(AtomicU64::new(0)),
+            params: Arc::new(Mutex::new(PlaybackParams::default())),
+            params_gen: Arc::new(AtomicU64::new(0)),
+            seek_target: Arc::new(AtomicU64::new(0)),
+            out_played: Arc::new(AtomicU64::new(0)),
+            total_frames: Arc::new(AtomicU64::new(0)),
+            frames_played: Arc::new(AtomicU64::new(0)),
+            started: Arc::new(AtomicBool::new(false)),
+            loop_enabled: Arc::new(AtomicBool::new(false)),
+            decoder_eof: Arc::new(AtomicBool::new(false)),
+            stage_eof: Arc::new(AtomicBool::new(false)),
+            track_ended: Arc::new(AtomicBool::new(false)),
+            dsp_enabled: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            dsp: Arc::new(Mutex::new(DspTap::new(rate))),
+            soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+        }
+    }
+
+    /// Estimate dominant frequency of `win` (mono f32) via upward zero
+    /// crossings. For sine-like signals this is robust to the small AM the
+    /// R3 engine imposes.
+    fn zc_freq(win: &[f32], rate: u32) -> f64 {
+        if win.len() < 2 {
+            return 0.0;
+        }
+        let mut up = 0usize;
+        for i in 1..win.len() {
+            if win[i - 1] <= 0.0 && win[i] > 0.0 {
+                up += 1;
+            }
+        }
+        up as f64 * rate as f64 / win.len() as f64
+    }
+
+    /// Live-topology param-latency measurement: the real `stretcher_thread`
+    /// over the real 8 s source ring + 80 ms output ring, a synthetic decoder
+    /// feeding a phase-continuous 440 Hz sine, and a real-time-paced drain
+    /// playing the cpal callback's role. The pitch actually leaving the
+    /// "speaker" is measured from the waveform — not from any internal
+    /// counter. Verifies both the bypass→active activation and an
+    /// active→active retune.
+    #[test]
+    fn pitch_change_audible_latency_live_topology() {
+        let rate = 48_000u32;
+        let out_ch = 2usize;
+        let sh = test_shared(rate);
+
+        let cap = rate as usize * out_ch * RING_SECONDS;
+        let (mut src_prod, src_cons) = RingBuffer::<f32>::new(cap);
+        let out_cap = ((rate as f64 * OUT_RING_SECONDS) as usize).max(4096) * out_ch;
+        let (out_prod, mut out_cons) = RingBuffer::<f32>::new(out_cap);
+
+        // Synthetic decoder: keep the source ring topped with a 440 Hz sine,
+        // polling like the real decode thread (3 ms cadence).
+        {
+            let sh = sh.clone();
+            thread::spawn(move || {
+                let f0 = 440.0f64;
+                let mut phase = 0.0f64;
+                loop {
+                    let free = src_prod.slots() / out_ch;
+                    if free == 0 {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    let n = free.min(CHUNK_FRAMES);
+                    for _ in 0..n {
+                        let v = (phase * 2.0 * std::f64::consts::PI).sin() as f32 * 0.25;
+                        phase += f0 / rate as f64;
+                        if phase >= 1.0 {
+                            phase -= 1.0;
+                        }
+                        let _ = src_prod.push(v);
+                        let _ = src_prod.push(v);
+                    }
+                    if !sh.playing.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(3));
+                    }
+                }
+            });
+        }
+        let sh_stretch = sh.clone();
+        thread::spawn(move || stretcher_thread(src_cons, out_prod, rate, out_ch, sh_stretch));
+
+        // Real-time-paced drain = cpal callback. 10 ms ticks, 480 frames.
+        let tick = Duration::from_millis(10);
+        let frames_per_tick = (rate as usize / 100) * out_ch;
+        let t_start = Instant::now();
+        let mut next = t_start;
+        let mut captured: Vec<f32> = Vec::with_capacity(rate as usize * 8 * out_ch);
+        let mut starved_samples: usize = 0;
+
+        let publish = |p: PlaybackParams| {
+            *sh.params.lock().unwrap() = p;
+            sh.params_gen.fetch_add(1, Ordering::SeqCst);
+        };
+        let change1_at = Duration::from_secs(2);
+        let change2_at = Duration::from_secs(4);
+        let stop_at = Duration::from_millis(6_600);
+        let mut played_at_change1 = 0usize;
+        let mut played_at_change2 = 0usize;
+        let mut played_frames = 0usize;
+
+        loop {
+            let now = Instant::now();
+            let elapsed = now - t_start;
+            if elapsed >= change1_at && played_at_change1 == 0 {
+                // Simulate the decoder thread's publish path exactly.
+                publish(PlaybackParams {
+                    pitch_semitones: 5.0,
+                    ..Default::default()
+                });
+                played_at_change1 = played_frames;
+            }
+            if elapsed >= change2_at && played_at_change2 == 0 {
+                publish(PlaybackParams {
+                    pitch_semitones: -5.0,
+                    ..Default::default()
+                });
+                played_at_change2 = played_frames;
+            }
+            if elapsed >= stop_at {
+                break;
+            }
+            next += tick;
+            let mut got = 0usize;
+            while got < frames_per_tick {
+                match out_cons.pop() {
+                    Ok(v) => {
+                        captured.push(v);
+                        got += 1;
+                    }
+                    Err(_) => {
+                        starved_samples += frames_per_tick - got;
+                        // The cpal callback would emit zeros here.
+                        for _ in 0..(frames_per_tick - got) {
+                            captured.push(0.0);
+                        }
+                        got = frames_per_tick;
+                    }
+                }
+            }
+            played_frames += frames_per_tick / out_ch;
+            sh.out_played
+                .fetch_add((frames_per_tick / out_ch) as u64, Ordering::Relaxed);
+            let wait = next.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                thread::sleep(wait);
+            }
+        }
+        sh.playing.store(false, Ordering::SeqCst);
+
+        // ---- Analyze the audible stream ---------------------------------
+        let mono: Vec<f32> = captured.chunks_exact(2).map(|f| f[0]).collect();
+        let n = mono.len();
+        let win = 3072usize;
+        let hop = 256usize;
+        let f_low = 440.0f64;
+        let f_up = 440.0 * 2f64.powf(5.0 / 12.0); // 587.33
+        let f_dn = 440.0 * 2f64.powf(-5.0 / 12.0); // 329.63
+        let mut freqs: Vec<(usize, f64)> = Vec::new();
+        let mut dropouts = 0usize;
+        let mut start = 0usize;
+        while start + win <= n {
+            let w = &mono[start..start + win];
+            let rms =
+                (w.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / win as f64).sqrt();
+            if rms < 1e-4 && start > rate as usize {
+                dropouts += 1;
+            }
+            freqs.push((start + win / 2, zc_freq(w, rate)));
+            start += hop;
+        }
+        let mid_up = (f_low + f_up) / 2.0;
+        let mid_dn = (f_up + f_dn) / 2.0;
+        let transition = |from: usize, above: bool, mid: f64| -> Option<usize> {
+            freqs
+                .iter()
+                .skip_while(|(i, _)| *i < from)
+                .find(|(_, f)| if above { *f > mid } else { *f < mid })
+                .map(|(i, _)| *i)
+        };
+        let t1 = transition(played_at_change1, true, mid_up);
+        let t2 = transition(played_at_change2, false, mid_dn);
+        let ms_of = |opt: Option<usize>, base: usize| -> f64 {
+            opt.map(|i| i.saturating_sub(base) as f64 / rate as f64 * 1000.0)
+                .unwrap_or(f64::NAN)
+        };
+        let lat1 = ms_of(t1, played_at_change1);
+        let lat2 = ms_of(t2, played_at_change2);
+        eprintln!(
+            "[latency-test] activation 0->+5: transition at out-frame {:?}, audible latency {:.0} ms",
+            t1, lat1
+        );
+        eprintln!(
+            "[latency-test] retune +5->-5:  transition at out-frame {:?}, audible latency {:.0} ms",
+            t2, lat2
+        );
+        eprintln!(
+            "[latency-test] starved drain samples: {} ({:.0} ms), dropout windows: {}",
+            starved_samples,
+            starved_samples as f64 / out_ch as f64 / rate as f64 * 1000.0,
+            dropouts
+        );
+        // Per-50ms frequency trace around each change for glide shape.
+        for (i, f) in freqs.iter().step_by(8) {
+            let ms = *i as f64 / rate as f64 * 1000.0;
+            if (900.0..=2400.0).contains(&ms) || (3100.0..=4600.0).contains(&ms) {
+                eprintln!("[latency-test]   {:6.0} ms  {:7.1} Hz", ms, f);
+            }
+        }
+        assert!(
+            lat1.is_finite() && lat1 < 400.0,
+            "activation latency {lat1:.0} ms exceeds 400 ms budget"
+        );
+        assert!(
+            lat2.is_finite() && lat2 < 400.0,
+            "retune latency {lat2:.0} ms exceeds 400 ms budget"
+        );
+    }
+
+    /// Full real-pipeline latency measurement: the real `start()` engine —
+    /// real command channel + coalescing, real FFmpeg decoder thread reading
+    /// a WAV from disk, real stretcher thread, real cpal/WASAPI callback —
+    /// captured at the speaker via the `DspTap` (post-fader callback output).
+    /// The only thing replaced is the human: parameter changes are published
+    /// on a schedule, exactly like the Parameters window does.
+    #[test]
+    fn pitch_change_audible_latency_real_pipeline() {
+        let sine = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/audiotest/sine_1k_60s.wav");
+        if !sine.exists() {
+            panic!(
+                "missing test signal {} — run scripts/audiotest/gen_signals.py (60 s variant)",
+                sine.display()
+            );
+        }
+        let a = start(Source::Silence).expect("audio device");
+        a.set_dsp_enabled(true);
+        let tap = a.dsp_tap();
+        a.load_file(sine);
+
+        // Wait for real audio to flow (decoder open + first decode + ring fill).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.out_played_frames() < 48_000 {
+            assert!(Instant::now() < deadline, "audio never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Record the tap continuously; `have` = frames already stored,
+        // anchored to the callback's own out_played counter.
+        let rate = a.rate as u64;
+        let mut rec: Vec<(f32, f32)> = Vec::with_capacity((rate * 10) as usize);
+        let mut have: u64 = 0;
+        let t0 = Instant::now();
+        let change1_at = Duration::from_secs(3);
+        let change2_at = Duration::from_secs(6);
+        let stop_at = Duration::from_millis(8_600);
+        let mut played_at_change1: u64 = 0;
+        let mut played_at_change2: u64 = 0;
+
+        loop {
+            let elapsed = Instant::now() - t0;
+            if elapsed >= change1_at && played_at_change1 == 0 {
+                a.set_params(PlaybackParams {
+                    pitch_semitones: 5.0,
+                    ..Default::default()
+                });
+                played_at_change1 = a.out_played_frames();
+            }
+            if elapsed >= change2_at && played_at_change2 == 0 {
+                a.set_params(PlaybackParams {
+                    pitch_semitones: -5.0,
+                    ..Default::default()
+                });
+                played_at_change2 = a.out_played_frames();
+            }
+            if elapsed >= stop_at {
+                break;
+            }
+            let total = a.out_played_frames();
+            let mut snap: Vec<(f32, f32)> = Vec::new();
+            tap.lock().unwrap().snapshot_into(&mut snap);
+            let fresh = total.saturating_sub(have) as usize;
+            if fresh > 0 && !snap.is_empty() {
+                let take = fresh.min(snap.len());
+                rec.extend_from_slice(&snap[snap.len() - take..]);
+                have += take as u64;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let mono: Vec<f32> = rec.iter().map(|&(l, _)| l).collect();
+        let n = mono.len();
+        assert!(n > 48_000 * 6, "captured only {n} frames of output");
+
+        // Frequency trace + transition detection (same estimator as the
+        // topology test). 1 kHz source; +5 st -> 1334.8 Hz; -5 -> 996.1 Hz.
+        let win = 3072usize;
+        let hop = 256usize;
+        let f0 = 1000.0f64;
+        let f_up = f0 * 2f64.powf(5.0 / 12.0);
+        let f_dn = f0 * 2f64.powf(-5.0 / 12.0);
+        let mid_up = (f0 + f_up) / 2.0;
+        let mid_dn = (f_up + f_dn) / 2.0;
+        let mut freqs: Vec<(usize, f64)> = Vec::new();
+        let mut start = 0usize;
+        while start + win <= n {
+            freqs.push((start + win / 2, zc_freq(&mono[start..start + win], a.rate)));
+            start += hop;
+        }
+        let transition = |from: u64, above: bool, mid: f64| -> Option<usize> {
+            freqs
+                .iter()
+                .skip_while(|(i, _)| (*i as u64) < from)
+                .find(|(_, f)| if above { *f > mid } else { *f < mid })
+                .map(|(i, _)| *i)
+        };
+        // `have` counts from engine start; out_played counters start at 0 —
+        // the recorder may have missed the first frames, so anchor by offset.
+        let missed = a.out_played_frames() - have;
+        let _ = missed;
+        let lat_ms = |opt: Option<usize>, base: u64| -> f64 {
+            opt.map(|i| {
+                let frames = i as i64 + missed as i64 - base as i64;
+                frames as f64 / a.rate as f64 * 1000.0
+            })
+            .unwrap_or(f64::NAN)
+        };
+        let t1 = transition(played_at_change1, true, mid_up);
+        let t2 = transition(played_at_change2, false, mid_dn);
+        let lat1 = lat_ms(t1, played_at_change1);
+        let lat2 = lat_ms(t2, played_at_change2);
+        eprintln!(
+            "[real-pipeline] activation 0->+5: audible latency {:.0} ms (transition @{:?})",
+            lat1, t1
+        );
+        eprintln!(
+            "[real-pipeline] retune +5->-5:  audible latency {:.0} ms (transition @{:?})",
+            lat2, t2
+        );
+        for (i, f) in freqs.iter().step_by(8) {
+            let ms = *i as f64 / a.rate as f64 * 1000.0;
+            if (2000.0..=5000.0).contains(&ms) || (5500.0..=7600.0).contains(&ms) {
+                eprintln!("[real-pipeline]   {:6.0} ms  {:7.1} Hz", ms, f);
+            }
+        }
+        assert!(
+            lat1.is_finite() && lat1 < 400.0,
+            "real-pipeline activation latency {lat1:.0} ms exceeds 400 ms budget"
+        );
+        assert!(
+            lat2.is_finite() && lat2 < 400.0,
+            "real-pipeline retune latency {lat2:.0} ms exceeds 400 ms budget"
+        );
+    }
+
+    /// Real-pipeline latency under the remaining real-world conditions the
+    /// basic test misses: pitch retune with tempo active, retune immediately
+    /// after a seek, a continuous UI-style staircase of changes, and the
+    /// Tape→PitchTime mode transition (the 8 s source ring may still hold
+    /// tape-resampled audio when Pitch/Time engages).
+    #[test]
+    fn pitch_change_latency_real_pipeline_matrix() {
+        let sine = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/audiotest/sine_1k_60s.wav");
+        if !sine.exists() {
+            panic!("missing test signal {}", sine.display());
+        }
+        let a = start(Source::Silence).expect("audio device");
+        a.set_dsp_enabled(true);
+        let tap = a.dsp_tap();
+        a.load_file(sine);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.out_played_frames() < 48_000 {
+            assert!(Instant::now() < deadline, "audio never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // (wall_elapsed, params, from_hz, to_hz, label)
+        let f = |st: f64| 1000.0 * 2f64.powf(st / 12.0);
+        let mut events: Vec<(Duration, PlaybackParams, f64, f64, &str)> = vec![
+            (
+                Duration::from_secs(2),
+                PlaybackParams {
+                    tempo_ratio: 1.25,
+                    pitch_semitones: -5.0,
+                    ..Default::default()
+                },
+                f(0.0),
+                f(-5.0),
+                "tempo1.25 engage + pitch -5",
+            ),
+            (
+                Duration::from_secs(5),
+                PlaybackParams {
+                    tempo_ratio: 1.25,
+                    pitch_semitones: 5.0,
+                    ..Default::default()
+                },
+                f(-5.0),
+                f(5.0),
+                "retune at tempo 1.25",
+            ),
+            (
+                Duration::from_secs(9),
+                PlaybackParams {
+                    tempo_ratio: 1.0,
+                    pitch_semitones: -7.0,
+                    ..Default::default()
+                },
+                f(5.0),
+                f(-7.0),
+                "post-seek retune",
+            ),
+        ];
+        let seek_at = Duration::from_secs(7);
+        // UI-style staircase: 8 x +1 st every 250 ms, from -7 up to +1.
+        let stair_start = Duration::from_secs(11);
+        for k in 0..8i32 {
+            events.push((
+                stair_start + Duration::from_millis(250 * k as u64),
+                PlaybackParams {
+                    tempo_ratio: 1.0,
+                    pitch_semitones: (k - 6) as f32,
+                    ..Default::default()
+                },
+                f((k - 7) as f64),
+                f((k - 6) as f64),
+                "staircase step",
+            ));
+        }
+        let stop_at = Duration::from_millis(14_500);
+
+        let mut rec: Vec<(f32, f32)> = Vec::with_capacity(a.rate as usize * 24);
+        let mut have: u64 = 0;
+        let t0 = Instant::now();
+        let mut marks: Vec<(u64, f64, f64, &str)> = Vec::new();
+        let mut ev_i = 0usize;
+        let mut sought = false;
+
+        loop {
+            let elapsed = Instant::now() - t0;
+            while ev_i < events.len() && elapsed >= events[ev_i].0 {
+                let (_, p, from, to, label) = &events[ev_i];
+                a.set_params(*p);
+                marks.push((a.out_played_frames(), *from, *to, label));
+                ev_i += 1;
+            }
+            if !sought && elapsed >= seek_at {
+                sought = true;
+                a.seek(20.0);
+            }
+            if elapsed >= stop_at {
+                break;
+            }
+            let total = a.out_played_frames();
+            let mut snap: Vec<(f32, f32)> = Vec::new();
+            tap.lock().unwrap().snapshot_into(&mut snap);
+            let fresh = total.saturating_sub(have) as usize;
+            if fresh > 0 && !snap.is_empty() {
+                let take = fresh.min(snap.len());
+                rec.extend_from_slice(&snap[snap.len() - take..]);
+                have += take as u64;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+
+        let mono: Vec<f32> = rec.iter().map(|&(l, _)| l).collect();
+        let n = mono.len();
+        assert!(n > 48_000 * 10, "captured only {n} frames");
+        let win = 3072usize;
+        let hop = 128usize;
+        let mut freqs: Vec<(usize, f64)> = Vec::new();
+        let mut start = 0usize;
+        while start + win <= n {
+            freqs.push((start + win / 2, zc_freq(&mono[start..start + win], a.rate)));
+            start += hop;
+        }
+        let missed = a.out_played_frames() - have;
+        let mut worst = 0.0f64;
+        for (base, from, to, label) in &marks {
+            let above = to > from;
+            let mid = (from + to) / 2.0;
+            let hit = freqs
+                .iter()
+                .skip_while(|(i, _)| (*i as u64) < *base)
+                .find(|(_, fq)| if above { *fq > mid } else { *fq < mid })
+                .map(|(i, _)| *i as i64 + missed as i64 - *base as i64);
+            let ms = hit
+                .map(|fr| fr as f64 / a.rate as f64 * 1000.0)
+                .unwrap_or(f64::NAN);
+            eprintln!("[matrix] {label:<42} from {from:7.1} to {to:7.1} Hz -> {ms:7.0} ms");
+            assert!(
+                ms.is_finite() && ms < 500.0,
+                "{label}: audible latency {ms:.0} ms exceeds 500 ms budget"
+            );
+            worst = worst.max(ms);
+        }
+        eprintln!("[matrix] worst-case audible latency: {worst:.0} ms");
+    }
+
+    /// THE regression for the tape-latency bug: with tape resampling applied
+    /// by the decoder upstream of the 8 s source ring, a tape pitch change
+    /// took seconds to become audible (ring drain; measured 2192 ms in a
+    /// partially drained ring, up to ~8 s full) and switching Tape→Pitch/Time
+    /// double-shifted the stale tape-processed ring contents for seconds.
+    /// With the downstream `TapeResampler` both must respond within the
+    /// output-ring budget and a mode switch must land exactly on target.
+    #[test]
+    fn tape_param_change_latency_real_pipeline() {
+        let sine = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/audiotest/sine_1k_60s.wav");
+        if !sine.exists() {
+            panic!("missing test signal {}", sine.display());
+        }
+        let a = start(Source::Silence).expect("audio device");
+        a.set_dsp_enabled(true);
+        let tap = a.dsp_tap();
+        a.load_file(sine);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.out_played_frames() < 48_000 {
+            assert!(Instant::now() < deadline, "audio never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let f = |st: f64| 1000.0 * 2f64.powf(st / 12.0);
+        let tape5 = PlaybackParams {
+            mode_tape: true,
+            pitch_semitones: 5.0,
+            ..Default::default()
+        };
+        let tape_m5 = PlaybackParams {
+            mode_tape: true,
+            pitch_semitones: -5.0,
+            ..Default::default()
+        };
+        let pt5 = PlaybackParams {
+            mode_tape: false,
+            pitch_semitones: 5.0,
+            ..Default::default()
+        };
+        // t=4.5: tape +5 (engages the tape stage at the audible edge).
+        // t=7.5: tape +5 -> -5 (a tape retune).
+        // t=10.5: Tape -> Pitch/Time at +5 (must land on the same pitch — no
+        //         double shift of stale ring audio).
+        let t_tape = Duration::from_millis(4_500);
+        let t_retune = Duration::from_millis(7_500);
+        let t_switch = Duration::from_millis(10_500);
+        let stop_at = Duration::from_millis(13_000);
+
+        let mut rec: Vec<(f32, f32)> = Vec::with_capacity(a.rate as usize * 14);
+        let mut have: u64 = 0;
+        let t0 = Instant::now();
+        let mut m_tape = 0u64;
+        let mut m_retune = 0u64;
+        let mut m_switch = 0u64;
+        loop {
+            let elapsed = Instant::now() - t0;
+            if m_tape == 0 && elapsed >= t_tape {
+                a.set_params(tape5);
+                m_tape = a.out_played_frames();
+            }
+            if m_retune == 0 && elapsed >= t_retune {
+                a.set_params(tape_m5);
+                m_retune = a.out_played_frames();
+            }
+            if m_switch == 0 && elapsed >= t_switch {
+                a.set_params(pt5);
+                m_switch = a.out_played_frames();
+            }
+            if elapsed >= stop_at {
+                break;
+            }
+            let total = a.out_played_frames();
+            let mut snap: Vec<(f32, f32)> = Vec::new();
+            tap.lock().unwrap().snapshot_into(&mut snap);
+            let fresh = total.saturating_sub(have) as usize;
+            if fresh > 0 && !snap.is_empty() {
+                let take = fresh.min(snap.len());
+                rec.extend_from_slice(&snap[snap.len() - take..]);
+                have += take as u64;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+
+        let mono: Vec<f32> = rec.iter().map(|&(l, _)| l).collect();
+        let n = mono.len();
+        assert!(n > 48_000 * 10, "captured only {n} frames");
+        let win = 3072usize;
+        let hop = 128usize;
+        let mut freqs: Vec<(usize, f64)> = Vec::new();
+        let mut start = 0usize;
+        while start + win <= n {
+            freqs.push((start + win / 2, zc_freq(&mono[start..start + win], a.rate)));
+            start += hop;
+        }
+        let missed = a.out_played_frames() - have;
+        let lat_of = |base: u64, from: f64, to: f64| -> f64 {
+            let above = to > from;
+            let mid = (from + to) / 2.0;
+            freqs
+                .iter()
+                .skip_while(|(i, _)| (*i as u64) < base)
+                .find(|(_, fq)| if above { *fq > mid } else { *fq < mid })
+                .map(|(i, _)| {
+                    (*i as i64 + missed as i64 - base as i64) as f64 / a.rate as f64 * 1000.0
+                })
+                .unwrap_or(f64::NAN)
+        };
+        let lat_tape = lat_of(m_tape, f(0.0), f(5.0));
+        let lat_retune = lat_of(m_retune, f(5.0), f(-5.0));
+        eprintln!("[tape] engage  0->+5 st: {lat_tape:.0} ms (was 2192 ms + ring drain pre-fix)");
+        eprintln!("[tape] retune +5->-5 st: {lat_retune:.0} ms");
+        assert!(
+            lat_tape.is_finite() && lat_tape < 400.0,
+            "tape engage latency {lat_tape:.0} ms exceeds 400 ms — tape is still upstream of the ring"
+        );
+        assert!(
+            lat_retune.is_finite() && lat_retune < 400.0,
+            "tape retune latency {lat_retune:.0} ms exceeds 400 ms"
+        );
+        // Mode switch: after the switch the pitch must sit at f(5) — the
+        // stale-ring double shift would burst to f(10), the raw-passthrough
+        // bug would sit at 1 kHz.
+        let band_lo = f(5.0) * 0.94;
+        let band_hi = f(5.0) * 1.06;
+        let mut outliers = 0usize;
+        let mut checked = 0usize;
+        for (i, fq) in &freqs {
+            let g = *i as i64 + missed as i64;
+            // Window centers fully inside [switch+250 ms, switch+2000 ms].
+            if g > m_switch as i64 + (a.rate as i64 / 4) && g < m_switch as i64 + a.rate as i64 * 2
+            {
+                checked += 1;
+                if *fq < band_lo || *fq > band_hi {
+                    outliers += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[tape] tape->pitchtime switch: {outliers}/{checked} windows outside f(5) band [{band_lo:.0},{band_hi:.0}] Hz"
+        );
+        assert!(
+            checked > 20 && outliers == 0,
+            "tape->pitchtime switch left the output off the +5 st target ({outliers}/{checked} windows out of band)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Tracker source engine (libopenmpt) — focused wiring tests.
+    // Media-dependent tests use the canonical share; each returns with a
+    // notice when the share is not mounted so the suite stays runnable
+    // anywhere (the same media checks also run device-free via
+    // `cargo test -- --ignored` in the tracker module itself).
+    // ------------------------------------------------------------------
+
+    fn canonical_tracker_media(name: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(r"Y:\Test Files").join(name);
+        if path.exists() {
+            Some(path)
+        } else {
+            eprintln!("[tracker-test] {} not mounted — skipping", path.display());
+            None
+        }
+    }
+
+    #[test]
+    fn decoder_source_switches_recompute_effective_post_params() {
+        let Some(module) = canonical_tracker_media("alpmar-3rd_world.mod") else {
+            return;
+        };
+        let audio = PathBuf::from(r"Y:\Test Files\Murr_01.mp3");
+        if !audio.exists() {
+            eprintln!("[decoder-test] {} not mounted — skipping", audio.display());
+            return;
+        }
+        let rate = 48_000u32;
+        let sh = test_shared(rate);
+        let cap = rate as usize * 2 * RING_SECONDS;
+        let (producer, mut consumer) = RingBuffer::<f32>::new(cap);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let sh_dec = sh.clone();
+        thread::spawn(move || decoder_thread(cmd_rx, producer, Source::Silence, rate, 2, sh_dec));
+        let requested = PlaybackParams {
+            mode_tape: true,
+            pitch_semitones: 12.0,
+            tempo_ratio: 2.0,
+            ..Default::default()
+        };
+        cmd_tx.send(Cmd::SetParams(requested)).unwrap();
+        cmd_tx.send(Cmd::Load(module)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sh.total_frames.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "tracker load never completed");
+            while consumer.pop().is_ok() {}
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(StageKind::of(&sh.params.lock().unwrap()), StageKind::Pass);
+
+        cmd_tx.send(Cmd::Load(audio)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            while consumer.pop().is_ok() {}
+            if *sh.params.lock().unwrap() == requested {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "FFmpeg load did not restore requested post params"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(cmd_tx);
+    }
+
+    /// The load path routes tracker files to `Engine::Openmpt`, publishes the
+    /// mapped metadata, computes the native total, services native SetParams
+    /// (tempo rescaling total_frames) and seek (seek_target rebase) — all on
+    /// the real decoder thread, no audio device.
+    #[test]
+    fn decoder_routes_tracker_files_end_to_end() {
+        let Some(path) = canonical_tracker_media("alpmar-3rd_world.mod") else {
+            return;
+        };
+        let rate = 48_000u32;
+        let sh = test_shared(rate);
+        let cap = rate as usize * 2 * RING_SECONDS;
+        let (producer, mut consumer) = RingBuffer::<f32>::new(cap);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let sh_dec = sh.clone();
+        thread::spawn(move || decoder_thread(cmd_rx, producer, Source::Silence, rate, 2, sh_dec));
+
+        cmd_tx.send(Cmd::Load(path.clone())).unwrap();
+        // Drain continuously while polling — without a stretcher thread the
+        // source ring would fill and the decoder would stop pushing.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sh.total_frames.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "tracker load never completed");
+            while consumer.pop().is_ok() {}
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Metadata fallback: mapped shape, real duration, no cover art.
+        let meta = sh.meta.lock().unwrap().clone().expect("tracker metadata");
+        assert_eq!(meta.codec, "mod", "codec is the libopenmpt format id");
+        assert!(!meta.title.is_empty(), "alpmar carries a title");
+        assert!(!meta.cover_rgba.is_some(), "modules have no cover art");
+        assert!(
+            meta.duration > 200.0 && meta.duration < 240.0,
+            "alpmar ≈ 231.5 s, got {}",
+            meta.duration
+        );
+
+        // Native tempo parameter must rescale total_frames by the ratio.
+        let total_1x = sh.total_frames.load(Ordering::Relaxed) as f64;
+        cmd_tx
+            .send(Cmd::SetParams(PlaybackParams {
+                tracker: crate::tracker::TrackerParams {
+                    tempo_ratio: 2.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while consumer.pop().is_ok() {}
+            let total_2x = sh.total_frames.load(Ordering::Relaxed) as f64;
+            if (total_2x - total_1x / 2.0).abs() < 4.0 * rate as f64 / 1000.0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native tempo did not rescale total_frames ({total_1x} -> {})",
+                total_2x
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Seek rebases the stretcher accounting target in output frames.
+        cmd_tx.send(Cmd::Seek(60.0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sh.seek_target.load(Ordering::Relaxed) != (60.0 * rate as f64) as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "seek(60) never rebased seek_target"
+            );
+            while consumer.pop().is_ok() {}
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // And the engine keeps producing fresh audio after the seek.
+        let mut frames = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while frames < rate as usize {
+            assert!(Instant::now() < deadline, "no tracker audio after seek");
+            while consumer.pop().is_ok() {
+                frames += 1;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(cmd_tx);
+    }
+
+    /// Offline render of a tracker module: one full pass reproduces the
+    /// reported duration; native tempo halves it; shared audio post params
+    /// are ignored rather than stacked on the native engine.
+    #[test]
+    fn render_offline_tracker_native_post_bypass() {
+        let Some(path) = canonical_tracker_media("alpmar-3rd_world.mod") else {
+            return;
+        };
+        let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let rate = 48_000u32;
+
+        let neutral = render_offline(
+            &path,
+            &PlaybackParams::default(),
+            &out_dir.join("tracker_neutral.wav"),
+            None,
+            rate,
+            Path::new(crate::midi::DEFAULT_SOUNDFONT),
+        )
+        .expect("neutral tracker render");
+        let reported = neutral.in_secs;
+        assert!(
+            reported > 200.0 && reported < 240.0,
+            "alpmar ≈ 231.5 s, got {reported}"
+        );
+        assert!(
+            (neutral.out_secs - reported).abs() < 0.5,
+            "neutral pass must reproduce duration ({:.2} vs {:.2})",
+            neutral.out_secs,
+            reported
+        );
+
+        let native_2x = render_offline(
+            &path,
+            &PlaybackParams {
+                tracker: crate::tracker::TrackerParams {
+                    tempo_ratio: 2.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &out_dir.join("tracker_native2x.wav"),
+            None,
+            rate,
+            Path::new(crate::midi::DEFAULT_SOUNDFONT),
+        )
+        .expect("native tempo render");
+        assert!(
+            (native_2x.out_secs - reported / 2.0).abs() < 0.5,
+            "native 2x tempo must halve the output ({:.2} vs {:.2})",
+            native_2x.out_secs,
+            reported / 2.0
+        );
+
+        // Shared Tape parameters belong to FFmpeg audio and must not alter a
+        // native tracker render, even when carried in by parameter locking.
+        let shared_ignored = render_offline(
+            &path,
+            &PlaybackParams {
+                mode_tape: true,
+                pitch_semitones: 12.0,
+                ..Default::default()
+            },
+            &out_dir.join("tracker_shared_ignored.wav"),
+            None,
+            rate,
+            Path::new(crate::midi::DEFAULT_SOUNDFONT),
+        )
+        .expect("tracker render with ignored audio post params");
+        assert!(
+            (shared_ignored.out_secs - reported).abs() < 0.5,
+            "shared audio post params must not alter tracker duration ({:.2} vs {:.2})",
+            shared_ignored.out_secs,
+            reported
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // MIDI source engine (FluidSynth) — wiring tests, tracker pattern.
+    // ------------------------------------------------------------------
+
+    fn canonical_midi_media(name: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(r"Y:\Test Files").join(name);
+        if path.exists() {
+            Some(path)
+        } else {
+            eprintln!("[midi-test] {} not mounted — skipping", path.display());
+            None
+        }
+    }
+
+    fn reference_soundfont() -> Option<PathBuf> {
+        let path = PathBuf::from(crate::midi::DEFAULT_SOUNDFONT);
+        if path.exists() {
+            Some(path)
+        } else {
+            eprintln!(
+                "[midi-test] {} missing — skipping FluidSynth tests",
+                path.display()
+            );
+            None
+        }
+    }
+
+    /// Read a float32 WAV written by `write_wav_f32` and return (frames, peak).
+    fn wav_f32_frames_peak(path: &Path) -> (usize, f32) {
+        let bytes = std::fs::read(path).expect("render output missing");
+        assert_eq!(&bytes[0..4], b"RIFF", "not a WAV");
+        let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+        let samples: Vec<f32> = bytes[44..44 + data_len]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        (samples.len() / 2, peak)
+    }
+
+    /// The load path routes MIDI files to `Engine::Midi`, publishes the
+    /// honest filename-fallback metadata, computes the timeline total,
+    /// services native SetParams (BPM override rescales total_frames) and
+    /// seek (seek_target rebase) — all on the real decoder thread, no audio
+    /// device.
+    #[test]
+    fn decoder_routes_midi_files_end_to_end() {
+        let Some(path) = canonical_midi_media("AERITHO.MID") else {
+            return;
+        };
+        let Some(font) = reference_soundfont() else {
+            return;
+        };
+        let rate = 48_000u32;
+        let sh = test_shared(rate);
+        *sh.soundfont.lock().unwrap() = font;
+        let cap = rate as usize * 2 * RING_SECONDS;
+        let (producer, mut consumer) = RingBuffer::<f32>::new(cap);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let sh_dec = sh.clone();
+        thread::spawn(move || decoder_thread(cmd_rx, producer, Source::Silence, rate, 2, sh_dec));
+
+        cmd_tx.send(Cmd::Load(path.clone())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let total = sh.total_frames.load(Ordering::SeqCst) as f64 / rate as f64;
+            if total > 30.0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "MIDI open never published a duration (total={total}s)"
+            );
+            while consumer.pop().is_ok() {}
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Metadata: honest filename fallback title + SMF facts.
+        let meta = sh.meta.lock().unwrap().clone().expect("midi metadata");
+        assert_eq!(meta.title, "AERITHO");
+        assert_eq!(meta.channels, 2);
+        assert_eq!(meta.sample_rate, rate as i32);
+        assert!(meta.duration > 30.0);
+        assert!(meta.format.starts_with("SMF format"), "{}", meta.format);
+
+        // Native params: BPM override must rescale the timeline total live.
+        let native_total = sh.total_frames.load(Ordering::SeqCst);
+        cmd_tx
+            .send(Cmd::SetParams(PlaybackParams {
+                midi: crate::midi::MidiParams {
+                    bpm_override: Some(240.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = sh.total_frames.load(Ordering::SeqCst);
+            if now != native_total {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "BPM override did not rescale total_frames"
+            );
+            while consumer.pop().is_ok() {}
+            thread::sleep(Duration::from_millis(10));
+        }
+        while consumer.pop().is_ok() {}
+
+        // Seek rebases the stretcher accounting target in output frames.
+        cmd_tx.send(Cmd::Seek(30.0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sh.seek_target.load(Ordering::Relaxed) != (30.0 * rate as f64) as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "seek(30) never rebased seek_target"
+            );
+            while consumer.pop().is_ok() {}
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The engine keeps producing fresh audio after the seek.
+        let mut frames = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while frames < rate as usize {
+            assert!(Instant::now() < deadline, "no MIDI audio after seek");
+            while consumer.pop().is_ok() {
+                frames += 1;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(cmd_tx);
+    }
+
+    /// Offline MIDI rendering reproduces the native timeline, applies BPM
+    /// override in the source engine, and ignores shared audio post params.
+    #[test]
+    fn render_offline_midi_native_post_bypass() {
+        let Some(path) = canonical_midi_media("AERITHO.MID") else {
+            return;
+        };
+        let Some(font) = reference_soundfont() else {
+            return;
+        };
+        let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let rate = 48_000u32;
+
+        let neutral = render_offline(
+            &path,
+            &PlaybackParams::default(),
+            &out_dir.join("midi_neutral.wav"),
+            None,
+            rate,
+            &font,
+        )
+        .expect("neutral midi render");
+        eprintln!(
+            "[midi-test] AERITHO native timeline: {:.2}s",
+            neutral.in_secs
+        );
+        assert!(neutral.in_secs > 30.0, "implausible timeline");
+        let neutral_tail = neutral.out_secs - neutral.in_secs;
+        assert!(
+            (-0.05..=5.5).contains(&neutral_tail),
+            "neutral render must preserve the SMF timeline plus its reverb tail ({:.2}s tail)",
+            neutral_tail
+        );
+        let (frames, peak) = wav_f32_frames_peak(&out_dir.join("midi_neutral.wav"));
+        assert!(peak > 0.01, "neutral render is silent (peak {peak})");
+        assert!(frames > rate as usize * 30, "neutral render too short");
+
+        // Native BPM override: the timeline itself shrinks (AERITHO's average
+        // tempo is well under 240 BPM).
+        let bpm_up = render_offline(
+            &path,
+            &PlaybackParams {
+                midi: crate::midi::MidiParams {
+                    bpm_override: Some(240.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &out_dir.join("midi_bpm240.wav"),
+            None,
+            rate,
+            &font,
+        )
+        .expect("bpm override render");
+        eprintln!(
+            "[midi-test] BPM 240 timeline: {:.2}s (was {:.2}s)",
+            bpm_up.in_secs, neutral.in_secs
+        );
+        assert!(
+            bpm_up.in_secs < neutral.in_secs * 0.75,
+            "BPM override must shorten the timeline ({:.2} vs {:.2})",
+            bpm_up.in_secs,
+            neutral.in_secs
+        );
+        let bpm_tail = bpm_up.out_secs - bpm_up.in_secs;
+        assert!(
+            (-0.05..=5.5).contains(&bpm_tail),
+            "BPM render must preserve its own timeline plus its reverb tail ({:.2}s tail)",
+            bpm_tail
+        );
+
+        // Shared Tape +12 st belongs to FFmpeg audio. A native MIDI render
+        // must ignore it and retain the requested source timeline.
+        let shared_ignored = render_offline(
+            &path,
+            &PlaybackParams {
+                mode_tape: true,
+                pitch_semitones: 12.0,
+                ..Default::default()
+            },
+            &out_dir.join("midi_shared_ignored.wav"),
+            Some(10.0),
+            rate,
+            &font,
+        )
+        .expect("midi render with ignored audio post params");
+        assert!(
+            (shared_ignored.out_secs - 10.0).abs() < 0.3,
+            "shared audio post params must not alter MIDI speed ({:.2}s for a 10s limit)",
+            shared_ignored.out_secs
+        );
+        let (_, shared_peak) = wav_f32_frames_peak(&out_dir.join("midi_shared_ignored.wav"));
+        assert!(
+            shared_peak > 0.01,
+            "MIDI render with ignored post params is silent"
+        );
+    }
+
+    /// Live device test: a MIDI track plays through the full real pipeline
+    /// (decoder → ring → stretcher → cpal), native transpose/BPM/font changes
+    /// never restart it, and seek lands. Requires the default output device,
+    /// the reference SoundFont and the canonical share.
+    #[test]
+    fn midi_live_engine_playback_controls_without_restart() {
+        let Some(path) = canonical_midi_media("AERITHO.MID") else {
+            return;
+        };
+        let Some(font) = reference_soundfont() else {
+            return;
+        };
+        let a = start(Source::Silence).expect("audio device");
+        a.set_soundfont(font.clone());
+        a.load_file(path);
+
+        // Wait for real audio.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while a.out_played_frames() < (a.rate as u64 * 3) {
+            assert!(Instant::now() < deadline, "MIDI audio never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let dur = a.duration_secs();
+        assert!(dur > 30.0, "implausible duration {dur}");
+        assert_eq!(a.metadata().map(|m| m.title), Some("AERITHO".to_string()));
+
+        // Native transpose: position must keep advancing (no restart).
+        let pos_before = a.position_secs();
+        thread::sleep(Duration::from_millis(300));
+        a.set_params(PlaybackParams {
+            midi: crate::midi::MidiParams {
+                transpose_semitones: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        thread::sleep(Duration::from_millis(700));
+        let pos_after = a.position_secs();
+        assert!(
+            pos_after > pos_before + 0.5,
+            "transpose restarted or stalled playback ({pos_before:.2} -> {pos_after:.2})"
+        );
+        assert!(a.is_playing(), "transpose must not stop playback");
+
+        // Native BPM override: duration rescales, playback continues.
+        let dur_native = a.duration_secs();
+        a.set_params(PlaybackParams {
+            midi: crate::midi::MidiParams {
+                bpm_override: Some(240.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        thread::sleep(Duration::from_millis(700));
+        let dur_bpm = a.duration_secs();
+        assert!(
+            (dur_bpm - dur_native).abs() > 1.0,
+            "BPM override did not rescale duration ({dur_native} -> {dur_bpm})"
+        );
+        assert!(a.is_playing(), "BPM override must not stop playback");
+
+        // SoundFont (re)load: live, no restart.
+        let pos_before = a.position_secs();
+        a.set_soundfont(font);
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            a.position_secs() > pos_before + 0.5,
+            "soundfont switch restarted playback"
+        );
+        assert!(a.is_playing(), "soundfont switch must not stop playback");
+
+        // Seek lands on the output timeline.
+        a.seek(30.0);
+        thread::sleep(Duration::from_millis(800));
+        let pos = a.position_secs();
+        assert!(
+            (pos - 30.0).abs() < 2.0,
+            "seek(30) did not land ({pos:.2}s)"
+        );
+        assert!(a.is_playing());
+
+        // Shared post stays optional and neutral by default: the native domain
+        // above never leaked into it.
+        let e = PlaybackParams::default();
+        assert_eq!(e.midi, crate::midi::MidiParams::default());
+        assert_eq!(e.tracker, crate::tracker::TrackerParams::default());
+        assert_eq!(e.pitch_semitones, 0.0);
+        assert_eq!(e.tempo_ratio, 1.0);
+    }
+
+    // ------------------------------------------------------------------
+    // Native-control latency regressions (tracker + MIDI).
+    //
+    // Openmpt/Midi parameters apply at the engine, upstream of the 8 s
+    // source ring; the ring is therefore the only buffer that can hide a
+    // native control behind seconds of stale-parameter audio. The high-water
+    // mark caps that at ~100 ms. These tests measure the REAL post-callback
+    // output (DspTap, post-fader, exactly what the speakers get) — a native
+    // parameter change must be audible within 500 ms. Against the ungated
+    // 8 s backlog the tracker transition lands ~5.5 s late and fails.
+    // ------------------------------------------------------------------
+
+    /// Generated media dir shared with scripts/audiotest.
+    fn gen_media_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/audiotest")
+    }
+
+    /// Write a self-contained ProTracker MOD whose audio is one steady tone:
+    /// sample 1 = 8-bit sine looping with 8 bytes/cycle, played as a single
+    /// held note (period 416 → ~1.07 kHz) on channel 0, sustained by a
+    /// 128-order pattern loop. Deterministic media beats a canonical music
+    /// module here: the frequency-transition estimator needs a signal with one
+    /// dominant fundamental.
+    ///
+    /// Two MOD traps, both measured against libopenmpt 0.8.9 (each renders the
+    /// whole 983 s timeline as digital silence, with a correct duration, so the
+    /// failure looks like "the engine plays nothing"):
+    ///   1. Cell layout is byte0 = (sample & 0xF0) | (period >> 8),
+    ///      byte1 = (period & 0xF0) | (sample & 0x0F). The LOW nibble of byte1
+    ///      is the sample number — putting the period's low byte there (0xAC)
+    ///      selects sample 12, which does not exist.
+    ///   2. A pattern whose cells carry NO effect never advances ticks until a
+    ///      speed is set, so no note is ever processed. Row 0 must set speed
+    ///      (`F06`), exactly as real modules do.
+    fn gen_steady_tone_mod() -> PathBuf {
+        let path = gen_media_dir().join("gen_steady_tone.mod");
+        let mut b: Vec<u8> = Vec::with_capacity(1084 + 1024 + 8192);
+        let mut title = [b' '; 20];
+        title[..10].copy_from_slice(b"latencyreg");
+        b.extend_from_slice(&title);
+        // 31 sample headers; sample 1 loops its full 4096 words at volume 64.
+        let mut hdr = [0u8; 30];
+        hdr[..22].copy_from_slice(&{
+            let mut n = [b' '; 22];
+            n[..4].copy_from_slice(b"tone");
+            n
+        });
+        hdr[22..24].copy_from_slice(&4096u16.to_be_bytes());
+        hdr[25] = 64;
+        hdr[28..30].copy_from_slice(&4096u16.to_be_bytes());
+        b.extend_from_slice(&hdr);
+        for _ in 1..31 {
+            b.extend_from_slice(&[0u8; 30]);
+        }
+        b.push(128); // song length: pattern 0 repeats all the way
+        b.push(0);
+        b.extend_from_slice(&[0u8; 128]);
+        b.extend_from_slice(b"M.K.");
+        let mut pat = [0u8; 1024];
+        // Row 0, channel 0: sample 1, period 416 (0x1A0), effect F06 (speed 6).
+        pat[0] = 0x01; // (sample & 0xF0) | (period >> 8)
+        pat[1] = 0xA1; // (period & 0xF0) | (sample & 0x0F)
+        pat[2] = 0x1F; // effect F: set speed
+        pat[3] = 0x06;
+        b.extend_from_slice(&pat);
+        for i in 0..8192usize {
+            let v = (120.0 * (std::f64::consts::PI * 2.0 * (i % 8) as f64 / 8.0).sin()) as i8;
+            b.push(v as u8);
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &b).unwrap();
+        path
+    }
+
+    fn gen_steady_tone_midi() -> PathBuf {
+        fn vlq(v: u32) -> Vec<u8> {
+            let mut out = vec![(v & 0x7f) as u8];
+            let mut rest = v >> 7;
+            while rest > 0 {
+                out.push(0x80 | (rest & 0x7f) as u8);
+                rest >>= 7;
+            }
+            out.reverse();
+            out
+        }
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/midiwork/native-tone.mid");
+        let mut smf = Vec::new();
+        smf.extend_from_slice(b"MThd");
+        smf.extend_from_slice(&6u32.to_be_bytes());
+        smf.extend_from_slice(&0u16.to_be_bytes());
+        smf.extend_from_slice(&1u16.to_be_bytes());
+        smf.extend_from_slice(&480u16.to_be_bytes());
+        let mut track = Vec::new();
+        track.extend(vlq(0));
+        track.extend_from_slice(&[0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        track.extend(vlq(0));
+        track.extend_from_slice(&[0xC0, 0]);
+        for _ in 0..96 {
+            track.extend(vlq(0));
+            track.extend_from_slice(&[0x90, 60, 100]);
+            track.extend(vlq(200));
+            track.extend_from_slice(&[0x80, 60, 0]);
+            track.extend(vlq(40));
+        }
+        track.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+        smf.extend_from_slice(b"MTrk");
+        smf.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        smf.extend_from_slice(&track);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &smf).unwrap();
+        path
+    }
+
+    /// Real-pipeline native-control capture: `media` plays through the full
+    /// live engine (real decoder thread + rings + stretcher + cpal callback),
+    /// `change` is published once 2.5 s of audio is audible (exactly like the
+    /// Parameters window does), the post-callback DspTap records until
+    /// `stop_after_change` s. Returns (left channel, rate, out-frames at the
+    /// change, frames the recorder missed before its first snapshot).
+    fn capture_native_change_latency(
+        media: &Path,
+        change: PlaybackParams,
+        stop_after_change: f64,
+    ) -> (Vec<f32>, u32, u64, u64) {
+        let a = start(Source::Silence).expect("audio device");
+        a.set_dsp_enabled(true);
+        let tap = a.dsp_tap();
+        a.load_file(media.to_path_buf());
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while a.out_played_frames() < a.rate as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "audio never started for {}",
+                media.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut rec: Vec<(f32, f32)> = Vec::with_capacity(a.rate as usize * 12);
+        let mut have: u64 = 0;
+        let t0 = Instant::now();
+        let change_at = Duration::from_secs_f64(2.5);
+        let stop_at = Duration::from_secs_f64(2.5 + stop_after_change);
+        let mut played_at_change: u64 = 0;
+
+        loop {
+            let elapsed = Instant::now() - t0;
+            if elapsed >= change_at && played_at_change == 0 {
+                a.set_params(change);
+                played_at_change = a.out_played_frames();
+            }
+            if elapsed >= stop_at {
+                break;
+            }
+            let total = a.out_played_frames();
+            let mut snap: Vec<(f32, f32)> = Vec::new();
+            tap.lock().unwrap().snapshot_into(&mut snap);
+            let fresh = total.saturating_sub(have) as usize;
+            if fresh > 0 && !snap.is_empty() {
+                let take = fresh.min(snap.len());
+                rec.extend_from_slice(&snap[snap.len() - take..]);
+                have += take as u64;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(played_at_change > 0, "parameter change never fired");
+        assert!(
+            rec.len() > a.rate as usize * 4,
+            "captured only {} frames of output",
+            rec.len() / 2
+        );
+        let missed = a.out_played_frames() - have;
+        let mono: Vec<f32> = rec.iter().map(|&(l, _)| l).collect();
+        (mono, a.rate, played_at_change, missed)
+    }
+
+    /// Measure when the dominant frequency of the captured output first
+    /// leaves the pre-change plateau towards `f_pre * 2^(semitones/12)`,
+    /// and whether it settles there. `anchor`/`missed` map rec indices to
+    /// the callback's out_played counter. Returns (latency_ms, settled).
+    fn native_change_latency_ms(
+        mono: &[f32],
+        rate: u32,
+        anchor: u64,
+        missed: u64,
+        semitones: f64,
+        tolerance: f64,
+        tag: &str,
+    ) -> (f64, bool) {
+        let win = 3072usize;
+        let hop = 256usize;
+        let n = mono.len();
+        let mut freqs: Vec<(usize, f64)> = Vec::new();
+        let mut start = 0usize;
+        while start + win <= n {
+            freqs.push((start + win / 2, zc_freq(&mono[start..start + win], rate)));
+            start += hop;
+        }
+        let anchor_i = anchor.saturating_sub(missed) as usize;
+        let pre: Vec<f64> = freqs
+            .iter()
+            .filter(|(i, _)| *i + win / 2 < anchor_i && *i > anchor_i.saturating_sub(rate as usize))
+            .map(|(_, f)| *f)
+            .collect();
+        assert!(pre.len() > 8, "no pre-change plateau windows");
+        let mut sorted = pre.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let f_pre = sorted[sorted.len() / 2];
+        let f_target = f_pre * 2f64.powf(semitones / 12.0);
+        let mid = (f_pre + f_target) / 2.0;
+        let transition = freqs
+            .iter()
+            .skip_while(|(i, _)| *i < anchor_i)
+            .find(|(_, f)| *f > mid)
+            .map(|(i, _)| *i);
+        let lat = transition
+            .map(|i| i.saturating_sub(anchor_i) as f64 / rate as f64 * 1000.0)
+            .unwrap_or(f64::NAN);
+        // Settled: median of the final 0.5 s sits on the target plateau.
+        let tail_start = n.saturating_sub(rate as usize / 2 + win);
+        let mut tail: Vec<f64> = freqs
+            .iter()
+            .filter(|(i, _)| *i >= tail_start)
+            .map(|(_, f)| *f)
+            .collect();
+        tail.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let f_tail = if tail.is_empty() {
+            f64::NAN
+        } else {
+            tail[tail.len() / 2]
+        };
+        let settled = (f_tail - f_target).abs() <= f_target * tolerance;
+        eprintln!(
+            "[{tag}] plateau {:.0} Hz -> target {:.0} Hz; audible latency {:.0} ms; tail median {:.0} Hz",
+            f_pre, f_target, lat, f_tail
+        );
+        for (i, f) in freqs.iter().step_by(8) {
+            let ms = (*i as f64 - anchor_i as f64) / rate as f64 * 1000.0;
+            if (-500.0..=1000.0).contains(&ms) {
+                eprintln!("[{tag}]   change{:+6.0} ms  {:7.1} Hz", ms, f);
+            }
+        }
+        (lat, settled)
+    }
+
+    /// Device-free proof of the high-water derivation itself: a native
+    /// tracker engine with NO consumer must stop filling the source ring on
+    /// its own at the ~100 ms mark (not at 8 s), and must resume after the
+    /// ring drains. Catches occupancy/free-space confusion directly.
+    #[test]
+    fn native_source_ring_respects_high_water() {
+        let path = gen_steady_tone_mod();
+        let rate = 48_000u32;
+        let sh = test_shared(rate);
+        let cap = rate as usize * 2 * RING_SECONDS;
+        let (producer, mut consumer) = RingBuffer::<f32>::new(cap);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let sh_dec = sh.clone();
+        thread::spawn(move || decoder_thread(cmd_rx, producer, Source::Silence, rate, 2, sh_dec));
+
+        cmd_tx.send(Cmd::Load(path)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while consumer.slots() == 0 {
+            assert!(Instant::now() < deadline, "tracker never produced audio");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Give the producer ample time to blow past the mark if ungated.
+        thread::sleep(Duration::from_millis(400));
+        let occupied = consumer.slots() / 2;
+        let mark = (rate as f64 * NATIVE_HIGH_WATER_SECS) as usize;
+        eprintln!("[high-water] ring settled at {occupied} frames (mark {mark})");
+        assert!(
+            occupied <= mark + rate as usize / 10,
+            "native source ring holds {occupied} frames ({:.0} ms) — high-water {} frames not enforced",
+            occupied as f64 / rate as f64 * 1000.0,
+            mark
+        );
+        assert!(
+            occupied >= mark / 2,
+            "ring under-filled ({occupied} frames) — gate closed too early"
+        );
+
+        // Drain fully, then the gate must reopen and keep producing.
+        while consumer.pop().is_ok() {}
+        thread::sleep(Duration::from_millis(200));
+        let refilled = consumer.slots() / 2;
+        assert!(
+            refilled >= mark / 2,
+            "ring did not refill after drain ({refilled} frames) — playback would stall"
+        );
+        drop(cmd_tx);
+    }
+
+    /// REAL output regression: native MIDI transpose must reach captured
+    /// post-callback audio within 500 ms, including the intentional voice
+    /// silence at the parameter boundary and the wait for the next note-on.
+    #[test]
+    fn native_midi_param_audible_latency_real_pipeline() {
+        let path = gen_steady_tone_midi();
+        let (mono, rate, anchor, missed) = capture_native_change_latency(
+            &path,
+            PlaybackParams {
+                midi: crate::midi::MidiParams {
+                    transpose_semitones: 7,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            8.0,
+        );
+        let (lat, settled) =
+            native_change_latency_ms(&mono, rate, anchor, missed, 7.0, 0.08, "midi-native");
+        assert!(
+            lat.is_finite() && lat < 500.0,
+            "native MIDI param change audible after {lat:.0} ms (budget 500 ms)"
+        );
+        assert!(settled, "output did not settle on the +7 st plateau");
+    }
+
+    /// REAL output regression: a native tracker pitch change must be audible
+    /// in the captured post-callback audio within 500 ms (target 100–200 ms).
+    /// Against the ungated 8 s source ring the same change trails by the
+    /// full buffered backlog (~5.5 s here) and this test fails.
+    #[test]
+    fn native_tracker_param_audible_latency_real_pipeline() {
+        let path = gen_steady_tone_mod();
+        let (mono, rate, anchor, missed) = capture_native_change_latency(
+            &path,
+            PlaybackParams {
+                tracker: crate::tracker::TrackerParams {
+                    pitch_semitones: 7.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            8.0,
+        );
+        // Uninterrupted playback: the steady tone never drops out.
+        let win = 3072usize;
+        let mut dropouts: Vec<usize> = Vec::new();
+        let mut start = rate as usize; // skip the fade-in region
+        while start + win <= mono.len() {
+            let w = &mono[start..start + win];
+            let rms =
+                (w.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / win as f64).sqrt();
+            if rms < 1e-4 {
+                dropouts.push(start);
+            }
+            start += win;
+        }
+        eprintln!(
+            "[tracker-native] {} dropout windows at {:?} (ms from change: {:?})",
+            dropouts.len(),
+            dropouts.iter().take(6).collect::<Vec<_>>(),
+            dropouts
+                .iter()
+                .take(6)
+                .map(|d| *d as f64 / rate as f64 * 1000.0 - anchor as f64 / rate as f64 * 1000.0)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            dropouts.is_empty(),
+            "{} silent windows — playback interrupted",
+            dropouts.len()
+        );
+
+        let (lat, settled) =
+            native_change_latency_ms(&mono, rate, anchor, missed, 7.0, 0.08, "tracker-native");
+        assert!(
+            lat.is_finite() && lat < 500.0,
+            "native tracker param change audible after {lat:.0} ms (budget 500 ms; \
+             ungated 8 s ring would read ~5500 ms)"
+        );
+        assert!(settled, "output did not settle on the +7 st plateau");
     }
 }

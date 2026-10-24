@@ -306,10 +306,7 @@ impl DspAnalyzer {
             [1.53512485958697, -2.69169618940638, 1.19839281085285],
             [1.0, -1.69065929318241, 0.73248077421585],
         );
-        let stage2 = Biquad::new(
-            [1.0, -2.0, 1.0],
-            [1.0, -1.99004745483398, 0.99007225036621],
-        );
+        let stage2 = Biquad::new([1.0, -2.0, 1.0], [1.0, -1.99004745483398, 0.99007225036621]);
 
         let mom_cap = (rate * 0.4) as usize;
         let st_cap = (rate * 3.0) as usize;
@@ -339,8 +336,14 @@ impl DspAnalyzer {
             peak_l_lin: 0.0,
             peak_r_lin: 0.0,
             kfilter: [[stage1, stage2], [stage1, stage2]],
-            lu_mom: [SlidingMeanSquare::new(mom_cap), SlidingMeanSquare::new(mom_cap)],
-            lu_st: [SlidingMeanSquare::new(st_cap), SlidingMeanSquare::new(st_cap)],
+            lu_mom: [
+                SlidingMeanSquare::new(mom_cap),
+                SlidingMeanSquare::new(mom_cap),
+            ],
+            lu_st: [
+                SlidingMeanSquare::new(st_cap),
+                SlidingMeanSquare::new(st_cap),
+            ],
             block_acc: [0.0; 2],
             block_n: 0,
             block_len: (rate * 0.1) as usize,
@@ -452,9 +455,8 @@ impl DspAnalyzer {
 
         let half = FFT_SIZE / 2;
         let norm = 1.0 / (FFT_SIZE as f32 * 0.25);
-        let mag_at = |re: &[f32], im: &[f32], k: usize| -> f32 {
-            (re[k] * re[k] + im[k] * im[k]).sqrt()
-        };
+        let mag_at =
+            |re: &[f32], im: &[f32], k: usize| -> f32 { (re[k] * re[k] + im[k] * im[k]).sqrt() };
 
         // Dominant peak (parabolic interpolation on the log-magnitude of the bin).
         let k_min = ((F_MIN * FFT_SIZE as f32 / self.rate).ceil() as usize).max(1);
