@@ -1,8 +1,8 @@
 # soundApp_R & NUI Rust — Agent Briefing
 
-> **START HERE:** Read **[`docs/development_plan.md`](docs/development_plan.md)** first. It holds the complete project state, measured benchmarks, solved rendering/typography/FFmpeg traps (§3), the Phase 1–3 roadmap (§4), and the **next-session priorities (§6)**.
+> **START HERE:** Read **[`docs/handover_2026-10-24.md`](docs/handover_2026-10-24.md)** for the authoritative uncommitted working state and unverified items. Then read **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap.
 
-**Last handover:** 2026-10-17 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`, HEAD `0fa94b5`)
+**Last handover:** 2026-10-24 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`; local HEAD `f72eca9` not yet pushed). NUI and SoundApp recovery checkpoints are committed. Native Parameters sizing and final MIDI real-output latency verification remain open.
 
 ## Overview
 
@@ -10,11 +10,20 @@
 
 The workspace has **three crates**: the reusable `nui` library, `nui-demo` (a standalone component playground), and `soundapp` (the player application).
 
+## Reference Sources & Development Orchestration
+
+- **Original Electron SoundApp:** `D:\Work\_GIT\SoundApp`. Inspect this codebase to verify reference behavior before porting features or changing parity-sensitive logic. Full Help content is in `D:\Work\_GIT\SoundApp\html\help.html`.
+- **Original UI screenshots:** `docs/reference_ui/`. Compare Rust UI work against these captures; the set is still growing and is not yet a complete visual specification.
+- The lead agent orchestrates development: break work into bounded tasks, integrate changes, verify results directly, and check in frequently.
+- Use **`deepseek-flash-chat` for substantial grunt work** such as bulk inspection, repetitive transformations, test/harness execution, and screenshot comparison. Keep architecture, ambiguous decisions, integration, and final verification with the lead agent.
+- `deepseek-flash-chat` is **multimodal**. For visual debugging, give it the relevant Rust capture and original reference image and explicitly ask it to inspect both images.
+
 ## Key Documents in `docs/`
 
 | Document | Purpose |
 |---|---|
-| **[`docs/development_plan.md`](docs/development_plan.md)** | **Master Handover & Roadmap** — current state, benchmarks, solved traps, ordered Phase 1–3 checklist, **§6 next-session priorities** |
+| **[`docs/handover_2026-10-24.md`](docs/handover_2026-10-24.md)** | **Current working state** — implemented engines, accepted behavior, verification checkpoints, and final unverified latency change |
+| **[`docs/development_plan.md`](docs/development_plan.md)** | Master roadmap & history — benchmarks, solved traps, Phase 1–3 checklist |
 | [`docs/FINDINGS.md`](docs/FINDINGS.md) | Initial M1–M4 POC benchmark numbers and 6 core findings |
 | [`docs/rust-rewrite-assessment.md`](docs/rust-rewrite-assessment.md) | Full feature inventory of Electron SoundApp and Rust crate mapping |
 | [`docs/rust-native-ui-exploration.md`](docs/rust-native-ui-exploration.md) | Bare-metal UI tier analysis and widget inventory |
@@ -49,16 +58,18 @@ soundApp_R/
                       # right-click context menu) + secondary UiState Inspector window (W)
                       # + dropzone preview (D) + live window drag/resize
     soundapp/             # SoundApp application crate -> soundapp_r.exe
-      build.rs            # Compiles ffmpeg_bridge.cpp against FFmpeg 7+ headers/libs and stages runtime DLLs
+      build.rs            # Compiles FFmpeg bridge + vendored Rubber Band/libopenmpt; links FluidSynth
+                          #   and stages runtime DLLs
       src/
-        main.rs           # Winit ApplicationHandler, minimalist player window, Parameters, Monitoring,
-                          #   Mixer, Settings & Help windows
-        audio.rs          # FFmpeg decode thread + lock-free rtrb ring buffer + cpal output + cosine fades
-                          #   + 8-tap Lanczos resampling + WSOLA pitch/tempo/formant
+        main.rs           # Winit ApplicationHandler, minimalist player window, adaptive native-only
+                          #   MIDI/tracker Parameters, Monitoring, Mixer, Settings & Help windows
+        audio.rs          # FFmpeg/libopenmpt/FluidSynth source engines + raw source ring + cpal output
+                          #   + audible-edge Tape/Rubber Band chain (FFmpeg only) + cosine fades/DSP tap
+                          #   + --render offline / --latency-probe harness (scripts/audiotest/)
         ffmpeg_bridge.cpp # C ABI bridge over SoundApp's FFmpegDecoder (decode, seek, metadata + embedded
                           #   cover art decode to 128x128 RGBA, rubberband/atempo filter graph)
-        midi.rs           # PARKED on disk (not compiled): pure-Rust SF2 SoundFont synth & SMF sequencer
-        tracker.rs        # PARKED on disk (not compiled): ProTracker .mod parser & Paula synthesizer
+        midi.rs           # FluidSynth 2.6.1 SoundFont synth + SMF parser/tempo map/sequencer
+        tracker.rs        # libopenmpt 0.8.9 tracked-module source engine
         dsp.rs            # Real-time 2048-pt Hann FFT (64 log bands), stabilized oscilloscope,
                           #   stereo goniometer & BS.1770-4 K-weighted LUFS
         config.rs         # Persistent user.json configuration loader/writer

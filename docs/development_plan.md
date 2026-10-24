@@ -1,9 +1,11 @@
 # soundApp_R & NUI Rust — Master Development Plan & Handover
 
+> **Current state:** Read [`handover_2026-10-24.md`](handover_2026-10-24.md) first. It is authoritative for the committed recovery checkpoints and remaining verification work. This file retains the longer roadmap, benchmarks, and historical checkpoints.
+
 **Created:** 2026-10-14  
-**Updated:** 2026-10-17  
+**Updated:** 2026-10-24
 **Workspace:** `D:\Work\_GIT\soundApp_R`  
-**Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`, HEAD `0fa94b5`)  
+**Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`; origin `0fa94b5`, local HEAD `f72eca9`)
 **Primary Test Media:** `Y:\Test Files` (SMB share; default `Y:\Test Files\Murr_01.mp3`, fallback `D:\Work\_GIT\SoundApp\_Material\mixer_media\Again\01.m4a`)  
 **Reference Electron App:** `D:\Work\_GIT\SoundApp` (untouched reference for features, assets, binaries, and additional test media in `D:\Work\_GIT\SoundApp\_Material\`)  
 **Reference Web UI Library:** `D:\Work\_GIT\nui_wc2` (`https://github.com/herrbasan/nui_wc2`, v3.0.0 `"slate"` theme)
@@ -20,7 +22,7 @@ We are building **three things simultaneously** inside a single Cargo workspace 
 2. **`crates/nui-demo` (`nui_demo.exe`):** A standalone component playground — six tabs (*Controls & Inputs*, *Layout & Cards*, *Vectors & Canvas*, *Typography & Icons*, *Virtual List 10k*, *Menus & Overlays*) inside an app shell (menu bar, collapsible `nui-sidebar`, right-click `nui-context-menu`, modal `nui-dialog`, live window drag/resize), a secondary `UiState` Inspector window (`W`) and a dropzone preview (`D`) — depending only on `nui` + `winit`. It exists so `crates/nui` component design and visual polish can be iterated **without** audio, FFmpeg or the player shell in the way.
 3. **`crates/soundapp` (`soundapp_r.exe`):** The native Rust port of SoundApp.
    - Replaces Electron's 3-process architecture (Main + Hidden Chromium Engine Window + Renderer Windows), `AudioWorklet` + `SharedArrayBuffer` + `Atomics` plumbing, and the idle-disposal state machine with a single native process: **1 UI thread + 1 `cpal` audio callback thread + background decoder threads**.
-   - FFmpeg-only decode pipeline (MIDI and tracker engines are parked on disk, see §2.2).
+   - FFmpeg encoded audio uses the shared audible-edge Tape/Rubber Band chain. libopenmpt tracker and FluidSynth MIDI sources use native controls and bypass that chain, matching the reference app. See the current handover for verification status.
 
 ---
 
@@ -33,7 +35,7 @@ We are building **three things simultaneously** inside a single Cargo workspace 
 | `crates/nui/src/render.rs` | **Unified `Scene` Display-List + Dual Backend (`Renderer`):**<br>• **GPU Backend (`glow` OpenGL 3.3 Core):** Renders the entire frame (sharp rects, SDF rounded rects, borders, soft SDF drop shadows `kind=3`, and R8 atlas glyphs `kind=1,2`) in **1 single `glDrawArraysInstanced` call**. Enforces per-instance `clip_rect` `[cx0, cy0, cx1, cy1]` in the fragment shader.<br>• **CPU Pixel Fallback (`softbuffer`):** Direct `u32` (`0x00RRGGBB`) blitter with `static_cache: Vec<u32>` layer caching, corner-only SDF evaluation, and integer LUT linear-light gamma blending.<br>• **Top-Layer Overlay Queue (`begin_overlay` / `end_overlay` / `finish_frame`):** Dropdown popups (`nui-select`) and tooltips render after all base widgets in painter's order.<br>• **Direct Screenshot Readback:** `--screenshot <path.png>` reads the live GPU framebuffer via `glReadPixels` (or CPU buffer) and writes a lossless PNG for visual verification. |
 | `crates/nui/src/text.rs` | **Browser-Grade Typography (`TextSystem`):**<br>• **`Swash` Engine (default):** OpenType `kern` + `liga` shaping (`ShapeContext`), TrueType auto-hinting (`ScaleContext::hint(true)` via Google Chrome's `skrifa`), 4-bin horizontal subpixel positioning (`0.0, 0.25, 0.50, 0.75` px), shaped-run caching (`shape_cache`), and linear-light gamma + stem-darkening contrast boost for dark backgrounds.<br>• **`Fontdue` Engine (legacy comparison):** Unhinted, integer-snapped, naive sRGB alpha blend (toggleable live with `F` key).<br>• **Pixel-Bounding-Box Icon Centering (`layout_icon_centered`):** Centers `MaterialIcons-Regular.ttf` glyphs using their exact rasterized bitmap dimensions `(w, h)`.<br>• **Hit-Testing & Measurement:** `measure()`, `byte_x_offset()`, `hit_test_byte()` for accurate `nui-input` caret placement and drag selection. |
 | `crates/nui/src/widgets.rs` | **`nui_wc2` v3.0.0 `"slate"` Theme & Interactive Components (`Theme`, `UiState`, `Ui`):**<br>• `Theme::dark(rem)` (default) & `Theme::light(rem)` with exact `nui-theme.css` color tokens (`base`, `shade1..9`, `border1..4`, `highlight` `rgb(76,132,229)`, `highlight_dim` `rgb(67,112,191)`, semantic palettes).<br>• `ui.tabs()` — horizontal tab bar with `border2` underline and `2px` `highlight` active indicator.<br>• `ui.button()` — `Primary`, `Outline`, `Ghost`, `Success`, `Danger` variants + active click flash.<br>• `ui.segmented()` — `nui-button-container[variant="segmented"]` joined control.<br>• `ui.text_input()` + `ui.input_label()` — single-line editable input with click-to-caret, drag selection, horizontal scroll clip, `Backspace`/`Delete`/Arrows/`Home`/`End`/`Ctrl+A`, and trailing `×` clear button.<br>• `ui.select()` — dropdown control with seamless clip-rounded trigger/popup seam, top-layer overlay popup, hover/selected checkmark rows, and outside-click close.<br>• `ui.slider()` — `0.25rem` pill track, bipolar center tick mark (`min < 0 && max > 0`), `1rem` circular thumb scaling `1.34x` on drag, wheel fine-tuning, and double-click / right-click reset to default.<br>• `ui.checkbox()`, `ui.switch()`, `ui.radio()`, `ui.badge()` (6px semantic left stripe + status dot). |
-| `crates/soundapp/src/audio.rs` | **`cpal` + `rtrb` + FFmpeg Audio Pipeline:**<br>• 8-second lock-free SPSC ring buffer (`rtrb`), WASAPI output stream (`48 kHz, 2 ch, F32, 480-frame buffer`), FFmpeg decode thread (`sa_ffmpeg_open`, always `threads = 1`), cosine fades, 8-tap Lanczos resampling, WSOLA pitch/tempo/formant, EOF drain (`decoder_eof` → `track_ended`), and duplicate-callback filtering. |
+| `crates/soundapp/src/audio.rs` | **`cpal` + `rtrb` + FFmpeg Audio Pipeline:**<br>• 8-second lock-free SPSC ring buffer (`rtrb`), WASAPI output stream (`48 kHz, 2 ch, F32, 480-frame buffer`), FFmpeg decode thread (`sa_ffmpeg_open`, always `threads = 1`), cosine fades, 8-tap Lanczos resampling, Rubber Band R3 real-time pitch/tempo/formant, EOF drain (`decoder_eof` → `track_ended`), and duplicate-callback filtering. |
 | `crates/nui-demo/src/main.rs` | **NUI Component Playground (`nui_demo.exe`):**<br>• Six tabs — *Controls & Inputs*, *Layout & Cards*, *Vectors & Canvas*, *Typography & Icons*, *Virtual List 10k*, *Menus & Overlays* — driving the same `Scene`/`Renderer`/`Ui` API as the player.<br>• App shell: undecorated header (empty middle = live drag zone), `.nui-menu-bar` (File / View / Components / Diagnostics), animated collapsible `nui-sidebar` + `nui-link-list[mode="fold"]`, right-click `nui-context-menu`, modal `nui-dialog` owning the demo controls.<br>• Secondary `UiState` Inspector window (`W`), file-drop preview (`D`), edge/corner window resize; zero audio/FFmpeg dependencies (`nui` + `winit` only). |
 | `crates/soundapp/src/main.rs` | **SoundApp Player Shell (`soundapp_r.exe`, `480x278` logical with controls / `480x221` without, min `480x221`):**<br>• Minimalist flat window (no nested card): `28px` top bar (play/pause, loop, shuffle, `n of m` counter, settings, close), `126px` cover tile with `-45°` extension ribbon, metadata rows (folder / file / format / bitrate / artist / album / title), flat scrub bar + status line, and an optional `55px` transport bar (`C`) with monitoring / parameters / volume / loop / shuffle / prev / play / next.<br>• Native Windows 11 DWM drop shadow (`with_undecorated_shadow(true)`), rounded corners (`CornerPreference::Round`), dark border; Per-Monitor V2 HiDPI + live zoom (`Ctrl + Wheel`, `+`/`-`/`0`).<br>• Implicit folder playlist: opening a file plays its sibling folder (index-matched), a folder recurses; three-zone drop overlay (add / replace / open in mixer, `Ctrl` = flat).<br>• NUI component showcase lives in `crates/nui-demo`. |
 
@@ -63,6 +65,24 @@ We are building **three things simultaneously** inside a single Cargo workspace 
 - Embedded cover art: `sa_ffmpeg_probe_metadata` decodes `AV_DISPOSITION_ATTACHED_PIC` in-memory from the **same** `AVFormatContext` open (`avcodec` + `swscale`) to `128×128` RGBA. No second open.
 
 **Engines parked.** `midi.rs` and `tracker.rs` remain on disk but are **not compiled** (`symphonia` and `rustysynth` removed from `crates/soundapp/Cargo.toml`) while the FFmpeg core workflow is hardened.
+
+### 2.2b Landed 2026-10-23 — Audio Test Harness & Downstream Pitch/Time Stage (commit `ca609d6`)
+
+- **Harness (`crates/soundapp`):** `soundapp_r.exe --render <in> --out <out.wav> [--pitch <st>] [--tempo <ratio>] [--formant|--no-formant] [--tape <st>] [--limit <s>]` runs the live DSP path offline (float32 WAV). `--latency-probe` logs param-change latency. `scripts/audiotest/`: `gen_signals.py` (1 kHz sine, log sweep, click train → `target/audiotest/`), `analyze_wav.py` (duration ratio, dominant freq/cents, THD+N, spurious peaks, discontinuities, RMS, transient smear), `run_matrix.ps1` (pitch × tempo matrix).
+- **Architecture:** decoder → 8 s source ring (tape step applied) → `stretcher_thread` running `Box<dyn PitchStage>` (`process`, `drain`, `set_pitch`, `set_tempo`, `set_formant`, `reset`, `latency_frames`) → 80 ms output ring → cpal callback. DSP taps are post-stretch. Seek/load drains both rings via `flush_ack` + `stage_ack`. Position = source position − stretcher latency − pending.
+- **Measured:** param-change latency **8.00 s → 85 ms** (unchanged by the engine replacement).
+- **Fixed:** shifter-expanded frames were silently dropped when the ring was full (`push_frames_fit` + carry); `out_produced` ignored carry-drain return (starvation trace `[stretch] starving:` kept as guard).
+- **Landed 2026-10-24:** `RubberBandStage` replaces both the original OLA and a rejected Signalsmith implementation with vendored **Rubber Band Library 4.0.0**, using the official R3 finer engine in real-time mode (`OptionProcessRealTime | OptionEngineFiner | OptionChannelsTogether`). Tempo/pitch/formant controls run in the existing downstream stage; one-shot EOF drain and seek/reset semantics are preserved. Formant-preserve defaults off to match the Electron reference, with true R3 formant preservation available in the UI.
+- **Verified:** 15 SoundApp tests and release build pass; 45-render harness has zero failures and no sine discontinuities. R3 start delay is **42.7 ms @48 kHz**; live parameter latency remains **85 ms**, seek and position correction pass. R3 sine THD+N varies from −19…−83 dB, so Signalsmith's better sine metrics are not a musical-quality verdict. A/B music renders live in `target/audiotest/ab/`; David's listening comparison remains the acceptance check.
+- **Dependency & license:** official C++ source is vendored under `crates/soundapp/vendor/rubberband/` with builtin FFT/resampler and no Rust binding dependency. Rubber Band is GPL-2.0-or-later or commercial; distribution requires GPL compliance or a commercial license. Signalsmith was removed after David found its musical output significantly worse.
+
+### 2.2c Landed 2026-10-24 — NUI Spacing Tokens & Layout Fixes
+
+- ~30 spacing tokens added to `Theme` in `crates/nui/src/widgets.rs` from the nui_wc2 CSS (card padding/gap, label/group/form-row gaps, button/control heights, tabs, menu bar, link list, page padding, radius1/2 realigned). Source table: [`nui_spacing_tokens.md`](nui_spacing_tokens.md).
+- Tokens wired through cards, tabs, form fields/rows/groups, buttons, menu bar, checkbox/switch/radio labels, and fold-mode link lists. Plain non-fold link lists are not implemented, so `link_item_height()` remains unused.
+- `Ui.viewport` is published by both nui-demo windows. `layout_grid` uses viewport-driven web breakpoints (30/48 rem) with the legacy container fallback for hosts that do not publish it.
+- Fixed heading/caption overlap in Layout & Cards and Menus & Overlays by allocating caption rows; fixed three-column grid rendering only column 0.
+- Verified with 10 numeric layout regressions, GPU/CPU dark screenshots, and a light-mode capture. Component port priorities: [`nui_port_inventory.md`](nui_port_inventory.md). Target UI screenshots: `docs/reference_ui/`.
 
 ### 2.3 Measured Benchmarks (24-Logical-Core Machine, `1290×735` Physical Window @ 1.5× DPI)
 
@@ -145,14 +165,15 @@ Goal: Full parity with the Electron app's 3 playback engines and audio parameter
   - Direct C ABI bridge (`crates/soundapp/src/ffmpeg_bridge.cpp`, compiled by `build.rs` against FFmpeg 7+ headers/libs from `D:\Work\_GIT\SoundApp\bin\win_bin`) for universal format support, seeking and metadata extraction. **FFmpeg is the only decode path** — `symphonia` was dropped on 2026-10-17.
   - 8-tap Lanczos sample-rate conversion in the Rust resampler + output device selection via `cpal`.
 - [x] **2.3 Real-Time Pitch / Tempo / Formant:**
-  - Rust `RealTimePitchShifter` (WSOLA) for pitch/tempo/formant, with FFmpeg's `rubberband`/`atempo` filter graph in the bridge for the decode-side path.
+  - `RubberBandStage` over vendored Rubber Band 4.0.0 R3 finer real-time engine for pitch/tempo and true optional formant preservation, with FFmpeg's `rubberband`/`atempo` filter graph retained in the bridge for the decode-side path.
   - Supports `mode: Tape` (playback rate resample) vs `mode: PitchTime` (`pitch: -12..+12 st`, `tempo: 0.5..2.0x`, `formant: bool`, `locked: bool` across track changes) without the 70 MB WASM heap or 1-second worklet warmup delay.
   - **Never call `sa_ffmpeg_set_*` for slider changes** — each call re-inits the FFmpeg filter graph and flushes ~1 s of decoded audio; parameter changes are applied in the Rust shifter instead.
-- [ ] **2.4 MIDI Engine (`rustysynth` + `midly`): PARKED 2026-10-17** — `crates/soundapp/src/midi.rs` is kept on disk but not compiled; `rustysynth`/`symphonia` were removed from `crates/soundapp/Cargo.toml`. Re-enable in Priority 3 (§6).
-  - Pure-Rust SF2 SoundFont synthesis using `.sf2` files from `D:\Work\_GIT\SoundApp\bin\soundfonts`.
-  - Parameters: `transpose` (`-12..+12`), `bpm` override, `metronome` click track, and live SoundFont switching.
-  - A/B ear-test against `js-synthesizer` / FluidSynth; fallback to `libfluidsynth` C FFI if needed.
-- [ ] **2.5 Tracker Engine (`libopenmpt` C FFI): PARKED 2026-10-17** — `crates/soundapp/src/tracker.rs` (native ProTracker `.mod` parser + Paula synthesizer) is kept on disk but not compiled. Re-enable in Priority 3 (§6), or port the path to `libopenmpt` FFI for the wider `.xm`/`.it`/`.s3m` format set (test files in `D:\Work\_GIT\SoundApp\_Material\mod\`).
+- [ ] **2.4 MIDI Engine (`FluidSynth` C API): INTEGRATED 2026-10-24, final verification pending**
+  - FluidSynth 2.6.1 SoundFont synthesis with a native SMF parser/tempo map, seek, transpose, absolute BPM override, metronome, loop, and live SoundFont switching.
+  - Dynamic `libfluidsynth-3.dll` + `sndfile.dll`; development uses the reference `default.sf2`, which is not vendored. See current handover for packaging and format limits.
+- [ ] **2.5 Tracker Engine (`libopenmpt` C API): INTEGRATED 2026-10-24, final verification pending**
+  - libopenmpt 0.8.9 tracked-module playback with native pitch, tempo, stereo separation, interpolation, metadata, seek, loop, and channel VU.
+  - MOD/S3M/XM standalone rendering verified; real IT media and final live transport/control-latency verification remain.
 
 ---
 
@@ -163,8 +184,9 @@ Goal: Full parity with the Electron app's 3 playback engines and audio parameter
   - Implicit folder playlist (a file plays its sibling folder at the matched index; folders recurse) and a three-zone drop overlay: add to current, replace playlist, open in mixer (`Ctrl` = non-recursive).
   - Keyboard shortcuts (`Space`, `Left`/`Right`, `Up`/`Down` volume, `L` loop, `C` controls, `M`/`N`/`P`/`S`/`H`, `Ctrl +/-` scale).
 - [x] **3.2 Parameters Window (`P`):**
-  - Adaptive tabs (`Audio` / `MIDI` / `Tracker`) automatically switching to match the loaded file type, plus `Lock` toggle across tracks. *(The MIDI/Tracker tabs remain, but their engines are parked — see §2.2.)*
-  - Audio: Tape/RubberBand mode, playback speed, pitch, formant preserve. MIDI: SoundFont, transpose, BPM override, metronome. Tracker: stereo separation, pitch, tempo, interpolation filter. Footer: lock + Reset All.
+  - Adaptive pages (`Audio` / `MIDI` / `Tracker`) automatically switch to match the loaded file type, plus `Lock` across tracks.
+  - Audio: Tape/Pitch-Time mode, playback speed, pitch, formant preserve. MIDI: SoundFont, transpose, BPM override, metronome. Tracker: stereo separation, pitch, tempo, interpolation filter.
+  - MIDI/Tracker pages are native-only with full-width controls; Tape/Rubber Band is FFmpeg-only in both UI and audio pipeline. Compact card/window sizing remains under visual verification.
 - [x] **3.3 Monitoring Window (`N` — Real-Time DSP):**
   - Lock-free analysis tap from the `cpal` callback feeding an analysis ring buffer.
   - 2048-point radix-2 Hann-windowed FFT mapped onto 64 logarithmic bands, live zero-crossing-stabilized oscilloscope, stereo goniometer (Lissajous), phase correlation meter (`-1..+1`), stereo RMS/Peak VU bars, and BS.1770-4 LUFS (`Momentary`, `Short-Term`, `Integrated`, `True Peak` with K-weighting biquad filters).
@@ -189,14 +211,19 @@ Every milestone commit must **compile cleanly (`cargo build --release`)**, **pas
 | **`m2-vectors-and-input`** (Phase 1.3–1.4) | `kind = 4` AA capsule line primitive (GPU shader + CPU blitter), `ui.waveform()`, `ui.polyline()`, Windows clipboard (`Ctrl+C/X/V`), `Tab` focus ring, `nui-dropzone` | Release build + `--screenshot` of waveform/sparkline + input/dropzone test |
 | **`m3-multi-window`** (Phase 1.5) | Multi-window manager (`HashMap<WindowId, WindowEntry>`) sharing `TextSystem` + fast `hide()`/`show()` toggling (`P`, `N`, `M`, `S`, `H`) | Release build + multi-window toggle verification *(Completes Phase 1)* |
 | **`m4-transport-and-ffmpeg`** (Phase 2.1–2.2) | Transport/seek/cosine-fade state machine, playlist manager, background peak extraction, FFmpeg decoding/metadata + `rubato` HQ resampling | Headless + UI playback test across audio formats & sample rates |
-| **`m5-rubberband-midi-tracker`** (Phase 2.3–2.5) | Rubber Band pitch/tempo/formant FFI, MIDI SF2 engine (`rustysynth` + `midly`), and Tracker engine (`libopenmpt` FFI) | Playback verification on `.mp3`/`.flac`, `.mid`, and `.mod`/`.xm`/`.it`/`.s3m` *(Completes Phase 2)* |
+| **`m5-rubberband-midi-tracker`** (Phase 2.3–2.5) | Rubber Band R3 pitch/tempo/formant (landed), MIDI SF2 engine (`rustysynth` + `midly`), and Tracker engine (`libopenmpt` FFI) | Playback verification on `.mp3`/`.flac`, `.mid`, and `.mod`/`.xm`/`.it`/`.s3m` *(Completes Phase 2)* |
 | **`m6-player-and-params-ui`** (Phase 3.1–3.2) | Production Main Player window (cover art, scrub bar, playlist, shortcuts) + adaptive Parameters window (`P`) | Release build + dark-mode `--screenshot` of Player & Parameters windows |
 | **`m7-dsp-mixer-and-shell`** (Phase 3.3–3.5) | Monitoring window (`N`: 64-band FFT, oscilloscope, goniometer, LUFS), 20-stem Mixer (`M`), Settings (`S`), Help (`H`), tray, global hotkeys, file associations | Full end-to-end verification + benchmark pass via `scripts/measure-proc.ps1` |
 | **`m8-ffmpeg-hardening`** (`0fa94b5`, 2026-10-17) | `crates/nui-demo` split (5-tab playground + Inspector + dropzone), `kind = 5` image quads + `-45°` atlas text, `DWMWA_CLOAK` zero-flash reveal, `threads = 1` FFmpeg open, zero-stat playlist scan, EOF ring-buffer drain, gate-able DSP tap, 15 Hz idle playback cadence, embedded cover art, three-zone drop | Release build + dark-mode `--screenshot` of player + demo; startup `295 ms`; clean tree on `origin/master` |
+| **Rubber Band R3 + NUI spacing** (uncommitted, 2026-10-24) | Vendored Rubber Band R3 `PitchStage`, one-shot EOF drain, viewport-aware grid, spacing-token wiring, overlap fixes | Workspace release build + 29 tests + 45-render audio harness + dark GPU/CPU and light UI captures |
 
 ---
 
-## 6. Next Session Priorities (2026-10-17 handover)
+## 6. Next Session Priorities (2026-10-24)
+
+**Read [`handover_2026-10-24.md`](handover_2026-10-24.md) first.** Recovery checkpoints `9fe8448` (NUI) and `f72eca9` (SoundApp) are committed. The real-output tracker latency gate and scaled-seek regressions pass; the equivalent MIDI gate is implemented but not yet run. Finish native Parameters sizing/visual verification, run the MIDI gate, then recheck the complete transport and FFmpeg regression matrix. Do not treat the engines as finished merely because the modules and integration compile.
+
+The longer-term priorities below remain valid after that gate.
 
 ### Priority 1 — `crates/nui` Visual & Design Polish (in `crates/nui-demo`)
 
