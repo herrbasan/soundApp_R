@@ -338,14 +338,22 @@ impl Theme {
         }
     }
 
+    /// `--border-radius1: var(--nui-space-eighth)`.
     #[inline]
     pub fn radius1(&self) -> f32 {
-        (self.rem * 0.14).round().max(2.0)
+        self.space_eighth()
     }
 
+    /// `--border-radius2: var(--nui-space-quarter)`.
     #[inline]
     pub fn radius2(&self) -> f32 {
-        (self.rem * 0.25).round().max(3.0)
+        self.space_quarter()
+    }
+
+    /// `--border-radius3: var(--nui-space-half)`.
+    #[inline]
+    pub fn radius3(&self) -> f32 {
+        self.space_half()
     }
 
     /// `--nui-space: 1rem` — the base spacing unit all gaps/padding derive from.
@@ -382,6 +390,150 @@ impl Theme {
     #[inline]
     pub fn space_triple(&self) -> f32 {
         (self.rem * 3.0).round()
+    }
+
+    /// `calc(var(--nui-space) * 4)`.
+    #[inline]
+    pub fn space_quadruple(&self) -> f32 {
+        (self.rem * 4.0).round()
+    }
+
+    /// `--nui-layout-gap` default `1rem`.
+    #[inline]
+    pub fn layout_gap(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-card` padding — `var(--nui-space)`.
+    #[inline]
+    pub fn card_padding(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-card` gap between children — `var(--nui-space)`.
+    #[inline]
+    pub fn card_gap(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-input-group` gap between label and control — `var(--nui-space-quarter)`.
+    #[inline]
+    pub fn label_gap(&self) -> f32 {
+        self.space_quarter()
+    }
+
+    /// `nui-input-group` margin-bottom to the next group — `var(--nui-space)`.
+    #[inline]
+    pub fn group_gap(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-input-group > label` line box — `1.28rem` (font-size-xsmall × 1.6).
+    #[inline]
+    pub fn label_line_height(&self) -> f32 {
+        (self.rem * 1.28).round()
+    }
+
+    /// `nui-form-row` gap between controls — `var(--nui-space)`.
+    #[inline]
+    pub fn form_row_gap(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-button-container` gap — `var(--nui-space-half)`.
+    #[inline]
+    pub fn button_gap(&self) -> f32 {
+        self.space_half()
+    }
+
+    /// Base `button` min-height — `var(--nui-space-double)`.
+    #[inline]
+    pub fn button_height(&self) -> f32 {
+        self.space_double()
+    }
+
+    /// Base `button` horizontal padding — `var(--nui-space)`.
+    #[inline]
+    pub fn button_pad_x(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-button button` min-width — `6rem`.
+    #[inline]
+    pub fn button_min_width(&self) -> f32 {
+        (self.rem * 6.0).round()
+    }
+
+    /// `nui-tabs [role=tablist]` gap — `var(--nui-space-quarter)`.
+    #[inline]
+    pub fn tab_gap(&self) -> f32 {
+        self.space_quarter()
+    }
+
+    /// `nui-tabs [role=tablist]` margin-bottom — `var(--nui-space)`.
+    #[inline]
+    pub fn tabs_margin_bottom(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-tabs [role=tab]` horizontal padding — `var(--nui-space)`.
+    #[inline]
+    pub fn tab_pad_x(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-link-list` item min-height — `var(--nui-space-double)`.
+    #[inline]
+    pub fn link_item_height(&self) -> f32 {
+        self.space_double()
+    }
+
+    /// `nui-menu-bar` height — `var(--nui-space-double)`.
+    #[inline]
+    pub fn menu_bar_height(&self) -> f32 {
+        self.space_double()
+    }
+
+    /// `nui-page > section` bottom margin — `var(--nui-space-triple)`.
+    #[inline]
+    pub fn section_gap(&self) -> f32 {
+        self.space_triple()
+    }
+
+    /// `nui-page > *` horizontal padding — `var(--nui-space-double)`.
+    #[inline]
+    pub fn page_pad_x(&self) -> f32 {
+        self.space_double()
+    }
+
+    /// `nui-page > *` vertical padding — `var(--nui-space)`.
+    #[inline]
+    pub fn page_pad_y(&self) -> f32 {
+        self.space()
+    }
+
+    /// `nui-checkbox` gap between box and label — `var(--nui-space-half)`.
+    #[inline]
+    pub fn checkbox_gap(&self) -> f32 {
+        self.space_half()
+    }
+
+    /// Generic control min-height (`nui-checkbox` `2rem`).
+    #[inline]
+    pub fn control_height(&self) -> f32 {
+        (self.rem * 2.0).round()
+    }
+
+    /// `--icon-size: 1.2rem`.
+    #[inline]
+    pub fn icon_size(&self) -> f32 {
+        (self.rem * 1.2).round()
+    }
+
+    /// `--font-size-xlarge: 2rem`.
+    #[inline]
+    pub fn font_xlarge(&self) -> f32 {
+        (self.rem * 2.0).round()
     }
 
     /// `--nui-form-row-height: 2.5rem`.
@@ -876,6 +1028,10 @@ pub struct Ui<'a> {
     pub text_sys: &'a mut TextSystem,
     pub font_engine: FontEngine,
     pub theme: Theme,
+    /// Window size in physical pixels. `nui-layout` resolves its column count from
+    /// *viewport* media queries (as the web reference does), not from the container
+    /// width, so the host publishes the window size here. `(0.0, 0.0)` means unknown.
+    pub viewport: (f32, f32),
     /// Active declarative-layout column scopes (Phase 1.1). See `crate::layout`.
     pub layout_stack: Vec<LayoutCursor>,
 }
@@ -894,6 +1050,7 @@ impl<'a> Ui<'a> {
             text_sys,
             font_engine,
             theme,
+            viewport: (0.0, 0.0),
             layout_stack: Vec::new(),
         }
     }
@@ -982,9 +1139,9 @@ impl<'a> Ui<'a> {
         // `nui-tabs` (nui-theme.css line 4445): base-size label, `--nui-space` padding,
         // `--nui-space-quarter` gap between tabs.
         let fs = t.font_base();
-        let icon_sz = (t.rem * 1.08).round();
-        let pad_x = (t.rem * 0.8).round();
-        let gap = t.space_quarter();
+        let icon_sz = t.icon_size();
+        let pad_x = t.tab_pad_x();
+        let gap = t.tab_gap();
 
         // Bottom border line across full tablist width
         self.scene.rect(r.x, r.y + r.h - 1.0, r.w, 1.0, t.border2);
@@ -1004,7 +1161,7 @@ impl<'a> Ui<'a> {
             let icon_w = if icon.is_empty() {
                 0.0
             } else {
-                icon_sz + (t.rem * 0.4).round()
+                icon_sz + t.space_half()
             };
             let tab_w = (text_w + icon_w + pad_x * 2.0).round();
             let tab_r = Rect::new(tx, r.y, tab_w, r.h);
@@ -1406,7 +1563,7 @@ impl<'a> Ui<'a> {
             );
         }
 
-        let ltx = (r.x + box_sz + t.rem * 0.55).round();
+        let ltx = (r.x + box_sz + t.checkbox_gap()).round();
         self.text_clipped(
             FontFace::Regular,
             self.font_engine,
@@ -1484,7 +1641,7 @@ impl<'a> Ui<'a> {
             0.0,
         );
 
-        let ltx = (r.x + sw_w + t.rem * 0.55).round();
+        let ltx = (r.x + sw_w + t.checkbox_gap()).round();
         self.text_clipped(
             FontFace::Regular,
             self.font_engine,
@@ -1551,7 +1708,7 @@ impl<'a> Ui<'a> {
             }
         }
 
-        let ltx = (rx + d + t.rem * 0.55).round();
+        let ltx = (rx + d + t.checkbox_gap()).round();
         self.text_clipped(
             FontFace::Regular,
             self.font_engine,
@@ -3419,7 +3576,8 @@ impl<'a> Ui<'a> {
         let t = self.theme;
         // `nui-theme.css:633` — group headers are `min-height: var(--nui-space-triple)`.
         let hdr_h = (t.rem * 3.0).round();
-        let row_h = (t.rem * 2.65).round();
+        // `nui-link-list[mode="fold"] ul li { min-height: var(--nui-space-triple) }`.
+        let row_h = t.space_triple();
         let sep_h = (t.rem * 0.5).round();
         let mut h = 0.0;
         for e in entries {
@@ -3480,7 +3638,8 @@ impl<'a> Ui<'a> {
     ) -> bool {
         let t = self.theme;
         let hdr_h = (t.rem * 3.0).round();
-        let row_h = (t.rem * 2.65).round();
+        // `nui-link-list[mode="fold"] ul li { min-height: var(--nui-space-triple) }`.
+        let row_h = t.space_triple();
         let sep_h = (t.rem * 0.5).round();
         let fs = t.font_small();
         let pad_x = t.space();

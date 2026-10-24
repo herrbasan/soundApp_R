@@ -298,6 +298,7 @@ impl App {
         quit_at: Option<Instant>,
         prefer_backend: BackendKind,
         font_engine: FontEngine,
+        dark_mode: bool,
     ) -> Self {
         Self {
             start: Instant::now(),
@@ -306,7 +307,7 @@ impl App {
             quit_at,
             prefer_backend,
             font_engine,
-            dark_mode: true, // Dark mode by default (accessibility requirement)
+            dark_mode, // Dark mode by default (accessibility requirement); --light overrides
             ui_zoom: 1.0,
             screenshot_path: None,
             window: None,
@@ -461,6 +462,9 @@ impl App {
                 self.font_engine,
                 theme,
             );
+            // `nui-layout` media queries resolve against the *viewport* (as on the web),
+            // not the container — publish the physical window size every frame.
+            ui.viewport = (pw, ph);
 
             // ================================================================
             // 1. Application header (`nui-app-header`, 3.25rem) — chrome only.
@@ -573,7 +577,7 @@ impl App {
             let side_t = ui.state.animate_bool(8800, self.sidebar_open, 0.30);
             let side_w = ((rem * 15.0).round() * side_t).round();
 
-            let menu_h = (rem * 2.0).round();
+            let menu_h = theme.menu_bar_height();
             let zoom_items: &[MenuItem<'_>] = &[
                 MenuItem::Action {
                     label: "80%",
@@ -949,7 +953,7 @@ impl App {
 
                         let btn_lbl = format!("nui-button · variants (clicks: {})", self.click_counter);
                         let row = ui.form_field(&btn_lbl, Length::rem(2.25));
-                        let gap = theme.space_half();
+                        let gap = theme.button_gap();
                         let bw = ((row.w - gap * 4.0) / 5.0).floor();
                         let variants = [
                             (320u32, "Primary", ButtonVariant::Primary),
@@ -965,7 +969,7 @@ impl App {
                             }
                         }
 
-                        let b_row = ui.take(Length::rem(2.0));
+                        let b_row = ui.take(Length::Px(theme.button_height()));
                         let badge_h = (rem * 1.48).round();
                         let by = b_row.y + (b_row.h - badge_h) * 0.5;
                         let mut bx = b_row.x;
@@ -1091,7 +1095,9 @@ impl App {
 
                         ui.spacer(Length::rem(0.35));
                         ui.heading("cols([Rem(7), Fill(1)])");
-                        let row = ui.take(Length::rem(3.6));
+                        // Heading line box + caption row must both fit inside the inset
+                        // card: pad(2×0.6rem) + heading(1.35rem) + gap + caption(1.45rem).
+                        let row = ui.take(Length::rem(4.5));
                         let [fixed_r, fill_r] =
                             ui.cols(row, Length::rem(0.5), [Length::rem(7.0), Length::fill()]);
                         ui.inset_card(
@@ -1101,16 +1107,16 @@ impl App {
                             theme.border2,
                             |ui| {
                                 ui.heading("Rem(7.0)");
+                                let cap = ui.take(Length::rem(1.45));
                                 let fs = theme.font_small();
-                                let b = ui.bounds();
                                 ui.text_clipped(
                                     FontFace::Regular,
                                     ui.font_engine,
                                     "fixed column",
-                                    b.x.round(),
-                                    (b.y + fs).round(),
+                                    cap.x.round(),
+                                    (cap.y + cap.h * 0.5 + fs * 0.33).round(),
                                     fs,
-                                    b.w,
+                                    cap.w,
                                     theme.text_muted,
                                 );
                             },
@@ -1122,16 +1128,16 @@ impl App {
                             theme.highlight_dim,
                             |ui| {
                                 ui.heading("Fill(1.0)");
+                                let cap = ui.take(Length::rem(1.45));
                                 let fs = theme.font_small();
-                                let b = ui.bounds();
                                 ui.text_clipped(
                                     FontFace::Regular,
                                     ui.font_engine,
                                     "takes the remainder",
-                                    b.x.round(),
-                                    (b.y + fs).round(),
+                                    cap.x.round(),
+                                    (cap.y + cap.h * 0.5 + fs * 0.33).round(),
                                     fs,
-                                    b.w,
+                                    cap.w,
                                     theme.highlight,
                                 );
                             },
@@ -1625,16 +1631,16 @@ impl App {
                             theme.border2,
                             |ui| {
                                 ui.heading("nui-context-menu");
-                                let b = ui.bounds();
+                                let cap = ui.take(Length::rem(2.9));
                                 let fs = theme.font_small();
                                 ui.text_clipped(
                                     FontFace::Regular,
                                     ui.font_engine,
                                     "Right-click anywhere in the workspace to open nui-context-menu (with nested submenus, checkmarks, and shortcuts).",
-                                    b.x.round(),
-                                    (b.y + fs).round(),
+                                    cap.x.round(),
+                                    (cap.y + fs).round(),
                                     fs,
-                                    b.w,
+                                    cap.w,
                                     theme.text_muted,
                                 );
                             },
@@ -2182,6 +2188,7 @@ impl App {
                 let pw = w as f32;
                 let ph = h as f32;
                 let mut ui = Ui::new(ui_state, scene, &mut self.text_sys, self.font_engine, theme);
+                ui.viewport = (pw, ph);
 
                 let (hdr_h, close) = ui.secondary_window_header(
                     pw,
@@ -2672,6 +2679,7 @@ fn main() {
     let mut drop_preview = false;
     let mut focus_preview = false;
     let mut open_window: Option<String> = None;
+    let mut dark_mode = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2711,6 +2719,7 @@ fn main() {
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()),
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).unwrap_or(60.0),
             "--screenshot" => screenshot = args.next(),
+            "--light" => dark_mode = false,
             other => eprintln!("[nui-demo] unknown argument: {other}"),
         }
     }
@@ -2719,7 +2728,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let quit_at = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
 
-    let mut app = App::new(animate, quit_at, backend, font_engine);
+    let mut app = App::new(animate, quit_at, backend, font_engine, dark_mode);
     if fps > 0.0 {
         app.frame_ms = (1000.0 / fps).round().max(1.0) as u64;
     }

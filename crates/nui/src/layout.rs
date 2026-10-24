@@ -68,7 +68,7 @@ pub struct LayoutCursor {
     pub bounds: Rect,
     /// The current vertical pen — the top edge of the next allocated row.
     pub y: f32,
-    /// Vertical gap added after each allocated row.
+    /// Vertical gap between adjacent rows, as in CSS `gap`.
     pub gap: f32,
 }
 
@@ -95,6 +95,59 @@ fn flex_widths<const N: usize>(avail: f32, rem: f32, specs: [Length; N]) -> [f32
             }
             other => other.resolve(rem),
         };
+    }
+    out
+}
+
+/// Shared axis splitter behind [`Ui::cols`]/[`Ui::rows`]: reserves fixed `Px`/`Rem`
+/// sizes first, shares the remainder between `Fill(w)` weights, snaps edges to integer
+/// pixels and gives the last cell the remainder so there are never subpixel seams.
+/// Neighbouring cells can never overlap: cell `i` ends at or before cell `i+1` starts.
+fn flex_split<const N: usize>(
+    horizontal: bool,
+    main_start: f32,
+    cross_start: f32,
+    main_len: f32,
+    cross_len: f32,
+    gap_px: f32,
+    rem: f32,
+    specs: [Length; N],
+) -> [Rect; N] {
+    let avail = (main_len - gap_px * (N as f32 - 1.0)).max(0.0);
+    let sizes = flex_widths(avail, rem, specs);
+
+    let mut out = [Rect::new(0.0, 0.0, 0.0, 0.0); N];
+    let mut cursor = main_start;
+    for i in 0..N {
+        let a0 = cursor.round();
+        let is_last = i == N - 1;
+        let a1 = if is_last {
+            main_start + main_len
+        } else {
+            (cursor + sizes[i]).round()
+        };
+        let cell = (a1 - a0).max(0.0);
+        out[i] = if horizontal {
+            Rect::new(a0, cross_start, cell, cross_len)
+        } else {
+            Rect::new(cross_start, a0, cross_len, cell)
+        };
+        cursor += sizes[i] + gap_px;
+    }
+    out
+}
+
+/// Split `r` into `n` equal columns separated by `gap_px`; the last column absorbs the
+/// rounding remainder (`n` comes pre-resolved from the responsive/viewport policy).
+fn grid_rects(n: usize, r: Rect, gap_px: f32) -> Vec<Rect> {
+    let col_w = ((r.w - gap_px * (n as f32 - 1.0)).max(0.0) / n as f32).round();
+    let mut out = Vec::with_capacity(n);
+    let mut cursor = r.x;
+    for i in 0..n {
+        let x0 = cursor.round();
+        let x1 = if i + 1 == n { r.x + r.w } else { x0 + col_w };
+        out.push(Rect::new(x0, r.y, (x1 - x0).max(0.0), r.h));
+        cursor += col_w + gap_px;
     }
     out
 }
@@ -129,48 +182,30 @@ impl<'a> Ui<'a> {
     /// proportionally between `Fill(w)` columns. Edges are rounded and the final column
     /// is snapped to `r.x + r.w` so there are never subpixel seams between columns.
     pub fn cols<const N: usize>(&self, r: Rect, gap: Length, specs: [Length; N]) -> [Rect; N] {
-        let rem = self.theme.rem;
-        let gap_px = gap.resolve(rem);
-        let avail = (r.w - gap_px * (N as f32 - 1.0)).max(0.0);
-        let widths = flex_widths(avail, rem, specs);
-
-        let mut out = [Rect::new(0.0, 0.0, 0.0, 0.0); N];
-        let mut cursor = r.x;
-        for i in 0..N {
-            let x0 = cursor.round();
-            let is_last = i == N - 1;
-            let x1 = if is_last {
-                r.x + r.w
-            } else {
-                (cursor + widths[i]).round()
-            };
-            out[i] = Rect::new(x0, r.y, (x1 - x0).max(0.0), r.h);
-            cursor += widths[i] + gap_px;
-        }
-        out
+        flex_split(
+            true,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            gap.resolve(self.theme.rem),
+            self.theme.rem,
+            specs,
+        )
     }
 
     /// Split `r` vertically into `N` rows separated by `gap` (mirror of [`Ui::cols`]).
     pub fn rows<const N: usize>(&self, r: Rect, gap: Length, specs: [Length; N]) -> [Rect; N] {
-        let rem = self.theme.rem;
-        let gap_px = gap.resolve(rem);
-        let avail = (r.h - gap_px * (N as f32 - 1.0)).max(0.0);
-        let heights = flex_widths(avail, rem, specs);
-
-        let mut out = [Rect::new(0.0, 0.0, 0.0, 0.0); N];
-        let mut cursor = r.y;
-        for i in 0..N {
-            let y0 = cursor.round();
-            let is_last = i == N - 1;
-            let y1 = if is_last {
-                r.y + r.h
-            } else {
-                (cursor + heights[i]).round()
-            };
-            out[i] = Rect::new(r.x, y0, r.w, (y1 - y0).max(0.0));
-            cursor += heights[i] + gap_px;
-        }
-        out
+        flex_split(
+            false,
+            r.y,
+            r.x,
+            r.h,
+            r.w,
+            gap.resolve(self.theme.rem),
+            self.theme.rem,
+            specs,
+        )
     }
 
     /// Push a layout column over `r` (row gap `gap`), run `f`, then pop the scope.
@@ -202,12 +237,12 @@ impl<'a> Ui<'a> {
         let t = self.theme;
         self.scene.shadow(
             r.x,
-            r.y + (t.rem * 0.18).round(),
+            r.y + (t.rem * 0.3).round(),
             r.w,
             r.h,
             t.radius2(),
-            (t.rem * 0.75).round(),
-            crate::widgets::rgba(0, 0, 0, if t.dark { 55 } else { 18 }),
+            t.space(),
+            crate::widgets::rgba(0, 0, 0, if t.dark { 77 } else { 26 }),
         );
         self.scene.rounded_rect(
             r.x,
@@ -231,9 +266,11 @@ impl<'a> Ui<'a> {
         out
     }
 
-    /// Standard `nui-card` defaults from `nui-theme.css`: `1.25rem` padding, `1.0rem` gap.
+    /// Standard `nui-card` defaults from `nui-theme.css`: `var(--nui-space)` padding and gap.
     pub fn nui_card<R>(&mut self, r: Rect, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.card(r, Length::Rem(1.25), Length::Rem(1.0), f)
+        let pad = self.theme.card_padding();
+        let gap = self.theme.card_gap();
+        self.card(r, Length::Px(pad), Length::Px(gap), f)
     }
 
     /// Draw a `base` surface with an explicit `border` (inset panel) and lay out its interior.
@@ -277,22 +314,36 @@ impl<'a> Ui<'a> {
         }
     }
 
+    /// Column count for a `nui-layout` grid at the current viewport width.
+    ///
+    /// The web reference clamps `nui-layout` columns with *media queries*
+    /// (`min-width: 30rem` / `48rem`) — i.e. against the **viewport**, not the
+    /// container — so a 3-column grid stays 3 columns inside a narrow card.
+    /// Without a published viewport the requested count is used unchanged.
+    pub fn viewport_col_count(&self, target_cols: usize) -> usize {
+        if self.viewport.0 <= 0.0 {
+            return target_cols.max(1);
+        }
+        self.responsive_col_count(self.viewport.0, target_cols)
+    }
+
     /// Split `r` horizontally into `responsive_col_count` equal columns separated by `gap`
     /// (default `--nui-space`, 1rem). Edges snap to integer pixels; the last column takes
     /// the remainder so there are never subpixel seams.
+    ///
+    /// When the host published a viewport, the column count resolves from the *viewport*
+    /// media queries (`min-width: 30rem` / `48rem`), exactly like the web `nui-layout` —
+    /// a 3-column grid keeps 3 columns inside a narrow card. Without a published viewport
+    /// the count falls back to the container width (legacy behaviour).
     pub fn layout_grid(&self, r: Rect, target_cols: usize, gap: Length) -> Vec<Rect> {
-        let n = self.responsive_col_count(r.w, target_cols);
+        let measure_w = if self.viewport.0 > 0.0 {
+            self.viewport.0
+        } else {
+            r.w
+        };
+        let n = self.responsive_col_count(measure_w, target_cols);
         let gap_px = gap.resolve(self.theme.rem);
-        let col_w = ((r.w - gap_px * (n as f32 - 1.0)).max(0.0) / n as f32).round();
-        let mut out = Vec::with_capacity(n);
-        let mut cursor = r.x;
-        for i in 0..n {
-            let x0 = cursor.round();
-            let x1 = if i + 1 == n { r.x + r.w } else { x0 + col_w };
-            out.push(Rect::new(x0, r.y, (x1 - x0).max(0.0), r.h));
-            cursor += col_w + gap_px;
-        }
-        out
+        grid_rects(n, r, gap_px)
     }
 
     /// Allocate a full-width grid row of `row_h` at the cursor, then grid it into columns.
@@ -373,7 +424,7 @@ impl<'a> Ui<'a> {
             self.theme.form_row_height()
         };
         let row = self.take(Length::Px(h));
-        self.cols(row, Length::Rem(1.0), specs)
+        self.cols(row, Length::Px(self.theme.form_row_gap()), specs)
     }
 
     /// Advance the pen by `h` without adding the row gap (used for tight label stacks).
@@ -459,15 +510,20 @@ impl<'a> Ui<'a> {
     }
 
     /// `nui-input-group` field: uppercase label at the cursor, advance by the label line
-    /// (`0.95rem`) plus the `--nui-space-quarter` label/control gap, then a control row of
-    /// `control_h`. Returns the control rect.
+    /// box (`1.28rem`, web `label { line-height }`) plus the `--nui-space-quarter`
+    /// label/control gap, then a control row of `control_h`. Returns the control rect.
+    ///
+    /// The web group also carries `margin-bottom: var(--nui-space)`; here the enclosing
+    /// column gap plays that role, so the pen is topped up to a full `group_gap()` below
+    /// the control when the host gap is smaller — consecutive groups sit exactly
+    /// `--nui-space` apart regardless of the card's own gap.
     pub fn form_field(&mut self, label: &str, control_h: Length) -> Rect {
         let (x, y, w) = {
             let c = self.layout_stack.last().expect("Ui layout_stack is empty");
             (c.bounds.x, c.y, c.bounds.w)
         };
         self.input_label_clipped(x, y, w, label);
-        let adv = (self.theme.rem * 0.95).round() + self.theme.space_quarter();
+        let adv = self.theme.label_line_height() + self.theme.label_gap();
         {
             let c = self
                 .layout_stack
@@ -475,11 +531,168 @@ impl<'a> Ui<'a> {
                 .expect("Ui layout_stack is empty");
             c.y = (c.y + adv).round();
         }
-        self.take(control_h)
+        let control = self.take(control_h);
+        let cur_gap = self.layout_stack.last().map(|c| c.gap).unwrap_or(0.0);
+        let top_up = self.theme.group_gap() - cur_gap;
+        if top_up > 0.5 {
+            self.spacer(Length::Px(top_up));
+        }
+        control
     }
 
     /// `nui-input-group` with the standard `--nui-form-row-height` (2.5rem) control height.
     pub fn input_group(&mut self, label: &str) -> Rect {
-        self.form_field(label, Length::Rem(2.5))
+        self.form_field(label, Length::Px(self.theme.form_row_height()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::Scene;
+    use crate::text::{FontEngine, TextSystem};
+    use crate::widgets::{Theme, UiState};
+
+    /// A real `Ui` over CPU-only primitives — no window, no GPU. Every cursor/geometry
+    /// path runs exactly as in the app. Leaked boxes keep the lifetimes self-contained.
+    fn test_ui(rem: f32) -> Ui<'static> {
+        let state = Box::leak(Box::new(UiState::new()));
+        let scene = Box::leak(Box::new(Scene::new()));
+        let text = Box::leak(Box::new(TextSystem::new()));
+        Ui::new(state, scene, text, FontEngine::Swash, Theme::dark(rem))
+    }
+
+    const EPS: f32 = 0.51;
+
+    #[test]
+    fn cols_fixed_and_fill_have_no_overlap_and_exact_edges() {
+        // The nui-demo `cols([Rem(7), Fill(1)])` case @1.5x dpi (rem 24).
+        let ui = test_ui(24.0);
+        let r = Rect::new(100.0, 50.0, 800.0, 60.0);
+        let [fixed, fill] = ui.cols(r, Length::rem(0.5), [Length::rem(7.0), Length::fill()]);
+        assert_eq!(fixed.w, 7.0 * 24.0);
+        assert_eq!(fixed.x, r.x);
+        assert!(
+            fill.x >= fixed.x + fixed.w + 12.0 - EPS,
+            "fill.x {} overlaps fixed column ending at {}",
+            fill.x,
+            fixed.x + fixed.w
+        );
+        assert!((fill.w - (800.0 - 168.0 - 12.0)).abs() <= 1.0);
+        assert!((fill.x + fill.w - (r.x + r.w)).abs() <= EPS);
+    }
+
+    #[test]
+    fn rows_mirror_cols_on_the_vertical_axis() {
+        let ui = test_ui(16.0);
+        let r = Rect::new(10.0, 20.0, 300.0, 400.0);
+        let [a, b] = ui.rows(r, Length::rem(1.0), [Length::fill(), Length::fill()]);
+        assert_eq!(a.x, r.x);
+        assert_eq!(a.w, r.w);
+        assert!(b.y >= a.y + a.h + 16.0 - EPS, "rows overlap");
+        assert_eq!(b.y + b.h, r.y + r.h);
+    }
+
+    #[test]
+    fn layout_grid_uses_viewport_media_queries_not_container_width() {
+        // Regression: a 3-col grid inside a ~653px-wide card @1.5x (27.2rem container)
+        // collapsed to 1 column under container-based resolution. The web reference
+        // clamps against the viewport (76.2rem) and keeps 3 columns.
+        let mut ui = test_ui(24.0);
+        ui.viewport = (1830.0, 1110.0);
+        let card = Rect::new(0.0, 0.0, 653.0, 76.0);
+        let cells = ui.layout_grid(card, 3, Length::rem(0.5));
+        assert_eq!(cells.len(), 3, "viewport-based count must keep 3 columns");
+        for w in cells.windows(2) {
+            assert!(w[1].x >= w[0].x + w[0].w + 12.0 - EPS, "cells overlap");
+        }
+        assert_eq!(cells[2].x + cells[2].w, card.x + card.w);
+    }
+
+    #[test]
+    fn layout_grid_falls_back_to_container_without_published_viewport() {
+        let ui = test_ui(16.0);
+        let cells = ui.layout_grid(Rect::new(0.0, 0.0, 400.0, 50.0), 3, Length::rem(0.5));
+        assert_eq!(cells.len(), 1, "no viewport => legacy container resolution");
+        let cells = ui.layout_grid(Rect::new(0.0, 0.0, 1200.0, 50.0), 3, Length::rem(0.5));
+        assert_eq!(cells.len(), 3);
+    }
+
+    #[test]
+    fn responsive_breakpoints_match_web_media_queries() {
+        let ui = test_ui(16.0);
+        assert_eq!(ui.responsive_col_count(479.0, 3), 1, "< 30rem => 1");
+        assert_eq!(ui.responsive_col_count(480.0, 3), 2, "30rem => clamp 2");
+        assert_eq!(ui.responsive_col_count(767.0, 3), 2);
+        assert_eq!(ui.responsive_col_count(768.0, 3), 3, "48rem => target");
+        assert_eq!(ui.viewport_col_count(3), 3, "unpublished viewport => target");
+    }
+
+    #[test]
+    fn form_field_label_block_uses_label_line_height_and_gap_tokens() {
+        let mut ui = test_ui(16.0);
+        ui.with_column(Rect::new(0.0, 0.0, 400.0, 400.0), Length::rem(0.62), |ui| {
+            let y0 = ui.bounds().y;
+            let control = ui.form_field("label", Length::rem(2.5));
+            let t = &ui.theme;
+            let label_block = t.label_line_height() + t.label_gap();
+            assert!((control.y - (y0 + label_block)).abs() <= 1.0);
+            assert_eq!(control.h, t.form_row_height());
+        });
+    }
+
+    #[test]
+    fn consecutive_input_groups_sit_one_group_gap_apart_in_tight_cards() {
+        let mut ui = test_ui(16.0);
+        ui.with_column(Rect::new(0.0, 0.0, 400.0, 600.0), Length::rem(0.62), |ui| {
+            let g1 = ui.input_group("first");
+            let y_after_g1 = ui.layout_stack.last().expect("stack").y;
+            // Web: control bottom + margin-bottom var(--nui-space).
+            assert_eq!(y_after_g1, g1.y + g1.h + ui.theme.group_gap());
+            let g2 = ui.input_group("second");
+            // g2's label starts at the pen; its control sits one label block below.
+            let label_block = ui.theme.label_line_height() + ui.theme.label_gap();
+            assert_eq!(g2.y, y_after_g1 + label_block);
+        });
+    }
+
+    #[test]
+    fn heading_row_then_taken_caption_row_never_overlap() {
+        // Pins the nui-demo Layout & Cards fix: the caption must be allocated *below*
+        // the heading's line box via the pen, not drawn from the column top.
+        let mut ui = test_ui(16.0);
+        ui.with_column(Rect::new(0.0, 0.0, 300.0, 200.0), Length::rem(0.2), |ui| {
+            let top = ui.bounds().y;
+            ui.heading("Rem(7.0)");
+            let cap = ui.take(Length::rem(1.45));
+            let heading_h = (ui.theme.rem * 1.35).round();
+            assert!(cap.y >= top + heading_h - EPS, "caption overlaps heading");
+        });
+    }
+
+    #[test]
+    fn spacing_token_scale_is_rem_derived() {
+        for rem in [16.0f32, 24.0] {
+            let t = Theme::dark(rem);
+            assert_eq!(t.space(), (rem * 1.0).round());
+            assert_eq!(t.space_eighth(), (rem * 0.125).round());
+            assert_eq!(t.space_quarter(), (rem * 0.25).round());
+            assert_eq!(t.space_half(), (rem * 0.5).round());
+            assert_eq!(t.space_double(), (rem * 2.0).round());
+            assert_eq!(t.space_triple(), (rem * 3.0).round());
+            assert_eq!(t.space_quadruple(), (rem * 4.0).round());
+            assert_eq!(t.radius1(), t.space_eighth());
+            assert_eq!(t.radius2(), t.space_quarter());
+            assert_eq!(t.radius3(), t.space_half());
+            assert_eq!(t.menu_bar_height(), t.space_double());
+            assert_eq!(t.button_height(), t.space_double());
+            assert_eq!(t.link_item_height(), t.space_double());
+            assert_eq!(t.group_gap(), t.space());
+            assert_eq!(t.form_row_gap(), t.space());
+            assert_eq!(t.checkbox_gap(), t.space_half());
+            assert_eq!(t.button_gap(), t.space_half());
+            assert_eq!(t.label_gap(), t.space_quarter());
+            assert_eq!(t.label_line_height(), (rem * 1.28).round());
+        }
     }
 }
