@@ -120,6 +120,11 @@ We are building **three things simultaneously** inside a single Cargo workspace 
 9. **Windows `avcodec_open2` `threads = 0` contention with `wglCreateContext` (`LdrpLoaderLock`):**
    - Default FFmpeg audio decoder init spawns up to 24 worker threads; each trigger of `DLL_THREAD_ATTACH` acquires the Windows loader lock, which OpenGL context creation is also waiting on. The result is a ~600 ms stall before the first frame.
    - **Always pass `threads = 1` for audio decoders** in `sa_ffmpeg_open`. Audio decode does not benefit from frame threading, and the fix cut window startup from `931 ms` to `295 ms`.
+10. **Undecorated windows must not carry the frame style bits (content offset on old Intel drivers):**
+    - winit's `to_window_styles()` unconditionally adds `WS_CAPTION | WS_BORDER | WS_SYSMENU` (+ `WS_SIZEBOX`, `WS_MINIMIZEBOX`, `WS_MAXIMIZEBOX`) and hides the frame only through a `WM_NCCALCSIZE` client-area override. On some driver stacks (measured: Intel HD 520 `20.19.15.4454` + Parsec Virtual Display Adapter, 144 DPI) DWM places the window surface at the frame origin those bits imply — `AdjustWindowRectExForDpi` — while the client area claims the whole window. Result: content displaced down/right by exactly `(border, caption)` = `(11,45) px` with the bottom/right clipped, while `GetClientRect`, `ClientToScreen` and the style all look correct.
+    - `Renderer::strip_frame_styles()` removes those bits at creation and again after `set_visible` (winit re-applies them on every window-flag change). Frame origin becomes `(0,0)` and the offset disappears on **every** driver, so it is the correct fix everywhere, not a workaround.
+    - `Renderer::install_nc_guard()` is required with it: the bits stripped, `WM_NCACTIVATE` still reaches `DefWindowProc`, which paints an inactive caption strip across the top on deactivation. The guard answers `WM_NCACTIVATE`/`WM_NCPAINT`/`WM_NCUAHDRAW*` itself and forwards everything else to winit.
+    - Ruled out by measurement, do not retry: `SWP_FRAMECHANGED` alone, `DWMWA_NCRENDERING_POLICY = DWMNCRP_DISABLED`, `DwmExtendFrameIntoClientArea(-1,-1,-1,-1)`, and the ±1px resize nudge — all leave the offset untouched. Minimizing an old-Intel WGL window kills the app (context loss), so don't use min/restore as a probe.
 
 ---
 

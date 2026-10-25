@@ -1,6 +1,7 @@
 # soundApp_R & NUI Rust — Agent Briefing
 
 > **START HERE:** Read **[`docs/handover_2026-10-24.md`](docs/handover_2026-10-24.md)** for the authoritative uncommitted working state and unverified items. Then read **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap.
+> **RESOLVED 2026-10-25 (ALPHATAP field box):** frameless-window DWM composition offset — content displaced down/right, metrics healthy. Root cause: winit's undecorated windows carry `WS_CAPTION|WS_THICKFRAME|…`, and this driver stack places the window surface at that style's frame origin while the client claims the whole window. Fixed by stripping the bits + suppressing non-client painting in `crates/nui/src/render.rs`. Measurements, verified matrix and the one open item (native drag/resize) in **[`docs/handover_alphatap-render-offset-2026-10-25.md`](docs/handover_alphatap-render-offset-2026-10-25.md)**.
 
 **Last handover:** 2026-10-24 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`; local HEAD `f72eca9` not yet pushed). NUI and SoundApp recovery checkpoints are committed. Native Parameters sizing and final MIDI real-output latency verification remain open.
 

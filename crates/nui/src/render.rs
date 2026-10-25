@@ -692,7 +692,8 @@ impl Renderer {
                 {
                     Self::set_win32_background(&win, base);
                     Self::set_win32_cloak(&win, true);
-                    Self::ensure_frameless(&win);
+                    Self::strip_frame_styles(&win);
+                    Self::install_nc_guard(&win);
                 }
                 return (
                     win.clone(),
@@ -713,7 +714,8 @@ impl Renderer {
         {
             Self::set_win32_background(&win, base);
             Self::set_win32_cloak(&win, true);
-            Self::ensure_frameless(&win);
+            Self::strip_frame_styles(&win);
+            Self::install_nc_guard(&win);
         }
         let cpu = Self::init_cpu(&win);
         (
@@ -797,16 +799,90 @@ impl Renderer {
         }
     }
 
-    /// winit keeps `WS_CAPTION` in the styles of undecorated windows and hides
-    /// the caption only through its `WM_NCCALCSIZE` client-area override. On
-    /// some machines that override desyncs (a DPI/display change right at the
-    /// first show is a known trigger) and the caption strip renders over the
-    /// client, displacing it and every hitbox. Strip the style for real —
-    /// without `WS_CAPTION` no caption can render anywhere. The probe is one
-    /// `GetWindowLongPtrW` per present; it only writes when something (a
-    /// winit flag refresh) re-added the style.
+    /// Stop Windows from painting a non-client frame on this window.
+    ///
+    /// With the frame bits stripped the window has no caption to draw, but
+    /// `WM_NCACTIVATE` still reaches `DefWindowProc`, which paints an inactive
+    /// caption strip over the top of the client area on deactivation — measured
+    /// on ALPHATAP as a light-grey title bar appearing across the header band.
+    /// Answering `WM_NCACTIVATE` and `WM_NCPAINT` ourselves suppresses that,
+    /// since the client area already covers the whole window. Every other
+    /// message goes to winit's proc unchanged.
     #[cfg(target_os = "windows")]
-    fn ensure_frameless(win: &Window) {
+    fn install_nc_guard(win: &Window) {
+        use raw_window_handle::RawWindowHandle;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+            fn CallWindowProcW(prev: isize, hwnd: isize, msg: u32, wp: usize, lp: isize) -> isize;
+        }
+        const GWLP_WNDPROC: i32 = -4;
+        const WM_NCPAINT: u32 = 0x0085;
+        const WM_NCACTIVATE: u32 = 0x0086;
+        const WM_NCUAHDRAWCAPTION: u32 = 0x00AE;
+        const WM_NCUAHDRAWFRAME: u32 = 0x00AF;
+
+        static ORIG: OnceLock<Mutex<HashMap<isize, isize>>> = OnceLock::new();
+
+        unsafe extern "system" fn guard(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isize {
+            match msg {
+                WM_NCACTIVATE => return 1,
+                WM_NCPAINT | WM_NCUAHDRAWCAPTION | WM_NCUAHDRAWFRAME => return 0,
+                _ => {}
+            }
+            let orig = ORIG
+                .get()
+                .and_then(|m| m.lock().ok().map(|g| g.get(&hwnd).copied()))
+                .flatten()
+                .unwrap_or(0);
+            if orig == 0 {
+                0
+            } else {
+                CallWindowProcW(orig, hwnd, msg, wp, lp)
+            }
+        }
+
+        if let Ok(wh) = win.window_handle() {
+            if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                unsafe {
+                    let hwnd = h.hwnd.get() as isize;
+                    let map = ORIG.get_or_init(|| Mutex::new(HashMap::new()));
+                    let mut installed = map.lock().expect("nc guard map");
+                    if installed.contains_key(&hwnd) {
+                        return;
+                    }
+                    let prev =
+                        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, guard as *const () as isize);
+                    if prev != 0 {
+                        installed.insert(hwnd, prev);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove the frame style bits winit keeps on undecorated windows.
+    ///
+    /// winit's `to_window_styles()` unconditionally adds
+    /// `WS_CAPTION | WS_BORDER | WS_SYSMENU` (+ `WS_SIZEBOX`, `WS_MINIMIZEBOX`,
+    /// `WS_MAXIMIZEBOX`) and hides the frame only through its `WM_NCCALCSIZE`
+    /// client-area override. Some driver stacks place the window's surface at
+    /// the frame origin those bits imply — `AdjustWindowRectExForDpi` — while
+    /// the client area claims the whole window, so the content lands (border,
+    /// caption) low and right with the bottom/right clipped. Measured on Intel
+    /// HD 520 20.19.15.4454 + Parsec virtual display at 144 DPI: dy=+45 dx=+11,
+    /// exactly the frame origin for this style, byte-identical to the
+    /// framebuffer once shifted, and exactly (0,0) after the bits are gone.
+    /// DWM's own frame knobs (`DWMWA_NCRENDERING_POLICY=DWMNCRP_DISABLED`,
+    /// `DwmExtendFrameIntoClientArea(-1)`) do not affect it — the placement
+    /// comes from the style, not from frame rendering.
+    ///
+    /// winit re-applies the bits on every window-flag change (notably
+    /// `set_visible`), so this runs again after the window is shown.
+    #[cfg(target_os = "windows")]
+    fn strip_frame_styles(win: &Window) {
         use raw_window_handle::RawWindowHandle;
         #[link(name = "user32")]
         extern "system" {
@@ -824,19 +900,24 @@ impl Renderer {
         }
         const GWL_STYLE: i32 = -16;
         const WS_CAPTION: isize = 0x00C0_0000;
+        const WS_THICKFRAME: isize = 0x0004_0000;
         const WS_SYSMENU: isize = 0x0008_0000;
+        const WS_MINIMIZEBOX: isize = 0x0002_0000;
+        const WS_MAXIMIZEBOX: isize = 0x0001_0000;
+        const FRAME_BITS: isize =
+            WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
         const SWP_FRAMECHANGED: u32 = 0x0020;
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOMOVE: u32 = 0x0002;
         const SWP_NOZORDER: u32 = 0x0004;
         const SWP_NOACTIVATE: u32 = 0x0010;
-        const SWP_NOMOVE: u32 = 0x0002;
-        const SWP_NOSIZE: u32 = 0x0001;
         if let Ok(wh) = win.window_handle() {
             if let RawWindowHandle::Win32(h) = wh.as_raw() {
                 unsafe {
                     let hwnd = h.hwnd.get() as isize;
                     let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-                    if style & WS_CAPTION != 0 {
-                        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_CAPTION | WS_SYSMENU));
+                    if style & FRAME_BITS != 0 {
+                        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !FRAME_BITS);
                         SetWindowPos(
                             hwnd,
                             0,
@@ -844,7 +925,10 @@ impl Renderer {
                             0,
                             0,
                             0,
-                            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE
+                            SWP_FRAMECHANGED
+                                | SWP_NOZORDER
+                                | SWP_NOACTIVATE
+                                | SWP_NOMOVE
                                 | SWP_NOSIZE,
                         );
                     }
@@ -877,7 +961,12 @@ impl Renderer {
             self.pending_reveal = false;
             self.window.set_visible(true);
             #[cfg(target_os = "windows")]
-            Self::set_win32_cloak(&self.window, false);
+            {
+                // `set_visible` re-applies winit's window flags, which restores the
+                // frame bits; strip them again before the window is uncloaked.
+                Self::strip_frame_styles(&self.window);
+                Self::set_win32_cloak(&self.window, false);
+            }
             self.window.focus_window();
         }
     }
@@ -1159,7 +1248,6 @@ impl Renderer {
             }
         }
         self.reveal_if_pending();
-        Self::ensure_frameless(&self.window);
     }
 
     pub fn render(
