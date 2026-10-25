@@ -208,16 +208,19 @@ impl<'a> Ui<'a> {
         )
     }
 
-    /// Push a layout column over `r` (row gap `gap`), run `f`, then pop the scope.
-    pub fn with_column<R>(&mut self, r: Rect, gap: Length, f: impl FnOnce(&mut Self) -> R) -> R {
+    /// Push a layout column and return both its result and intrinsic content height.
+    fn with_column_measured<R>(
+        &mut self,
+        r: Rect,
+        gap: Length,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, f32) {
         let gap_px = gap.resolve(self.theme.rem).round();
         self.layout_stack.push(LayoutCursor {
             bounds: r,
             y: r.y.round(),
             gap: gap_px,
         });
-        // A `4px` pad keeps `:focus-visible` rings and slider thumbs at the column edge
-        // intact while clipping any overflowing text or child rows to the column.
         self.scene.push_clip(
             r.x - 4.0,
             r.y - 4.0,
@@ -225,15 +228,32 @@ impl<'a> Ui<'a> {
             (r.h + 8.0).max(0.0),
         );
         let out = f(self);
+        let cursor = self.layout_stack.last().expect("Ui layout_stack is empty");
+        let content_h = if cursor.y == r.y {
+            0.0
+        } else {
+            (cursor.y - r.y - cursor.gap).max(0.0)
+        };
         self.scene.pop_clip();
         self.layout_stack.pop();
-        out
+        (out, content_h)
+    }
+
+    /// Push a layout column over `r` (row gap `gap`), run `f`, then pop the scope.
+    pub fn with_column<R>(&mut self, r: Rect, gap: Length, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.with_column_measured(r, gap, f).0
     }
 
     /// Draw a `shade2`/`border2` card surface (`nui-card`) and lay out its padded interior.
     /// The `nui-theme.css` elevation (`box-shadow: 0 0.3rem 1rem rgba(0,0,0,0.3)`) is emitted
     /// before the surface so the opaque fill covers the shadow's interior.
-    pub fn card<R>(&mut self, r: Rect, pad: Length, gap: Length, f: impl FnOnce(&mut Self) -> R) -> R {
+    pub fn card<R>(
+        &mut self,
+        r: Rect,
+        pad: Length,
+        gap: Length,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         let t = self.theme;
         self.scene.shadow(
             r.x,
@@ -264,6 +284,56 @@ impl<'a> Ui<'a> {
         let out = self.with_column(inner, gap, f);
         self.scene.pop_clip();
         out
+    }
+
+    /// Content-sized card. `r.h` is only a minimum; children with intrinsic
+    /// heights determine the returned height. `take_rest` is not meaningful here.
+    pub fn card_auto<R>(
+        &mut self,
+        r: Rect,
+        pad: Length,
+        gap: Length,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, f32) {
+        let t = self.theme;
+        let shadow = self.scene.instances.len();
+        let surface_h = r.h.max(1.0);
+        self.scene.shadow(
+            r.x,
+            r.y + (t.rem * 0.3).round(),
+            r.w,
+            surface_h,
+            t.radius2(),
+            t.space(),
+            crate::widgets::rgba(0, 0, 0, if t.dark { 77 } else { 26 }),
+        );
+        self.scene.rounded_rect(
+            r.x,
+            r.y,
+            r.w,
+            surface_h,
+            t.radius2(),
+            if t.dark { t.shade2 } else { t.shade1 },
+            t.border2,
+            1.0,
+        );
+        let inner = self.pad(r, pad);
+        let layout_inner = Rect::new(inner.x, inner.y, inner.w, 32768.0 - inner.y);
+        self.scene
+            .push_clip(r.x + 1.0, r.y + 1.0, (r.w - 2.0).max(0.0), 32768.0 - r.y);
+        let (out, content_h) = self.with_column_measured(layout_inner, gap, f);
+        self.scene.pop_clip();
+        let height = (content_h + pad.resolve(t.rem) * 2.0).ceil().max(r.h);
+        self.scene.instances[shadow].rect[3] = height;
+        self.scene.instances[shadow + 1].rect[3] = height;
+        (out, height)
+    }
+
+    /// Standard content-sized `nui-card`, returning `(result, measured_height)`.
+    pub fn nui_card_auto<R>(&mut self, r: Rect, f: impl FnOnce(&mut Self) -> R) -> (R, f32) {
+        let pad = self.theme.card_padding();
+        let gap = self.theme.card_gap();
+        self.card_auto(r, Length::Px(pad), Length::Px(gap), f)
     }
 
     /// Standard `nui-card` defaults from `nui-theme.css`: `var(--nui-space)` padding and gap.
@@ -625,7 +695,11 @@ mod tests {
         assert_eq!(ui.responsive_col_count(480.0, 3), 2, "30rem => clamp 2");
         assert_eq!(ui.responsive_col_count(767.0, 3), 2);
         assert_eq!(ui.responsive_col_count(768.0, 3), 3, "48rem => target");
-        assert_eq!(ui.viewport_col_count(3), 3, "unpublished viewport => target");
+        assert_eq!(
+            ui.viewport_col_count(3),
+            3,
+            "unpublished viewport => target"
+        );
     }
 
     #[test]
@@ -668,6 +742,19 @@ mod tests {
             let heading_h = (ui.theme.rem * 1.35).round();
             assert!(cap.y >= top + heading_h - EPS, "caption overlaps heading");
         });
+    }
+
+    #[test]
+    fn auto_card_height_includes_children_gaps_and_padding() {
+        let mut ui = test_ui(16.0);
+        let (_, height) = ui.nui_card_auto(Rect::new(10.0, 20.0, 300.0, 0.0), |ui| {
+            ui.take(Length::rem(2.0));
+            ui.take(Length::rem(3.0));
+        });
+        // 2 + 3 rem children + 1 rem row gap + 2 rem vertical padding.
+        assert_eq!(height, 8.0 * 16.0);
+        assert_eq!(ui.scene.instances[0].rect[3], height);
+        assert_eq!(ui.scene.instances[1].rect[3], height);
     }
 
     #[test]

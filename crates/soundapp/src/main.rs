@@ -293,6 +293,8 @@ struct App {
     secondary_windows: WindowManager,
     pending_window_toggles: Vec<&'static str>,
     open_window_spec: Option<&'static WindowSpec>,
+    /// Last content-driven Parameters window height requested (physical px).
+    parameters_window_height: Option<f32>,
 
     // Interactive player states
     /// Playback parameters shown in the Parameters window (engine mode + the
@@ -377,11 +379,11 @@ const SAMPLE_RATES: &[&str] = &[
 const SPEC_PARAMETERS: WindowSpec = WindowSpec {
     key: "parameters",
     title: "SoundApp · Parameters [P]",
-    // All adaptive pages share the reference window's default geometry.
+    // Initial fallback only; the first layout replaces this with measured content height.
     width: 510.0,
-    height: 922.0,
+    height: 800.0,
     min_width: 480.0,
-    min_height: 720.0,
+    min_height: 600.0,
     undecorated: true,
 };
 
@@ -2157,6 +2159,7 @@ impl App {
             secondary_windows: WindowManager::new(theme_base),
             pending_window_toggles: Vec::new(),
             open_window_spec: None,
+            parameters_window_height: None,
 
             params: ParamState::default(),
             selected_device: 0,
@@ -3533,6 +3536,9 @@ impl App {
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
                 .toggle(event_loop, &spec, self.prefer_backend);
+            if key == "parameters" && !was_visible {
+                self.parameters_window_height = None;
+            }
             if key == "mixer" {
                 if was_visible {
                     self.close_mixer();
@@ -3571,6 +3577,9 @@ impl App {
         match event {
             WindowEvent::CloseRequested => {
                 self.secondary_windows.hide(key);
+                if key == "parameters" {
+                    self.parameters_window_height = None;
+                }
                 if key == "mixer" {
                     self.close_mixer();
                 }
@@ -3704,6 +3713,9 @@ impl App {
                             }
                         } else {
                             self.secondary_windows.hide(key);
+                            if key == "parameters" {
+                                self.parameters_window_height = None;
+                            }
                             if key == "mixer" {
                                 self.close_mixer();
                             }
@@ -3732,6 +3744,7 @@ impl App {
         // Phase 3.2 — intents queued by the Parameters window, applied after the
         // scene-build borrow ends (immediate engine forwarding).
         let mut params_intents = ParamsWindowIntents::default();
+        let mut parameters_required_height = None;
         // Adaptive Parameters page: a tracker module swaps the source-engine
         // section for the native libopenmpt card, a MIDI file for the native
         // FluidSynth card (computed before the window borrow; the tracker
@@ -3746,20 +3759,6 @@ impl App {
             };
             let sz = mw.window.inner_size();
             let (w, h) = (sz.width, sz.height);
-            if key == "parameters" {
-                let min_h = if tracker_page || midi_page {
-                    540.0
-                } else {
-                    spec.min_height
-                };
-                mw.window
-                    .set_min_inner_size(Some(winit::dpi::LogicalSize::new(spec.min_width, min_h)));
-                if h < min_h as u32 {
-                    let _ = mw
-                        .window
-                        .request_inner_size(winit::dpi::LogicalSize::new(w as f64, min_h));
-                }
-            }
             mw.size = (w, h);
             if w == 0 || h == 0 {
                 return;
@@ -3851,21 +3850,13 @@ impl App {
                     // ========================================================
                     let card_gap = Length::Rem(1.5).resolve(rem).round();
                     let card_w = (pw - m * 2.0).max(0.0);
-                    let native_h = Length::Rem(if midi_page { 22.5 } else { 19.25 })
-                        .resolve(rem)
-                        .round();
-                    let tape_h = Length::Rem(13.3).resolve(rem).round();
-                    let pt_h = Length::Rem(21.6).resolve(rem).round();
-                    let lock_h = Length::Rem(4.0).resolve(rem).round();
                     let mut cy = hdr_h + m;
 
                     if tracker_page {
-                        // ---- Tracker Engine card (native, always active) -----
-                        let native_r = Rect::new(m, cy, card_w, native_h);
-                        cy += native_h + card_gap;
-                        ui.nui_card(native_r, |ui| {
+                        let (_, card_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             draw_tracker_native_card(ui, &mut self.params, &mut params_intents);
                         });
+                        cy += card_h + card_gap;
                         let channel_count = self
                             .audio
                             .as_ref()
@@ -3876,10 +3867,7 @@ impl App {
                             .as_ref()
                             .map(|audio| audio.tracker_vu())
                             .unwrap_or_default();
-                        let channel_h = Length::Rem(9.75).resolve(rem).round();
-                        let channel_r = Rect::new(m, cy, card_w, channel_h);
-                        cy += channel_h + card_gap;
-                        ui.nui_card(channel_r, |ui| {
+                        let (_, card_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             draw_tracker_channel_card(
                                 ui,
                                 channel_count,
@@ -3889,22 +3877,18 @@ impl App {
                                 &mut params_intents,
                             );
                         });
-                        let separation_h = Length::Rem(16.75).resolve(rem).round();
-                        let separation_r = Rect::new(m, cy, card_w, separation_h);
-                        cy += separation_h + card_gap;
-                        ui.nui_card(separation_r, |ui| {
+                        cy += card_h + card_gap;
+                        let (_, card_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             draw_tracker_separation_card(ui, &mut self.params, &mut params_intents);
                         });
+                        cy += card_h + card_gap;
                     } else if midi_page {
-                        // ---- MIDI controls + independent SoundFont card -----
                         let native_bpm = self
                             .audio
                             .as_ref()
                             .map(|a| a.midi_native_bpm())
                             .unwrap_or(120.0);
-                        let native_r = Rect::new(m, cy, card_w, native_h);
-                        cy += native_h + card_gap;
-                        ui.nui_card(native_r, |ui| {
+                        let (_, card_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             draw_midi_native_card(
                                 ui,
                                 &mut self.params,
@@ -3912,10 +3896,8 @@ impl App {
                                 &mut params_intents,
                             );
                         });
-                        let font_h = Length::Rem(10.25).resolve(rem).round();
-                        let font_r = Rect::new(m, cy, card_w, font_h);
-                        cy += font_h + card_gap;
-                        ui.nui_card(font_r, |ui| {
+                        cy += card_h + card_gap;
+                        let (_, card_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             draw_midi_soundfont_card(
                                 ui,
                                 &self.soundfonts,
@@ -3923,15 +3905,12 @@ impl App {
                                 &mut params_intents,
                             );
                         });
+                        cy += card_h + card_gap;
                     }
 
                     if !tracker_page && !midi_page {
-                        // ---- Tape Speed card (engine: tape) ------------------
                         let tape_active = self.params.tape;
-                        let tape_r = Rect::new(m, cy, card_w, tape_h);
-                        cy += tape_h + card_gap;
-                        let tape_click = engine_card_hit(&mut ui, 1200, tape_r, tape_active);
-                        ui.nui_card(tape_r, |ui| {
+                        let (_, tape_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             draw_tape_speed_card(
                                 ui,
                                 "Tape Speed",
@@ -3940,6 +3919,9 @@ impl App {
                                 &mut params_intents,
                             );
                         });
+                        let tape_r = Rect::new(m, cy, card_w, tape_h);
+                        cy += tape_h + card_gap;
+                        let tape_click = engine_card_hit(&mut ui, 1200, tape_r, tape_active);
                         if tape_click {
                             self.params.tape = true;
                             params_intents.pipeline_changed = true;
@@ -3948,12 +3930,8 @@ impl App {
                             dim_card(&mut ui, tape_r);
                         }
 
-                        // ---- Rubber Band Pitch / Time card (engine: pitchtime) ---
                         let pt_active = !self.params.tape;
-                        let pt_r = Rect::new(m, cy, card_w, pt_h);
-                        cy += pt_h + card_gap;
-                        let pt_click = engine_card_hit(&mut ui, 1250, pt_r, pt_active);
-                        ui.nui_card(pt_r, |ui| {
+                        let (_, pt_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             draw_pitch_time_card(
                                 ui,
                                 "Pitch / Time",
@@ -3962,6 +3940,9 @@ impl App {
                                 &mut params_intents,
                             );
                         });
+                        let pt_r = Rect::new(m, cy, card_w, pt_h);
+                        cy += pt_h + card_gap;
+                        let pt_click = engine_card_hit(&mut ui, 1250, pt_r, pt_active);
                         if pt_click {
                             self.params.tape = false;
                             params_intents.pipeline_changed = true;
@@ -3971,14 +3952,14 @@ impl App {
                         }
                     }
 
-                    // ---- Lock card (Audio only; persists via user.json) ----
                     if !tracker_page && !midi_page {
-                        let lock_r = Rect::new(m, cy, card_w, lock_h);
-                        ui.nui_card(lock_r, |ui| {
+                        let (_, lock_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
                             let sw_r = ui.take(Length::Rem(2.0));
                             ui.checkbox(1190, sw_r, "Lock Settings", &mut self.chk_locked);
                         });
+                        cy += lock_h + card_gap;
                     }
+                    parameters_required_height = Some(cy - card_gap + m);
                 } else {
                     let body = Rect::new(
                         m,
@@ -4984,6 +4965,29 @@ impl App {
             (w, h, close_clicked, shot)
         };
 
+        if let Some(required) = parameters_required_height {
+            if let Some(mw) = self.secondary_windows.find_by_key_mut("parameters") {
+                let scale = mw.window.scale_factor() as f32;
+                let logical_h = (required / scale).ceil() as f64;
+                mw.window
+                    .set_min_inner_size(Some(winit::dpi::LogicalSize::new(
+                        spec.min_width,
+                        logical_h,
+                    )));
+                let changed = self
+                    .parameters_window_height
+                    .map(|previous| (previous - required).abs() > 0.5)
+                    .unwrap_or(true);
+                if changed {
+                    let logical_w = mw.size.0 as f64 / scale as f64;
+                    let _ = mw
+                        .window
+                        .request_inner_size(winit::dpi::LogicalSize::new(logical_w, logical_h));
+                    self.parameters_window_height = Some(required);
+                }
+            }
+        }
+
         // Phase 3.5 — the Settings window's "Save Configuration" button persists
         // `user.json` (applied here, after the scene-build borrow has ended).
         if self.save_config_req {
@@ -5040,6 +5044,9 @@ impl App {
             // The Mixer owns a real engine and is destroyed on close; the other
             // secondary windows only hide their rendering surfaces.
             self.secondary_windows.hide(key);
+            if key == "parameters" {
+                self.parameters_window_height = None;
+            }
             if key == "mixer" {
                 self.close_mixer();
             }
