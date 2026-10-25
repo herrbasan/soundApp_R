@@ -300,6 +300,11 @@ impl App {
         font_engine: FontEngine,
         dark_mode: bool,
     ) -> Self {
+        let theme_base = if dark_mode {
+            Theme::dark(1.0).base
+        } else {
+            Theme::light(1.0).base
+        };
         Self {
             start: Instant::now(),
             reported: false,
@@ -327,7 +332,7 @@ impl App {
             next_frame: Instant::now(),
             quitting: false,
 
-            secondary_windows: WindowManager::new(),
+            secondary_windows: WindowManager::new(theme_base),
             pending_window_toggles: Vec::new(),
             open_window_spec: None,
 
@@ -1951,11 +1956,12 @@ impl App {
             self.dark_mode = !self.dark_mode;
         }
         if toggle_drop_req {
-            self.ui_state.hovered_file = if self.ui_state.hovered_file.is_some() {
+            let next = if self.ui_state.hovered_file.is_some() {
                 None
             } else {
                 Some(std::path::PathBuf::from("D:\\drop-preview.flac"))
             };
+            self.ui_state.set_hovered_file(next);
         }
         if zoom_delta.abs() > 0.001 {
             self.set_zoom(self.ui_zoom + zoom_delta);
@@ -2027,7 +2033,6 @@ impl App {
         self.frames += 1;
         if self.fps_at.elapsed() >= Duration::from_millis(1000) {
             self.last_fps = self.frames;
-            println!("[nui-demo] {} fps", self.frames);
             self.frames = 0;
             self.fps_at = Instant::now();
         }
@@ -2299,6 +2304,16 @@ impl App {
             }
         }
     }
+
+    /// Active theme's window base color — the pre-first-frame class brush and
+    /// fill use it, so the surface never shows a mismatched background.
+    fn theme_base(&self) -> nui::Color {
+        if self.dark_mode {
+            Theme::dark(self.ui_zoom).base
+        } else {
+            Theme::light(self.ui_zoom).base
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -2322,7 +2337,7 @@ impl ApplicationHandler for App {
                 .with_border_color(Some(winit::platform::windows::Color::from_rgb(55, 55, 55)));
         }
 
-        let (window, mut renderer) = Renderer::new(event_loop, attrs, self.prefer_backend);
+        let (window, mut renderer) = Renderer::new(event_loop, attrs, self.prefer_backend, self.theme_base());
         renderer.request_reveal();
         let sz = window.inner_size();
         self.size = (sz.width, sz.height);
@@ -2363,19 +2378,19 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::HoveredFile(path) => {
-                self.ui_state.hovered_file = Some(path);
+                self.ui_state.set_hovered_file(Some(path));
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
             WindowEvent::HoveredFileCancelled => {
-                self.ui_state.hovered_file = None;
+                self.ui_state.set_hovered_file(None);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                self.ui_state.hovered_file = None;
+                self.ui_state.set_hovered_file(None);
                 self.ui_state.dropped_files.push(path);
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -2550,12 +2565,12 @@ impl ApplicationHandler for App {
                             self.dark_mode = !self.dark_mode;
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("d") => {
-                            self.ui_state.hovered_file =
-                                if self.ui_state.hovered_file.is_some() {
-                                    None
-                                } else {
-                                    Some(std::path::PathBuf::from("D:\\drop-preview.flac"))
-                                };
+                            let next = if self.ui_state.hovered_file.is_some() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from("D:\\drop-preview.flac"))
+                            };
+                            self.ui_state.set_hovered_file(next);
                         }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("w") => {
                             self.pending_window_toggles.push("inspector");
@@ -2759,8 +2774,8 @@ fn main() {
         app.ui_state.context_menu_pos = (520.0, 260.0);
     }
     if drop_preview {
-        app.ui_state.hovered_file =
-            Some(std::path::PathBuf::from("D:\\drop-preview.flac"));
+        app.ui_state
+            .set_hovered_file(Some(std::path::PathBuf::from("D:\\drop-preview.flac")));
     }
     if focus_preview {
         app.ui_state.focused_id = Some(301);

@@ -1,10 +1,16 @@
 // SoundApp — native audio player built on the NUI Rust dual-backend renderer
 // (GPU instanced SDF + CPU Softbuffer), nui_wc2 v3.0.0 "slate" theme and Swash typography.
+//
+// GUI subsystem: no console window ever opens with the app. When launched from
+// a terminal, `attach_parent_console()` reroutes harness output back to it.
+
+#![windows_subsystem = "windows"]
 
 mod audio;
 mod config;
 mod dsp;
 mod midi;
+mod perf;
 mod tracker;
 
 use std::path::PathBuf;
@@ -265,11 +271,18 @@ struct App {
     t: f32,
     frame_ms: u64,
     nopaint: bool,
-    frames: u32,
-    last_fps: u32,
-    fps_at: Instant,
     next_frame: Instant,
     quitting: bool,
+    /// Pending interactive open: (request instant, file label) until the
+    /// decoder publishes the track's metadata — the file-open measurement.
+    open_pending: Option<(Instant, String)>,
+    /// Frame pacing (UI responsiveness): frames per 10 s window and how many
+    /// intervals missed the 15 Hz budget (>66 ms). Gaps >500 ms are a fresh
+    /// burst after idle, not stalls, and are excluded.
+    last_frame_at: Option<Instant>,
+    pace_at: Instant,
+    pace_frames: u32,
+    pace_slow: u32,
 
     // Phase 1.5 multi-window: secondary windows sharing `text_sys`, plus queued
     // show/hide toggles executed in `window_event` where `event_loop` is available.
@@ -1904,6 +1917,11 @@ impl App {
                     let _ = res_tx.send((gen, out));
                 }
             });
+        let theme_base = if config.dark_mode {
+            Theme::dark(1.0).base
+        } else {
+            Theme::light(1.0).base
+        };
         Self {
             start: Instant::now(),
             reported: false,
@@ -1926,13 +1944,15 @@ impl App {
             t: 0.0,
             frame_ms: 16,
             nopaint: false,
-            frames: 0,
-            last_fps: 0,
-            fps_at: Instant::now(),
             next_frame: Instant::now(),
             quitting: false,
+            open_pending: None,
+            last_frame_at: None,
+            pace_at: Instant::now(),
+            pace_frames: 0,
+            pace_slow: 0,
 
-            secondary_windows: WindowManager::new(),
+            secondary_windows: WindowManager::new(theme_base),
             pending_window_toggles: Vec::new(),
             open_window_spec: None,
 
@@ -2108,6 +2128,7 @@ impl App {
         self.scrub_frac = 0.0;
         self.track_meta = None;
         self.scene.clear_image();
+        self.open_pending = Some((Instant::now(), path.display().to_string()));
         if let Some(a) = &self.audio {
             a.load_file(path);
         }
@@ -2127,6 +2148,7 @@ impl App {
             if let Some(a) = &self.audio {
                 a.load_file(path.clone());
             }
+            self.open_pending = Some((Instant::now(), path.display().to_string()));
             self.playlist = vec![path.clone()];
             self.selected_track = 0;
             self.scan_gen = self.scan_gen.wrapping_add(1);
@@ -2266,7 +2288,15 @@ impl App {
             } else {
                 self.scene.clear_image();
             }
+            let arrived = meta.is_some();
             self.track_meta = meta;
+            if arrived {
+                if let Some((t0, file)) = self.open_pending.take() {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    println!("[poc] track ready at {ms:.1} ms ({file})");
+                    perf::note(&format!("track_ready_ms={ms:.1} file={file}"));
+                }
+            }
         }
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         let (pos, dur) = self
@@ -3010,6 +3040,29 @@ impl App {
         }
     }
 
+    /// Active theme's window base color — the pre-first-frame class brush and
+    /// fill use it, so a light-mode launch never flashes the dark color (and
+    /// no launch flashes the white default brush).
+    fn theme_base(&self) -> nui::Color {
+        if self.dark_mode {
+            Theme::dark(self.ui_zoom).base
+        } else {
+            Theme::light(self.ui_zoom).base
+        }
+    }
+
+    /// Emit one frame-pacing summary line and reset the window counters.
+    fn flush_pacing(&mut self, tag: &str) {
+        if self.pace_frames > 0 {
+            perf::note(&format!(
+                "frame_pacing frames={} slow_gt66ms={} window={tag}",
+                self.pace_frames, self.pace_slow
+            ));
+            self.pace_frames = 0;
+            self.pace_slow = 0;
+        }
+    }
+
     fn render(&mut self) {
         self.poll_transport_and_scans();
         let Some(window) = self.window.clone() else {
@@ -3024,13 +3077,6 @@ impl App {
         if self.nopaint {
             if let Some(renderer) = &mut self.renderer {
                 renderer.present_nopaint(w, h, (30, 30, 30));
-            }
-            self.frames += 1;
-            if self.fps_at.elapsed() >= Duration::from_millis(1000) {
-                self.last_fps = self.frames;
-                println!("[poc] {} fps", self.frames);
-                self.frames = 0;
-                self.fps_at = Instant::now();
             }
             return;
         }
@@ -3051,12 +3097,23 @@ impl App {
             }
         }
 
-        self.frames += 1;
-        if self.fps_at.elapsed() >= Duration::from_millis(1000) {
-            self.last_fps = self.frames;
-            println!("[poc] {} fps", self.frames);
-            self.frames = 0;
-            self.fps_at = Instant::now();
+        // Frame pacing (UI responsiveness): 10 s windows counting frames and
+        // intervals that missed the 15 Hz budget. A >500 ms gap is a fresh
+        // burst after idle, not a stall.
+        let now = Instant::now();
+        if let Some(last) = self.last_frame_at {
+            let dt = now.duration_since(last);
+            if dt < Duration::from_millis(500) {
+                self.pace_frames += 1;
+                if dt > Duration::from_millis(66) {
+                    self.pace_slow += 1;
+                }
+            }
+        }
+        self.last_frame_at = Some(now);
+        if now.duration_since(self.pace_at) >= Duration::from_secs(10) {
+            self.flush_pacing("10s");
+            self.pace_at = now;
         }
 
         if !self.reported {
@@ -3074,6 +3131,15 @@ impl App {
                 scale,
                 bname
             );
+            perf::note(&format!(
+                "first_frame_ms={:.1} backend={bname}",
+                self.start.elapsed().as_secs_f64() * 1000.0
+            ));
+            #[cfg(target_os = "windows")]
+            if let Some((cw, ch)) = nui::win32_client_size(&window) {
+                println!("[poc] win32 client {cw}x{ch} vs inner {w}x{h}");
+                perf::note(&format!("client={cw}x{ch} inner={w}x{h}"));
+            }
         }
         if !self.audio_reported {
             if let Some(a) = &self.audio {
@@ -3085,6 +3151,12 @@ impl App {
                         a.rate,
                         a.channels
                     );
+                    perf::note(&format!(
+                        "audio_started_ms={:.1} rate={} ch={}",
+                        self.start.elapsed().as_secs_f64() * 1000.0,
+                        a.rate,
+                        a.channels
+                    ));
                 }
             }
         }
@@ -4506,7 +4578,7 @@ impl ApplicationHandler for App {
                 .with_border_color(Some(Color::from_rgb(55, 55, 55)));
         }
 
-        let (window, mut renderer) = Renderer::new(event_loop, attrs, self.prefer_backend);
+        let (window, mut renderer) = Renderer::new(event_loop, attrs, self.prefer_backend, self.theme_base());
         let sz = window.inner_size();
         self.size = (sz.width, sz.height);
         self.window = Some(window.clone());
@@ -4553,19 +4625,19 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::HoveredFile(path) => {
-                self.ui_state.hovered_file = Some(path);
+                self.ui_state.set_hovered_file(Some(path));
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
             WindowEvent::HoveredFileCancelled => {
-                self.ui_state.hovered_file = None;
+                self.ui_state.set_hovered_file(None);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                self.ui_state.hovered_file = None;
+                self.ui_state.set_hovered_file(None);
                 self.ui_state.dropped_files.push(path);
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -4851,6 +4923,7 @@ impl ApplicationHandler for App {
                 if !self.quitting {
                     self.quitting = true;
                     println!("[poc] auto-quit reached");
+                    self.flush_pacing("auto-quit");
                 }
                 event_loop.exit();
                 return;
@@ -4913,13 +4986,59 @@ impl ApplicationHandler for App {
         self.config.sw_hq_mode = self.sw_hq_mode;
         self.config.sw_keep_tray = self.sw_keep_tray;
         self.config.selected_soundfont = self.selected_soundfont;
+        self.flush_pacing("exit");
         if let Err(e) = self.config.save() {
             eprintln!("[poc] config save failed: {e}");
         }
     }
 }
 
+/// The release build has no console; when launched from a terminal, attach the
+/// parent console and reroute stdout/stderr to it so harness output
+/// (--render, --latency-probe, screenshots, timings) stays visible. A stdout
+/// that is already a pipe or file (measure.ps1, `> log`) is left untouched,
+/// and double-clicked launches fail the attach silently — no console flash.
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+        fn GetFileType(h_file: *mut std::ffi::c_void) -> u32;
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn SetStdHandle(n_std_handle: u32, h_handle: *mut std::ffi::c_void) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const FILE_TYPE_UNKNOWN: u32 = 0;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let ty = if out.is_null() {
+            FILE_TYPE_UNKNOWN
+        } else {
+            GetFileType(out)
+        };
+        if ty != FILE_TYPE_UNKNOWN {
+            // Console (dev build), pipe or file: output is already routed.
+            return;
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        for slot in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            if let Ok(con) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                // Leak the handle: it must outlive every println! in the process.
+                SetStdHandle(slot, con.as_raw_handle() as *mut std::ffi::c_void);
+                std::mem::forget(con);
+            }
+        }
+    }
+}
+
 fn main() {
+    attach_parent_console();
+    perf::init();
     let mut file: Option<String> = None;
     let mut tone = false;
     let mut silence = false;

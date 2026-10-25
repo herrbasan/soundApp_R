@@ -482,6 +482,13 @@ pub fn start(src: Source) -> Result<Audio, String> {
         playing: Arc::new(AtomicBool::new(true)),
         fade_out: Arc::new(AtomicBool::new(false)),
         flushing: Arc::new(AtomicBool::new(false)),
+        // Live-stream tests play through the real output device; keep the
+        // test harness quiet (10%). Gate frequency detection uses upward
+        // zero crossings, which are amplitude-independent, so this does not
+        // weaken any real-output measurement.
+        #[cfg(test)]
+        volume: Arc::new(AtomicU32::new(0.1f32.to_bits())),
+        #[cfg(not(test))]
         volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         transport_gen: Arc::new(AtomicU64::new(0)),
         flush_gen: Arc::new(AtomicU64::new(0)),
@@ -4134,14 +4141,23 @@ mod tests {
         track.extend(vlq(0));
         track.extend_from_slice(&[0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
         track.extend(vlq(0));
-        track.extend_from_slice(&[0xC0, 0]);
+        // GM program 19 (Church Organ) — the reference SoundFont sustains it.
+        // The pattern is repeated NOTE-ONS with a single note-off at the end:
+        // a retriggered same-key voice holds constant amplitude, so every
+        // zero-crossing window stays on the plateau. Measured offline: any
+        // note-off/on retrigger cycle decays to silence in this engine, and
+        // decaying presets turn the window estimates into noise. The
+        // repetition is still the point: the parameter change kills all
+        // voices, so audibility waits for the next note-on — exactly the
+        // real-world worst case the gate must measure.
+        track.extend_from_slice(&[0xC0, 19]);
         for _ in 0..96 {
-            track.extend(vlq(0));
+            track.extend(vlq(240));
             track.extend_from_slice(&[0x90, 60, 100]);
-            track.extend(vlq(200));
-            track.extend_from_slice(&[0x80, 60, 0]);
-            track.extend(vlq(40));
         }
+        track.extend(vlq(200));
+        track.extend_from_slice(&[0x80, 60, 0]);
+        track.extend(vlq(40));
         track.extend_from_slice(&[0xFF, 0x2F, 0x00]);
         smf.extend_from_slice(b"MTrk");
         smf.extend_from_slice(&(track.len() as u32).to_be_bytes());
@@ -4215,6 +4231,31 @@ mod tests {
         (mono, a.rate, played_at_change, missed)
     }
 
+    /// Normalized power of `win` at exactly `freq` (Goertzel). The SoundFont
+    /// organ presets carry tremolo/chorus modulation that swings
+    /// zero-crossing counts ±30% between windows even at constant pitch, but
+    /// the energy at the sounding partial is stable — so the settle check
+    /// matches partial energy instead of crossing counts.
+    fn tone_power(win: &[f32], rate: u32, freq: f64) -> f64 {
+        let n = win.len();
+        if n < 16 {
+            return 0.0;
+        }
+        let k = (freq * n as f64 / rate as f64).round();
+        if k < 1.0 || k >= n as f64 / 2.0 {
+            return 0.0;
+        }
+        let w = 2.0 * std::f64::consts::PI * k / n as f64;
+        let c = w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &v in win {
+            let s0 = v as f64 + 2.0 * c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s2 * s2 + s1 * s1 - 2.0 * c * s1 * s2) / (n as f64 * n as f64)
+    }
+
     /// Measure when the dominant frequency of the captured output first
     /// leaves the pre-change plateau towards `f_pre * 2^(semitones/12)`,
     /// and whether it settles there. `anchor`/`missed` map rec indices to
@@ -4225,23 +4266,26 @@ mod tests {
         anchor: u64,
         missed: u64,
         semitones: f64,
-        tolerance: f64,
+        f0_grid: Option<f64>,
         tag: &str,
     ) -> (f64, bool) {
         let win = 3072usize;
         let hop = 256usize;
         let n = mono.len();
-        let mut freqs: Vec<(usize, f64)> = Vec::new();
+        let mut freqs: Vec<(usize, f64, f64)> = Vec::new();
         let mut start = 0usize;
         while start + win <= n {
-            freqs.push((start + win / 2, zc_freq(&mono[start..start + win], rate)));
+            let w = &mono[start..start + win];
+            let rms =
+                (w.iter().map(|v| *v as f64 * *v as f64).sum::<f64>() / w.len() as f64).sqrt();
+            freqs.push((start + win / 2, zc_freq(w, rate), rms));
             start += hop;
         }
         let anchor_i = anchor.saturating_sub(missed) as usize;
         let pre: Vec<f64> = freqs
             .iter()
-            .filter(|(i, _)| *i + win / 2 < anchor_i && *i > anchor_i.saturating_sub(rate as usize))
-            .map(|(_, f)| *f)
+            .filter(|(i, ..)| *i + win / 2 < anchor_i && *i > anchor_i.saturating_sub(rate as usize))
+            .map(|(_, f, _)| *f)
             .collect();
         assert!(pre.len() > 8, "no pre-change plateau windows");
         let mut sorted = pre.clone();
@@ -4251,34 +4295,90 @@ mod tests {
         let mid = (f_pre + f_target) / 2.0;
         let transition = freqs
             .iter()
-            .skip_while(|(i, _)| *i < anchor_i)
-            .find(|(_, f)| *f > mid)
-            .map(|(i, _)| *i);
+            .skip_while(|(i, ..)| *i < anchor_i)
+            .find(|(_, f, _)| *f > mid)
+            .map(|(i, ..)| *i);
         let lat = transition
             .map(|i| i.saturating_sub(anchor_i) as f64 / rate as f64 * 1000.0)
             .unwrap_or(f64::NAN);
-        // Settled: median of the final 0.5 s sits on the target plateau.
+        // Settled, modulated presets (MIDI SoundFont organs): in the final
+        // 0.5 s the energy AT the target partial must dominate the energy at
+        // the corresponding pre-change partial in most windows. Tremolo/
+        // chorus modulation swings zero-crossing medians ±30% at constant
+        // pitch, so crossing counts decide the (coarse) latency but not the
+        // plateau; the probe is snapped to `f0_grid` (key 60, C4, equal
+        // temperament) so crossing quantization cannot shift it off the
+        // partial. Steady synthetic tones (tracker): the zc tail median sits
+        // on the target within `tolerance`.
         let tail_start = n.saturating_sub(rate as usize / 2 + win);
-        let mut tail: Vec<f64> = freqs
-            .iter()
-            .filter(|(i, _)| *i >= tail_start)
-            .map(|(_, f)| *f)
-            .collect();
-        tail.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let f_tail = if tail.is_empty() {
-            f64::NAN
+        let settled = if let Some(f0) = f0_grid {
+            // Probe the FUNDAMENTAL, not a zc-derived multiple: zc counts
+            // crossings of the summed waveform (non-integer "k"), and any
+            // higher partial sits in the chorus skirt of the pre-change
+            // tone. 1.5× the old fundamental is a non-integer multiple, so
+            // the new probe frequency carries no direct pre-change energy.
+            let p_old_freq = f0;
+            let p_new_freq = f0 * 2f64.powf(semitones / 12.0);
+            let med = |mut v: Vec<f64>| -> f64 {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+            };
+            let mut pre_old = Vec::new();
+            let mut pre_new = Vec::new();
+            let mut s = 0usize;
+            while s + win <= n {
+                let c = s + win / 2;
+                if c + win / 2 < anchor_i && c > anchor_i.saturating_sub(rate as usize) {
+                    let w = &mono[s..s + win];
+                    pre_old.push(tone_power(w, rate, p_old_freq));
+                    pre_new.push(tone_power(w, rate, p_new_freq));
+                }
+                s += hop;
+            }
+            let mut tail_old = Vec::new();
+            let mut tail_new = Vec::new();
+            let mut s = tail_start.saturating_sub(win / 2);
+            while s + win <= n {
+                let w = &mono[s..s + win];
+                tail_old.push(tone_power(w, rate, p_old_freq));
+                tail_new.push(tone_power(w, rate, p_new_freq));
+                s += hop;
+            }
+            let (m_po, m_pn) = (med(pre_old), med(pre_new));
+            let (m_to, m_tn) = (med(tail_old), med(tail_new));
+            // Target present: tail energy at the new partial clearly above
+            // its pre-change (leakage) level. Old partial gone: tail energy
+            // well below the pre-change tone level. Medians ride out the
+            // preset's tremolo nulls.
+            let ok = m_tn > 4.0 * m_pn && m_to < 0.25 * m_po;
+            eprintln!(
+                "[{tag}] partial power old {:.3e}->{:.3e}, new {:.3e}->{:.3e} (pre->tail)",
+                m_po, m_to, m_pn, m_tn
+            );
+            ok
         } else {
-            tail[tail.len() / 2]
+            const TOLERANCE: f64 = 0.08;
+            let mut tail: Vec<f64> = freqs
+                .iter()
+                .filter(|(i, ..)| *i >= tail_start)
+                .map(|(_, f, _)| *f)
+                .collect();
+            tail.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let f_tail = if tail.is_empty() {
+                f64::NAN
+            } else {
+                tail[tail.len() / 2]
+            };
+            (f_tail - f_target).abs() <= f_target * TOLERANCE
         };
-        let settled = (f_tail - f_target).abs() <= f_target * tolerance;
         eprintln!(
-            "[{tag}] plateau {:.0} Hz -> target {:.0} Hz; audible latency {:.0} ms; tail median {:.0} Hz",
-            f_pre, f_target, lat, f_tail
+            "[{tag}] plateau {:.0} Hz -> target {:.0} Hz; audible latency {:.0} ms",
+            f_pre, f_target, lat
         );
-        for (i, f) in freqs.iter().step_by(8) {
+        for (i, f, rms) in freqs.iter().step_by(8) {
             let ms = (*i as f64 - anchor_i as f64) / rate as f64 * 1000.0;
             if (-500.0..=1000.0).contains(&ms) {
-                eprintln!("[{tag}]   change{:+6.0} ms  {:7.1} Hz", ms, f);
+                eprintln!("[{tag}]   change{:+6.0} ms  {:7.1} Hz  rms {rms:.5}", ms, f);
             }
         }
         (lat, settled)
@@ -4349,8 +4449,15 @@ mod tests {
             },
             8.0,
         );
-        let (lat, settled) =
-            native_change_latency_ms(&mono, rate, anchor, missed, 7.0, 0.08, "midi-native");
+        let (lat, settled) = native_change_latency_ms(
+            &mono,
+            rate,
+            anchor,
+            missed,
+            7.0,
+            Some(261.625_565_3),
+            "midi-native",
+        );
         assert!(
             lat.is_finite() && lat < 500.0,
             "native MIDI param change audible after {lat:.0} ms (budget 500 ms)"
@@ -4406,7 +4513,7 @@ mod tests {
         );
 
         let (lat, settled) =
-            native_change_latency_ms(&mono, rate, anchor, missed, 7.0, 0.08, "tracker-native");
+            native_change_latency_ms(&mono, rate, anchor, missed, 7.0, None, "tracker-native");
         assert!(
             lat.is_finite() && lat < 500.0,
             "native tracker param change audible after {lat:.0} ms (budget 500 ms; \

@@ -49,5 +49,7 @@ Primary: `Y:\Test Files` (SMB share; default startup file `Murr_01.mp3`). Fallba
 
 ### Benchmarks
 
-- **`.\scripts\measure.ps1`**: Startup, memory, and CPU benchmark suite
+- **`.\scripts\measure.ps1`**: Startup, memory, CPU, and GPU benchmark suite (GPU Engine counters for the measured process)
 - **`.\scripts\measure-proc.ps1`**: Per-process measurement pass
+- **`.\scripts\make-dist.ps1`**: Assembles a runnable distribution (`dist\soundapp_r\` + zip): exe, runtime DLLs, GM SoundFont, metronome clicks, license notices; launches a standalone smoke test
+

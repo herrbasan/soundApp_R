@@ -154,9 +154,28 @@ const PERCUSSION_CHANNEL: c_int = 9;
 /// development resolves it from the reference tree.
 pub const DEFAULT_SOUNDFONT: &str = r"D:\Work\_GIT\SoundApp\bin\soundfonts\default.sf2";
 
-/// Reference metronome click WAVs (mixed at `set_metronome(true)`).
+/// Reference metronome click WAVs (mixed at `set_metronome(true)`), resolved
+/// from `<exe_dir>/metronome/` first (distribution layout) and the reference
+/// SoundApp tree second (development). Missing/unreadable assets fall back to
+/// a synthesized click, logged loudly.
 const METRONOME_HIGH_WAV: &str = r"D:\Work\_GIT\SoundApp\bin\metronome\metronome-high.wav";
 const METRONOME_LOW_WAV: &str = r"D:\Work\_GIT\SoundApp\bin\metronome\metronome-low.wav";
+
+/// Distribution-first metronome asset path: `<exe_dir>/metronome/<name>` when
+/// present, else the reference-tree path.
+fn metronome_asset(dev_path: &str) -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(name) = std::path::Path::new(dev_path).file_name() {
+                let p = dir.join("metronome").join(name);
+                if p.exists() {
+                    return p.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    dev_path.to_string()
+}
 /// Metronome click gains, from the reference `midi.js` (0.7 / 0.4).
 const METRONOME_HIGH_GAIN: f32 = 0.7;
 const METRONOME_LOW_GAIN: f32 = 0.4;
@@ -907,8 +926,8 @@ impl MidiEngine {
                 sf_path: soundfont_path.to_path_buf(),
                 hook: Some(hook),
                 metronome: false,
-                click_high: load_click(METRONOME_HIGH_WAV, 1600.0, out_rate),
-                click_low: load_click(METRONOME_LOW_WAV, 900.0, out_rate),
+                click_high: load_click(&metronome_asset(METRONOME_HIGH_WAV), 1600.0, out_rate),
+                click_low: load_click(&metronome_asset(METRONOME_LOW_WAV), 900.0, out_rate),
                 scratch: vec![0.0; 64],
             };
 

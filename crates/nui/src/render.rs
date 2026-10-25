@@ -644,21 +644,55 @@ pub struct Renderer {
     pending_reveal: bool,
 }
 
+/// Real Win32 client rect in physical pixels. winit's `inner_size` trusts its
+/// own `WM_NCCALCSIZE` override; the OS client can differ after that override
+/// desyncs (winit #4691) — this is the ground truth to compare against.
+#[cfg(target_os = "windows")]
+pub fn win32_client_size(win: &Window) -> Option<(u32, u32)> {
+    use raw_window_handle::RawWindowHandle;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetClientRect(hwnd: isize, rect: *mut [i32; 4]) -> i32;
+    }
+    if let Ok(wh) = win.window_handle() {
+        if let RawWindowHandle::Win32(h) = wh.as_raw() {
+            unsafe {
+                let mut rc = [0i32; 4];
+                if GetClientRect(h.hwnd.get() as isize, &mut rc) != 0 {
+                    return Some((
+                        (rc[2] - rc[0]).max(0) as u32,
+                        (rc[3] - rc[1]).max(0) as u32,
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Renderer {
     pub fn new(
         event_loop: &ActiveEventLoop,
         attrs: WindowAttributes,
         prefer: BackendKind,
+        base: crate::widgets::Color,
     ) -> (Arc<Window>, Self) {
         // Ask DWM for a dark frame/surface from creation.
         let attrs = attrs.with_theme(Some(winit::window::Theme::Dark));
+        // Created hidden: the class background fill and the cloak are applied
+        // while nothing is on screen, and `request_reveal()` maps the window
+        // only after the first frame is presented. Created visible, one white
+        // WM_ERASEBKGND frame (winit registers no class brush) can reach the
+        // compositor in the gap before the cloak lands.
+        let attrs = attrs.with_visible(false);
 
         if prefer == BackendKind::Gpu {
             if let Some((win, gpu)) = Self::try_init_gpu(event_loop, attrs.clone()) {
                 #[cfg(target_os = "windows")]
                 {
-                    Self::set_win32_dark_background(&win);
+                    Self::set_win32_background(&win, base);
                     Self::set_win32_cloak(&win, true);
+                    Self::ensure_frameless(&win);
                 }
                 return (
                     win.clone(),
@@ -677,8 +711,9 @@ impl Renderer {
         let win = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_os = "windows")]
         {
-            Self::set_win32_dark_background(&win);
+            Self::set_win32_background(&win, base);
             Self::set_win32_cloak(&win, true);
+            Self::ensure_frameless(&win);
         }
         let cpu = Self::init_cpu(&win);
         (
@@ -694,7 +729,7 @@ impl Renderer {
     }
 
     #[cfg(target_os = "windows")]
-    fn set_win32_dark_background(win: &Window) {
+    fn set_win32_background(win: &Window, base: crate::widgets::Color) {
         use raw_window_handle::RawWindowHandle;
         #[link(name = "gdi32")]
         extern "system" {
@@ -713,8 +748,11 @@ impl Renderer {
             if let RawWindowHandle::Win32(h) = wh.as_raw() {
                 unsafe {
                     let hwnd = h.hwnd.get();
-                    // COLORREF 0x00BBGGRR = rgb(19, 19, 19) (`Theme::dark` base)
-                    let brush = CreateSolidBrush(0x0013_1313);
+                    // COLORREF is 0x00BBGGRR; `base` is the active theme's
+                    // window color, so the pre-first-frame background matches
+                    // what the first frame paints.
+                    let (r, g, b, _) = base;
+                    let brush = CreateSolidBrush(((b as u32) << 16) | ((g as u32) << 8) | r as u32);
                     if brush != 0 {
                         SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush);
                         let hdc = GetDC(hwnd);
@@ -754,6 +792,62 @@ impl Renderer {
                         &val as *const u32,
                         std::mem::size_of::<u32>() as u32,
                     );
+                }
+            }
+        }
+    }
+
+    /// winit keeps `WS_CAPTION` in the styles of undecorated windows and hides
+    /// the caption only through its `WM_NCCALCSIZE` client-area override. On
+    /// some machines that override desyncs (a DPI/display change right at the
+    /// first show is a known trigger) and the caption strip renders over the
+    /// client, displacing it and every hitbox. Strip the style for real —
+    /// without `WS_CAPTION` no caption can render anywhere. The probe is one
+    /// `GetWindowLongPtrW` per present; it only writes when something (a
+    /// winit flag refresh) re-added the style.
+    #[cfg(target_os = "windows")]
+    fn ensure_frameless(win: &Window) {
+        use raw_window_handle::RawWindowHandle;
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+            fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+            fn SetWindowPos(
+                hwnd: isize,
+                after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+        }
+        const GWL_STYLE: i32 = -16;
+        const WS_CAPTION: isize = 0x00C0_0000;
+        const WS_SYSMENU: isize = 0x0008_0000;
+        const SWP_FRAMECHANGED: u32 = 0x0020;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOSIZE: u32 = 0x0001;
+        if let Ok(wh) = win.window_handle() {
+            if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                unsafe {
+                    let hwnd = h.hwnd.get() as isize;
+                    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                    if style & WS_CAPTION != 0 {
+                        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_CAPTION | WS_SYSMENU));
+                        SetWindowPos(
+                            hwnd,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE
+                                | SWP_NOSIZE,
+                        );
+                    }
                 }
             }
         }
@@ -1065,6 +1159,7 @@ impl Renderer {
             }
         }
         self.reveal_if_pending();
+        Self::ensure_frameless(&self.window);
     }
 
     pub fn render(

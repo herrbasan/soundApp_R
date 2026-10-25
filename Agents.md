@@ -61,8 +61,12 @@ soundApp_R/
       build.rs            # Compiles FFmpeg bridge + vendored Rubber Band/libopenmpt; links FluidSynth
                           #   and stages runtime DLLs
       src/
-        main.rs           # Winit ApplicationHandler, minimalist player window, adaptive native-only
-                          #   MIDI/tracker Parameters, Monitoring, Mixer, Settings & Help windows
+        main.rs           # Winit ApplicationHandler, GUI-subsystem binary (no console window;
+                          #   terminal re-attach for harness output), field perf log, adaptive
+                          #   native-only MIDI/tracker Parameters, Monitoring, Mixer, Settings & Help
+        perf.rs           # Field-performance log (perf_log.txt next to user.json): session marker,
+                          #   first-frame / audio-started / open-to-track-ready ms, 10 s frame-pacing
+                          #   windows (frames + >66 ms stalls) — works with no console attached
         audio.rs          # FFmpeg/libopenmpt/FluidSynth source engines + raw source ring + cpal output
                           #   + audible-edge Tape/Rubber Band chain (FFmpeg only) + cosine fades/DSP tap
                           #   + --render offline / --latency-probe harness (scripts/audiotest/)
@@ -77,9 +81,9 @@ soundApp_R/
 
 ### The three binaries
 
-1. **`crates/nui`** — reusable library: `render.rs` with `kind = 0..5` (0 sharp rect, 1 Swash glyph, 2 Fontdue glyph, 3 SDF shadow, 4 AA capsule line, **5 RGBA image quad**), `DWMWA_CLOAK (13)` + dark `#131313` `GCLP_HBRBACKGROUND` zero-flash reveal, Swash subpixel shaping, `layout_rotated_ccw45` for atlas-cached `-45°` text, widgets, layout, window manager.
+1. **`crates/nui`** — reusable library: `render.rs` with `kind = 0..5` (0 sharp rect, 1 Swash glyph, 2 Fontdue glyph, 3 SDF shadow, 4 AA capsule line, **5 RGBA image quad**), zero-flash reveal (`DWMWA_CLOAK (13)` + theme-colored `GCLP_HBRBACKGROUND` brush and first fill; windows are created **hidden** and only uncloaked after the first presented frame), Swash subpixel shaping, `layout_rotated_ccw45` for atlas-cached `-45°` text, widgets, layout, window manager.
 2. **`crates/nui-demo`** → **`nui_demo.exe`** — standalone 6-tab NUI Component Playground (*Controls & Inputs*, *Layout & Cards*, *Vectors & Canvas*, *Typography & Icons*, *Virtual List 10k*, *Menus & Overlays*), wrapped in a real app shell: undecorated app header (empty middle = live window drag zone), `.nui-menu-bar` (File / View / Components / Diagnostics), an animated collapsible `nui-sidebar` + `nui-link-list[mode="fold"]`, a right-click `nui-context-menu`, and a modal `nui-dialog` that now owns every demo control the header used to carry. Plus a secondary `UiState` Inspector window (`W`) and dropzone preview (`D`); the window is resizable via edge/corner hit-testing. Zero audio/FFmpeg dependencies. **This is the iteration surface for `crates/nui` design work.**
-3. **`crates/soundapp`** → **`soundapp_r.exe`** — minimalist, fast-opening, low-footprint FFmpeg audio player: `480×278` with controls, `480×221` without (`C`); proportional UI scaling via `+`/`-`/`0`, `Ctrl+Wheel`, or undecorated edge/corner drag.
+3. **`crates/soundapp`** → **`soundapp_r.exe`** — minimalist, fast-opening, low-footprint FFmpeg audio player: `480×278` with controls, `480×221` without (`C`); proportional UI scaling via `+`/`-`/`0`, `Ctrl+Wheel`, or undecorated edge/corner drag. Windows GUI subsystem: double-clicked launches never open a console; launched from a terminal the binary re-attaches to it so harness output stays visible (redirected/piped stdout is untouched).
 
 ## Test Media & Remote
 
@@ -103,11 +107,13 @@ soundApp_R/
    - Material Icons are centered using `TextSystem::layout_icon_centered` (true rasterized pixel bounding box `w, h`), never estimated font baselines.
 5. **Visual Verification via `--screenshot`:**
    - Run `.\target\release\soundapp_r.exe --screenshot .\target\preview.png --seconds 1` to capture the exact GPU framebuffer via `glReadPixels` and inspect with `view_image`. Use `--open-window <key>` to capture a secondary window.
+   - The release exe is GUI-subsystem: PowerShell captures via pipes (`$out = & exe` returns immediately for GUI children — use `Start-Process -RedirectStandardOutput` or `scripts/measure.ps1`). Field timings land in `perf_log.txt` next to `user.json` regardless.
 6. **Zero Idle CPU & Bounded Repaint Loop:**
    - Event-driven (`ControlFlow::Wait`) when static (`0.0%` CPU).
    - When animating, gate `window.request_redraw()` strictly on `Instant::now() >= self.next_frame` before returning `ControlFlow::WaitUntil(self.next_frame)`. Never call `request_redraw()` unconditionally inside `about_to_wait`.
    - Playing with only the player visible repaints at ~15 Hz (`66 ms`); Monitoring/Mixer visible → 60 Hz.
 7. **Startup latency is a feature, and the first frame must not flash:**
    - FFmpeg audio decoders always open with `threads = 1` (development_plan §3 #9).
-   - The player is revealed by uncloaking (`DWMWA_CLOAK`) after the first `swap_buffers` — never `winit`'s `.with_visible(false)` (§3 #8).
+   - The player is revealed by uncloaking (`DWMWA_CLOAK`) after the first `swap_buffers`. Windows are created hidden by `Renderer::new` and shown (still cloaked) by `request_reveal()` — `.with_visible(false)` must never be used as the reveal mechanism itself, and windows must never be created visible-before-cloak (one white `WM_ERASEBKGND` frame reaches the compositor in that gap).
    - Audio stream opens first; metadata + cover art are probed on a detached thread.
+   - First-frame after a fresh build reads high (~1 s, cold driver/disk caches); warm runs are ~280 ms — compare warm runs only.

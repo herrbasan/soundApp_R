@@ -731,6 +731,12 @@ pub struct UiState {
     pub focus_order: Vec<u32>,
     pub focus_visible: bool,
     pub hovered_file: Option<std::path::PathBuf>,
+    /// When `hovered_file` was latched. The drop overlay expires itself after
+    /// [`UiState::DROP_HOVER_GRACE`] when no `DroppedFile` /
+    /// `HoveredFileCancelled` arrives — some environments (RDP drag proxying,
+    /// elevated drag sources) never deliver the OLE DragLeave, which used to
+    /// stick the overlay until restart.
+    pub hovered_file_at: Option<std::time::Instant>,
     pub dropped_files: Vec<std::path::PathBuf>,
 
     // Frame clock: `dt` (seconds) is measured in `begin_frame` and every widget
@@ -761,6 +767,20 @@ pub struct UiState {
 }
 
 impl UiState {
+    /// Drag hover expires after this long without a drop or cancel: the OLE
+    /// DragLeave is not delivered in some environments (RDP drag proxy,
+    /// elevated drag source), which used to stick the drop overlay until
+    /// restart. Generous enough that only pathological hovers expire.
+    const DROP_HOVER_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Latch/clear the file-drag hover (drives the `nui-dropzone` overlay)
+    /// and stamp when it was latched, for the expiry check in
+    /// [`UiState::dropzone_overlay`].
+    pub fn set_hovered_file(&mut self, file: Option<std::path::PathBuf>) {
+        self.hovered_file_at = file.as_ref().map(|_| std::time::Instant::now());
+        self.hovered_file = file;
+    }
+
     pub fn new() -> Self {
         Self {
             cursor: (-1000.0, -1000.0),
@@ -785,6 +805,7 @@ impl UiState {
             focus_order: Vec::new(),
             focus_visible: false,
             hovered_file: None,
+            hovered_file_at: None,
             dropped_files: Vec::new(),
             anim_values: Vec::new(),
             f32_anims: Vec::new(),
@@ -2952,6 +2973,14 @@ impl<'a> Ui<'a> {
     /// the whole window and draws a dashed drop target with the file path. Returns
     /// the oldest queued dropped file (from `state.dropped_files`), if any.
     pub fn dropzone_overlay(&mut self, win_r: Rect, title: &str) -> Option<std::path::PathBuf> {
+        // Self-heal a lost OLE DragLeave: expire the hover after the grace
+        // period. A drop still works regardless of this overlay's visibility.
+        if let Some(at) = self.state.hovered_file_at {
+            if at.elapsed() > UiState::DROP_HOVER_GRACE {
+                self.state.hovered_file = None;
+                self.state.hovered_file_at = None;
+            }
+        }
         let t = self.theme;
         if let Some(hov_path) = self.state.hovered_file.clone() {
             self.scene.begin_overlay();

@@ -202,11 +202,17 @@ pub struct ManagedWindow {
 
 pub struct WindowManager {
     pub windows: Vec<ManagedWindow>,
+    /// Theme window base color handed to every renderer: the class brush and
+    /// first fill use it, so the pre-first-frame background matches the theme.
+    base: crate::widgets::Color,
 }
 
 impl WindowManager {
-    pub fn new() -> Self {
-        Self { windows: Vec::new() }
+    pub fn new(base: crate::widgets::Color) -> Self {
+        Self {
+            windows: Vec::new(),
+            base,
+        }
     }
 
     /// Window attributes shared by every managed window: logical size, min size and —
@@ -246,7 +252,7 @@ impl WindowManager {
             return idx;
         }
         let attrs = Self::build_window_attrs(spec).with_visible(visible);
-        let (window, mut renderer) = Renderer::new(event_loop, attrs, prefer);
+        let (window, mut renderer) = Renderer::new(event_loop, attrs, prefer, self.base);
         if visible {
             renderer.request_reveal();
         }
