@@ -44,11 +44,14 @@ Being style-based, this is correct on every driver (frame origin `(0,0)` is righ
 
 `SWP_FRAMECHANGED` alone; `DWMWA_NCRENDERING_POLICY = DWMNCRP_DISABLED`; `DwmExtendFrameIntoClientArea(-1,-1,-1,-1)`; the ±1px size nudge while cloaked; minimizing/restoring. DWM's render policies do not move the surface, and minimize kills a WGL window on this driver stack (context loss) — don't use min/restore as a probe.
 
+## Interaction test (after the commit)
+
+1. **Native drag and edge/corner resize work with `WS_THICKFRAME` removed** — confirmed by hand on ALPHATAP: header drag moves the window, edge and corner drags resize it. winit drives both by posting `WM_NCLBUTTONDOWN` with `HT*` codes (`HTCAPTION`, `HTBOTTOMRIGHT`, …), which is style-independent, so `SC_MOVE`/`SC_SIZE` and the frame bits are not needed. No need for a custom drag/resize loop in `live_drag`.
+
 ## Open items
 
-1. **Native drag/resize with `WS_THICKFRAME` removed** — not verified. winit posts `WM_NCLBUTTONDOWN` with `HT*` codes (`HTCAPTION`, `HTBOTTOMRIGHT`, …), which should engage the modal move/size loop without the style bits, but a synthetic probe cannot prove it: the loop exits immediately unless the physical button is down (a control run against decorated Paint behaved identically, so the probe is inconclusive rather than negative). **Needs one real mouse drag + corner resize by a human.** If broken, replace the `SC_MOVE`/`SC_SIZE` dependency with nui's own drag/resize loop in `nui/src/window.rs::live_drag`.
-2. `nui-demo` shows `dy=+1` on the CPU backend only — softbuffer presentation rounding, cosmetic.
-3. Everything else on ALPHATAP is unchanged: `D:` mapping from `\\coolkid\Work` required for `soundapp` builds, test media at `\\BADKID\Storage\Test Files`, GUI binaries launched with `Start-Process -PassThru`.
+1. `nui-demo` shows `dy=+1` on the CPU backend only — softbuffer presentation rounding, cosmetic.
+2. Everything else on ALPHATAP is unchanged: `D:` mapping from `\\coolkid\Work` required for `soundapp` builds, test media at `\\BADKID\Storage\Test Files`, GUI binaries launched with `Start-Process -PassThru`.
 
 ## Tooling added (committed under `scripts/`)
 
