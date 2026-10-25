@@ -18,7 +18,9 @@ Native Rust audio player & NUI component library. The workspace holds three crat
   - Five tabs: *Controls & Inputs*, *Layout & Cards*, *Vectors & Canvas*, *Typography & Icons*, *Virtual List 10k*.
   - Secondary `UiState` Inspector window (`W`) and file-drop preview (`D`). No audio or FFmpeg dependencies — this is where `crates/nui` components are designed and polished.
 - **`crates/soundapp` — Minimalist Player (`soundapp_r.exe`):**
-  - Fast-opening FFmpeg decode + lock-free `rtrb` ring buffer + `cpal` WASAPI output, cosine fades, 8-tap Lanczos resampling, and WSOLA pitch/tempo/formant.
+  - Fast-opening FFmpeg decode + lock-free `rtrb` ring buffer + `cpal` WASAPI output, cosine fades, 8-tap Lanczos resampling, and Rubber Band pitch/tempo/formant processing.
+  - **Independent multi-track Mixer (`M`):** a separate output graph and transport with up to 20 streaming stems, synchronized start/seek/loop, per-stem gain/equal-power pan/mute/solo, real VU meters, master gain, and recursive drop-to-add/replace. Opening Mixer pauses the main player; closing Mixer destroys its engine.
+  - Native MIDI and tracker parameters, including SoundFont selection, file-tempo display, tracker channel VU, and click/Shift-click channel solo.
   - Implicit sibling-folder playlist on single-file open, recursive folder drop, and a three-zone drop overlay (*Add to current*, *Replace playlist*, *Open in Mixer*; `Ctrl` = non-recursive).
   - Embedded cover art decoded to `128×128` RGBA from the same FFmpeg metadata open, with a `-45°` format sash.
   - `480×278` with controls, `480×221` without (`C`), proportional UI scaling.

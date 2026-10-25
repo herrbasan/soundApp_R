@@ -59,6 +59,32 @@ struct Module {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct ModuleExt {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct InteractiveIface {
+    set_current_speed: Option<unsafe extern "C" fn(*mut ModuleExt, i32) -> c_int>,
+    set_current_tempo: Option<unsafe extern "C" fn(*mut ModuleExt, i32) -> c_int>,
+    set_tempo_factor: Option<unsafe extern "C" fn(*mut ModuleExt, c_double) -> c_int>,
+    get_tempo_factor: Option<unsafe extern "C" fn(*mut ModuleExt) -> c_double>,
+    set_pitch_factor: Option<unsafe extern "C" fn(*mut ModuleExt, c_double) -> c_int>,
+    get_pitch_factor: Option<unsafe extern "C" fn(*mut ModuleExt) -> c_double>,
+    set_global_volume: Option<unsafe extern "C" fn(*mut ModuleExt, c_double) -> c_int>,
+    get_global_volume: Option<unsafe extern "C" fn(*mut ModuleExt) -> c_double>,
+    set_channel_volume: Option<unsafe extern "C" fn(*mut ModuleExt, i32, c_double) -> c_int>,
+    get_channel_volume: Option<unsafe extern "C" fn(*mut ModuleExt, i32) -> c_double>,
+    set_channel_mute_status: Option<unsafe extern "C" fn(*mut ModuleExt, i32, c_int) -> c_int>,
+    get_channel_mute_status: Option<unsafe extern "C" fn(*mut ModuleExt, i32) -> c_int>,
+    set_instrument_mute_status: Option<unsafe extern "C" fn(*mut ModuleExt, i32, c_int) -> c_int>,
+    get_instrument_mute_status: Option<unsafe extern "C" fn(*mut ModuleExt, i32) -> c_int>,
+    play_note: Option<unsafe extern "C" fn(*mut ModuleExt, i32, i32, c_double, c_double) -> i32>,
+    stop_note: Option<unsafe extern "C" fn(*mut ModuleExt, i32) -> c_int>,
+}
+
 type LogFunc = extern "C" fn(message: *const c_char, user: *mut c_void);
 type ErrorFunc = extern "C" fn(error: c_int, user: *mut c_void) -> c_int;
 
@@ -72,7 +98,7 @@ extern "C" {
     fn openmpt_free_string(s: *const c_char);
     fn openmpt_get_supported_extensions() -> *const c_char;
     fn openmpt_is_extension_supported(extension: *const c_char) -> c_int;
-    fn openmpt_module_create_from_memory2(
+    fn openmpt_module_ext_create_from_memory(
         filedata: *const c_void,
         filesize: usize,
         logfunc: Option<LogFunc>,
@@ -82,8 +108,15 @@ extern "C" {
         error: *mut c_int,
         error_message: *mut *const c_char,
         ctls: *const c_void,
-    ) -> *mut Module;
-    fn openmpt_module_destroy(module: *mut Module);
+    ) -> *mut ModuleExt;
+    fn openmpt_module_ext_get_module(mod_ext: *mut ModuleExt) -> *mut Module;
+    fn openmpt_module_ext_destroy(mod_ext: *mut ModuleExt);
+    fn openmpt_module_ext_get_interface(
+        mod_ext: *mut ModuleExt,
+        interface_id: *const c_char,
+        interface: *mut c_void,
+        interface_size: usize,
+    ) -> c_int;
     fn openmpt_module_read_interleaved_float_stereo(
         module: *mut Module,
         samplerate: c_int,
@@ -352,7 +385,9 @@ pub fn is_tracker_file(path: &Path) -> bool {
 
 /// Output-timeline playhead plus the library handle it belongs to.
 pub struct TrackerEngine {
+    module_ext: *mut ModuleExt,
     module: *mut Module,
+    interactive: InteractiveIface,
     path: PathBuf,
     out_rate: u32,
     metadata: TrackerMetadata,
@@ -393,8 +428,8 @@ impl TrackerEngine {
 
         let mut error: c_int = 0;
         let mut error_message: *const c_char = std::ptr::null();
-        let module = unsafe {
-            openmpt_module_create_from_memory2(
+        let module_ext = unsafe {
+            openmpt_module_ext_create_from_memory(
                 bytes.as_ptr().cast(),
                 bytes.len(),
                 None,
@@ -408,16 +443,44 @@ impl TrackerEngine {
         };
         // libopenmpt allocates the message even on failure; always free it.
         let detail = take_string(error_message);
-        if module.is_null() {
+        if module_ext.is_null() {
             return Err(TrackerError::Open {
                 path: path.to_path_buf(),
                 code: error,
                 detail: detail.unwrap_or_else(|| "no detail reported".into()),
             });
         }
+        let module = unsafe { openmpt_module_ext_get_module(module_ext) };
+        if module.is_null() {
+            unsafe { openmpt_module_ext_destroy(module_ext) };
+            return Err(TrackerError::Open {
+                path: path.to_path_buf(),
+                code: error,
+                detail: detail.unwrap_or_else(|| "extension returned no module".into()),
+            });
+        }
+        let mut interactive = InteractiveIface::default();
+        let interface_ok = unsafe {
+            openmpt_module_ext_get_interface(
+                module_ext,
+                b"interactive\0".as_ptr().cast(),
+                (&mut interactive as *mut InteractiveIface).cast(),
+                std::mem::size_of::<InteractiveIface>(),
+            )
+        };
+        if interface_ok != 1 {
+            unsafe { openmpt_module_ext_destroy(module_ext) };
+            return Err(TrackerError::Open {
+                path: path.to_path_buf(),
+                code: -1,
+                detail: "libopenmpt interactive interface unavailable".into(),
+            });
+        }
 
         let mut engine = Self {
+            module_ext,
             module,
+            interactive,
             path: path.to_path_buf(),
             out_rate,
             metadata: TrackerMetadata::default(),
@@ -726,6 +789,13 @@ impl TrackerEngine {
         }
     }
 
+    pub fn set_channel_mute(&mut self, channel: usize, mute: bool) -> bool {
+        let Some(set) = self.interactive.set_channel_mute_status else {
+            return false;
+        };
+        unsafe { set(self.module_ext, channel as i32, mute as c_int) == 1 }
+    }
+
     /// Loudest channel's VU in one pass, for a single meter.
     pub fn vu_peak(&self) -> ChannelVu {
         let mut peak = ChannelVu::default();
@@ -741,7 +811,8 @@ impl TrackerEngine {
 
 impl Drop for TrackerEngine {
     fn drop(&mut self) {
-        unsafe { openmpt_module_destroy(self.module) };
+        // `module` is a borrowed view owned by `module_ext`; destroy only the owner.
+        unsafe { openmpt_module_ext_destroy(self.module_ext) };
     }
 }
 
@@ -943,6 +1014,13 @@ mod tests {
             let path = Path::new(r"Y:\Test Files").join(name);
             let mut engine = TrackerEngine::open(&path, 44_100).expect("module must load");
             assert!(engine.channel_count() > 0, "{name}");
+            for channel in 0..engine.channel_count() as usize {
+                assert!(engine.set_channel_mute(channel, true), "{name} ch{channel}");
+                assert!(
+                    engine.set_channel_mute(channel, false),
+                    "{name} ch{channel}"
+                );
+            }
             assert!(
                 engine.duration_secs().is_some(),
                 "{name} needs a finite length"

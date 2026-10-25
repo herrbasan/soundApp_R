@@ -156,8 +156,12 @@ pub fn update_resize_cursor(window: &Window, cursor: (f32, f32), win_size: (u32,
     let icon = match hit_test_resize_border(cursor, win_size, window.scale_factor()) {
         Some(ResizeDirection::North) | Some(ResizeDirection::South) => CursorIcon::NsResize,
         Some(ResizeDirection::East) | Some(ResizeDirection::West) => CursorIcon::EwResize,
-        Some(ResizeDirection::NorthWest) | Some(ResizeDirection::SouthEast) => CursorIcon::NwseResize,
-        Some(ResizeDirection::NorthEast) | Some(ResizeDirection::SouthWest) => CursorIcon::NeswResize,
+        Some(ResizeDirection::NorthWest) | Some(ResizeDirection::SouthEast) => {
+            CursorIcon::NwseResize
+        }
+        Some(ResizeDirection::NorthEast) | Some(ResizeDirection::SouthWest) => {
+            CursorIcon::NeswResize
+        }
         None => CursorIcon::Default,
     };
     window.set_cursor(icon);
@@ -333,14 +337,16 @@ impl WindowManager {
     /// `true` when any visible window still has a UI transition in flight. Drives the
     /// host's 60 fps repaint timer so widget animations finish before going idle.
     pub fn any_animating(&self) -> bool {
-        self.windows.iter().any(|w| w.visible && w.ui_state.is_animating())
+        self.windows
+            .iter()
+            .any(|w| w.visible && w.ui_state.is_animating())
     }
 }
 
 impl<'a> Ui<'a> {
     /// Reusable secondary-window header: a `3.0rem` bar (`theme.shade2` fill +
-    /// `1px` `theme.border2` bottom rule) with the left icon + SemiBold title +
-    /// primary badge, and a right-side `ICON_CLOSE` danger button (widget ID `990`).
+    /// `1px` `theme.border2` bottom rule) with a left icon + title, an optional
+    /// primary badge, and a right-side ghost close button (widget ID `990`).
     /// Returns `(header_height, close_clicked)`.
     pub fn secondary_window_header(
         &mut self,
@@ -361,12 +367,12 @@ impl<'a> Ui<'a> {
             t.rem * 0.85 + icon_sz * 0.5,
             hdr_h * 0.5,
             icon_sz,
-            t.highlight,
+            t.text_dim,
         );
         let title_fs = t.font_base();
         let title_w = self.scene.text(
             self.text_sys,
-            FontFace::SemiBold,
+            FontFace::Regular,
             self.font_engine,
             title,
             (t.rem * 2.35).round(),
@@ -377,7 +383,9 @@ impl<'a> Ui<'a> {
 
         let badge_y = (hdr_h - (t.rem * 1.48).round()) * 0.5;
         let bx = t.rem * 2.35 + title_w + t.rem * 0.85;
-        let _ = self.badge(bx, badge_y, badge_text, BadgeVariant::Primary, None);
+        if !badge_text.is_empty() {
+            let _ = self.badge(bx, badge_y, badge_text, BadgeVariant::Primary, None);
+        }
 
         let btn_h = (t.rem * 1.75).round();
         let btn_y = (hdr_h - btn_h) * 0.5;
@@ -387,7 +395,7 @@ impl<'a> Ui<'a> {
             Rect::new(pw - t.rem * 0.6 - close_w, btn_y, close_w, btn_h),
             "",
             ICON_CLOSE,
-            ButtonVariant::Danger,
+            ButtonVariant::Ghost,
         );
         (hdr_h, close_clicked)
     }

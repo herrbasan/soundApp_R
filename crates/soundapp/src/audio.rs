@@ -122,6 +122,48 @@ fn path_cstring(path: &Path) -> Option<CString> {
     CString::new(path.to_string_lossy().as_bytes()).ok()
 }
 
+/// Single-owner streaming FFmpeg decoder used by the independent Mixer graph.
+/// The main player keeps its own transport/ring state; this is only the codec.
+pub(crate) struct FFmpegStream {
+    handle: *mut c_void,
+}
+
+unsafe impl Send for FFmpegStream {}
+
+impl FFmpegStream {
+    pub(crate) fn open(path: &Path, out_rate: u32) -> Result<Self, String> {
+        let c = path_cstring(path).ok_or_else(|| format!("invalid path: {}", path.display()))?;
+        let handle = unsafe { sa_ffmpeg_open(c.as_ptr(), out_rate as c_int) };
+        if handle.is_null() {
+            return Err(format!("FFmpeg open failed for {}", path.display()));
+        }
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn duration_secs(&self) -> f64 {
+        unsafe { sa_ffmpeg_duration(self.handle) }
+    }
+
+    pub(crate) fn seek(&mut self, seconds: f64) -> Result<(), String> {
+        if unsafe { sa_ffmpeg_seek(self.handle, seconds.max(0.0)) } == 0 {
+            Err("FFmpeg seek failed".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns interleaved-stereo samples, matching the bridge contract.
+    pub(crate) fn read(&mut self, out: &mut [f32]) -> usize {
+        unsafe { sa_ffmpeg_read(self.handle, out.as_mut_ptr(), out.len() as c_int) }.max(0) as usize
+    }
+}
+
+impl Drop for FFmpegStream {
+    fn drop(&mut self) {
+        unsafe { sa_ffmpeg_close(self.handle) };
+    }
+}
+
 /// Extract metadata + cover art directly from an already-opened `FFmpegDecoder`
 /// handle (no second SMB `avformat_open_input` or `avformat_find_stream_info`).
 fn read_handle_metadata(handle: *mut c_void, path: &Path) -> Option<TrackMetadata> {
@@ -231,6 +273,7 @@ enum Cmd {
     /// thread — never restarts the track. Non-MIDI engines just record it
     /// as the font for the next MIDI open.
     SetSoundfont(PathBuf),
+    SetTrackerMutes(Vec<bool>),
 }
 
 /// Shared atomics + mutex-guarded results, cloned into the callback and the
@@ -275,6 +318,10 @@ struct Shared {
     /// (after a live `set_soundfont` succeeds, or directly when no MIDI
     /// engine is running); read at every MIDI open.
     soundfont: Arc<Mutex<PathBuf>>,
+    /// Current tempo from the file's own tempo map, for the Parameters readout.
+    midi_native_bpm: Arc<AtomicU32>,
+    tracker_channels: Arc<AtomicU64>,
+    tracker_vu: Arc<Mutex<Vec<crate::tracker::ChannelVu>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +386,9 @@ pub struct Audio {
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
     soundfont: Arc<Mutex<PathBuf>>,
+    midi_native_bpm: Arc<AtomicU32>,
+    tracker_channels: Arc<AtomicU64>,
+    tracker_vu: Arc<Mutex<Vec<crate::tracker::ChannelVu>>>,
 }
 
 impl Audio {
@@ -434,6 +484,18 @@ impl Audio {
     pub fn soundfont(&self) -> PathBuf {
         self.soundfont.lock().unwrap().clone()
     }
+    pub fn midi_native_bpm(&self) -> f32 {
+        f32::from_bits(self.midi_native_bpm.load(Ordering::Relaxed))
+    }
+    pub fn tracker_channel_count(&self) -> usize {
+        self.tracker_channels.load(Ordering::Relaxed) as usize
+    }
+    pub fn tracker_vu(&self) -> Vec<crate::tracker::ChannelVu> {
+        self.tracker_vu.lock().unwrap().clone()
+    }
+    pub fn set_tracker_mutes(&self, mutes: Vec<bool>) {
+        let _ = self.cmd_tx.send(Cmd::SetTrackerMutes(mutes));
+    }
     pub fn metadata(&self) -> Option<TrackMetadata> {
         self.meta.lock().unwrap().clone()
     }
@@ -510,6 +572,9 @@ pub fn start(src: Source) -> Result<Audio, String> {
         meta: Arc::new(Mutex::new(None)),
         current: Arc::new(Mutex::new(None)),
         soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+        midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
+        tracker_channels: Arc::new(AtomicU64::new(0)),
+        tracker_vu: Arc::new(Mutex::new(Vec::new())),
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -697,6 +762,9 @@ pub fn start(src: Source) -> Result<Audio, String> {
         current: shared.current.clone(),
         dsp: shared.dsp.clone(),
         soundfont: shared.soundfont.clone(),
+        midi_native_bpm: shared.midi_native_bpm.clone(),
+        tracker_channels: shared.tracker_channels.clone(),
+        tracker_vu: shared.tracker_vu.clone(),
     })
 }
 
@@ -1349,6 +1417,7 @@ fn decoder_thread(
 
     // Scratch buffers reused across iterations.
     let mut raw: Vec<f32> = Vec::new();
+    let mut tracker_vu_buf: Vec<crate::tracker::ChannelVu> = Vec::new();
 
     let mut tone_hz: Option<f32> = None;
     let mut silence = false;
@@ -1372,6 +1441,7 @@ fn decoder_thread(
         let mut latest_seek: Option<f64> = None;
         let mut latest_params: Option<PlaybackParams> = None;
         let mut latest_soundfont: Option<PathBuf> = None;
+        let mut latest_mutes: Option<Vec<bool>> = None;
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Cmd::Load(p) => {
@@ -1386,6 +1456,9 @@ fn decoder_thread(
                 }
                 Cmd::SetSoundfont(p) => {
                     latest_soundfont = Some(p);
+                }
+                Cmd::SetTrackerMutes(mutes) => {
+                    latest_mutes = Some(mutes);
                 }
             }
         }
@@ -1442,6 +1515,15 @@ fn decoder_thread(
                 },
                 _ => {
                     *sh.soundfont.lock().unwrap() = p;
+                }
+            }
+        }
+        if let Some(mutes) = latest_mutes {
+            if let Engine::Openmpt(eng) = &mut engine {
+                for (channel, mute) in mutes.into_iter().enumerate() {
+                    if !eng.set_channel_mute(channel, mute) {
+                        eprintln!("[audio] tracker channel mute rejected: ch{channel}");
+                    }
                 }
             }
         }
@@ -1678,11 +1760,19 @@ fn decoder_thread(
                     eof = true;
                     produced = 0;
                 } else {
+                    eng.channel_vu_into(&mut tracker_vu_buf);
+                    {
+                        let mut published = sh.tracker_vu.lock().unwrap();
+                        published.clear();
+                        published.extend_from_slice(&tracker_vu_buf);
+                    }
                     raw.extend_from_slice(&tmp[..n * 2]);
                     produced = n;
                 }
             }
             Engine::Midi(eng) => {
+                sh.midi_native_bpm
+                    .store((eng.native_bpm() as f32).to_bits(), Ordering::Relaxed);
                 // Loop intent mirrors the tracker arm: the player loops inside
                 // FluidSynth (tick-accurate), so no seam surgery. Loop enabled
                 // after EOF: rewind explicitly — a loop set after the song
@@ -1969,6 +2059,7 @@ fn push_frames_fit(producer: &mut rtrb::Producer<f32>, src: &mut Vec<f32>, out_c
 
 fn open_ffmpeg(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
     close_engine(engine);
+    sh.tracker_channels.store(0, Ordering::Release);
     // New track: the stretcher re-bases its position accounting to zero when
     // it services the flush below.
     sh.seek_target.store(0, Ordering::SeqCst);
@@ -2049,6 +2140,7 @@ fn tracker_track_metadata(
 /// to the fresh module before any audio flows.
 fn open_tracker(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
     close_engine(engine);
+    sh.tracker_channels.store(0, Ordering::Release);
     sh.seek_target.store(0, Ordering::SeqCst);
     let flush_target = pre_load(sh);
 
@@ -2064,6 +2156,9 @@ fn open_tracker(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
             if let Err(e) = eng.set_loop(sh.loop_enabled.load(Ordering::Relaxed)) {
                 eprintln!("[audio] tracker set_loop at open failed: {e}");
             }
+            sh.tracker_channels
+                .store(eng.channel_count() as u64, Ordering::Release);
+            sh.tracker_vu.lock().unwrap().clear();
             let meta = tracker_track_metadata(path, eng.metadata(), out_rate, eng.duration_secs());
             // u64::MAX marks a module with no finite end (the tone source uses
             // the same marker); at_track_end then never fires.
@@ -2139,6 +2234,7 @@ fn midi_track_metadata(
 /// audio flows; the SoundFont comes from `sh.soundfont` (last published).
 fn open_midi(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
     close_engine(engine);
+    sh.tracker_channels.store(0, Ordering::Release);
     sh.seek_target.store(0, Ordering::SeqCst);
     let flush_target = pre_load(sh);
 
@@ -2152,6 +2248,8 @@ fn open_midi(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
             eng.apply_params(params.midi);
             eng.set_loop(sh.loop_enabled.load(Ordering::Relaxed));
             let dur = eng.duration();
+            sh.midi_native_bpm
+                .store((eng.native_bpm() as f32).to_bits(), Ordering::Relaxed);
             let meta = midi_track_metadata(path, eng.info(), dur, out_rate);
             *sh.meta.lock().unwrap() = Some(meta);
             *engine = Engine::Midi(eng);
@@ -2801,6 +2899,9 @@ mod tests {
             meta: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+            midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
+            tracker_channels: Arc::new(AtomicU64::new(0)),
+            tracker_vu: Arc::new(Mutex::new(Vec::new())),
         };
         let (mut src_prod, src_cons) = RingBuffer::<f32>::new(48_000 * 2);
         let (out_prod, mut out_cons) = RingBuffer::<f32>::new(4096 * 2);
@@ -2855,6 +2956,9 @@ mod tests {
             current: Arc::new(Mutex::new(None)),
             dsp: Arc::new(Mutex::new(DspTap::new(rate))),
             soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+            midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
+            tracker_channels: Arc::new(AtomicU64::new(0)),
+            tracker_vu: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -4129,8 +4233,8 @@ mod tests {
             out
         }
 
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/midiwork/native-tone.mid");
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/midiwork/native-tone.mid");
         let mut smf = Vec::new();
         smf.extend_from_slice(b"MThd");
         smf.extend_from_slice(&6u32.to_be_bytes());
@@ -4284,7 +4388,9 @@ mod tests {
         let anchor_i = anchor.saturating_sub(missed) as usize;
         let pre: Vec<f64> = freqs
             .iter()
-            .filter(|(i, ..)| *i + win / 2 < anchor_i && *i > anchor_i.saturating_sub(rate as usize))
+            .filter(|(i, ..)| {
+                *i + win / 2 < anchor_i && *i > anchor_i.saturating_sub(rate as usize)
+            })
             .map(|(_, f, _)| *f)
             .collect();
         assert!(pre.len() > 8, "no pre-change plateau windows");

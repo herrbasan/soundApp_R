@@ -10,6 +10,7 @@ mod audio;
 mod config;
 mod dsp;
 mod midi;
+mod mixer;
 mod perf;
 mod tracker;
 
@@ -39,6 +40,9 @@ use nui::{
 struct MixerStem {
     /// Display number (`01`..`20`).
     number: usize,
+    /// Stable engine slot; UI removal never renumbers another stem's audio.
+    slot: usize,
+    path: Option<PathBuf>,
     /// Fader gain, `0.0..=2.0` (`1.0` = unity).
     gain: f32,
     /// Stereo pan, `-1.0` = hard left .. `+1.0` = hard right.
@@ -66,11 +70,11 @@ struct ParamState {
     stretch: f32,
     /// Pitch/Time formant preservation.
     formant: bool,
-    /// Native tracker (libopenmpt) pitch in whole semitones (`-24..=24`,
+    /// Native tracker (libopenmpt) pitch in whole semitones (`-12..=12`,
     /// `0` = neutral). Active only while a tracker module plays; the event
     /// stream is unaffected — samples transpose, speed does not.
     trk_pitch_st: f32,
-    /// Native tracker tempo in whole percent (`25..=400`, `100` = neutral).
+    /// Native tracker tempo in whole percent (`50..=150`, `100` = neutral).
     /// Event-domain: rows and envelopes play faster/slower, samples keep pitch.
     trk_tempo_pct: f32,
     /// Native mixer stereo separation, `0..=200` percent (`100` = libopenmpt
@@ -78,11 +82,11 @@ struct ParamState {
     trk_separation: f32,
     /// Native mixer interpolation filter.
     trk_interp: tracker::Interpolation,
-    /// Native MIDI (FluidSynth) transpose in whole semitones (`-24..=24`,
+    /// Native MIDI (FluidSynth) transpose in whole semitones (`-12..=12`,
     /// `0` = neutral). Applies live at the note-on/off hook — never restarts,
     /// percussion channel 9 skips.
     midi_transpose_st: f32,
-    /// Native MIDI tempo override in whole BPM (`30..=300`, default 120).
+    /// Native MIDI tempo override in whole BPM (`40..=240`, default 120).
     /// Applied only while `midi_bpm_override` is on; otherwise the file's
     /// own tempo map rules.
     midi_bpm: f32,
@@ -309,6 +313,8 @@ struct App {
     // the selection index (persisted as `selected_soundfont`).
     soundfonts: Vec<PathBuf>,
     selected_soundfont: usize,
+    /// Tracker channel solo/mute state; cleared for every new module.
+    tracker_mutes: Vec<bool>,
 
     // Phase 3.1 — player transport state (loop / shuffle).
     pub loop_enabled: bool,
@@ -331,12 +337,15 @@ struct App {
     /// Output-frame counter at the last Monitoring redraw (delta = new frames).
     last_dsp_frames: u64,
 
-    // Phase 3.4 — multitrack stem preview mixer state.
+    // Phase 3.4 — independent multitrack stem preview mixer.
+    mixer_audio: Option<mixer::MixerAudio>,
     mixer_stems: Vec<MixerStem>,
     mixer_playing: bool,
     mixer_loop: bool,
     mixer_master_vol: f32,
     mixer_pos_frac: f32,
+    mixer_strip_targets: Vec<(Rect, usize)>,
+    mixer_add_target: Option<Rect>,
 
     // Phase 3.5 — persistent user configuration.
     config: UserConfig,
@@ -368,12 +377,11 @@ const SAMPLE_RATES: &[&str] = &[
 const SPEC_PARAMETERS: WindowSpec = WindowSpec {
     key: "parameters",
     title: "SoundApp · Parameters [P]",
-    // Audio-page size. Native tracker/MIDI pages use a compact adjusted spec
-    // when opened (see `adjusted_window_spec`).
-    width: 680.0,
-    height: 1076.0,
+    // All adaptive pages share the reference window's default geometry.
+    width: 510.0,
+    height: 922.0,
     min_width: 480.0,
-    min_height: 1076.0,
+    min_height: 720.0,
     undecorated: true,
 };
 
@@ -449,18 +457,9 @@ fn window_header_badge(key: &str) -> &'static str {
     }
 }
 
-/// The nine default multitrack stems (Phase 3.4). Media lives in
-/// `D:\Work\_GIT\SoundApp\_Material\mixer_media\Again\01.m4a .. 09.m4a`.
+/// Mixer strips are created only for real media paths; no synthetic demo audio.
 fn default_mixer_stems() -> Vec<MixerStem> {
-    (1..=9)
-        .map(|n| MixerStem {
-            number: n,
-            gain: 1.0,
-            pan: 0.0,
-            muted: false,
-            solo: false,
-        })
-        .collect()
+    Vec::new()
 }
 
 /// Deterministic synthetic stereo signal used by the Monitoring window when the
@@ -841,12 +840,27 @@ enum ScanJob {
         path: PathBuf,
         recursive: bool,
     },
+    MixerDrop {
+        path: PathBuf,
+        replace_slot: Option<usize>,
+        recursive: bool,
+    },
 }
 
 enum ScanOutcome {
-    SingleFile { files: Vec<PathBuf>, idx: usize },
-    Folder { files: Vec<PathBuf>, append: bool },
-    MixerStems(usize),
+    SingleFile {
+        files: Vec<PathBuf>,
+        idx: usize,
+    },
+    Folder {
+        files: Vec<PathBuf>,
+        append: bool,
+    },
+    MixerStems(Vec<PathBuf>),
+    MixerDrop {
+        files: Vec<PathBuf>,
+        replace_slot: Option<usize>,
+    },
 }
 
 /// Which of the three drop zones the pointer is over.
@@ -884,6 +898,8 @@ struct ParamsWindowIntents {
     /// The SoundFont select moved — forward the new font to the engine (MIDI
     /// sources adopt it live; others open the next MIDI track with it).
     soundfont_idx: Option<usize>,
+    open_soundfonts_folder: bool,
+    tracker_mutes_changed: bool,
 }
 
 /// Small flat ghost icon button used by the minimalist top bar.
@@ -1240,39 +1256,34 @@ fn draw_ghost_button(ui: &mut Ui, r: Rect, label: &str) {
     draw_centered_text(ui, r, label, FontFace::Regular, t.font_small(), t.text_dim);
 }
 
-/// Static switch snapshot (dimmed card): pill track + thumb + label, no hit target.
-fn draw_ghost_switch(ui: &mut Ui, r: Rect, label: &str, on: bool) {
+/// Static checkbox snapshot for a dimmed card.
+fn draw_ghost_checkbox(ui: &mut Ui, r: Rect, label: &str, on: bool) {
     let t = ui.theme;
-    let sw_h = (t.rem * 1.25).round();
-    let sw_w = (sw_h * 1.8).round();
+    let side = (t.rem * 1.1).round();
     let cy = r.y + r.h * 0.5;
-    let sy = (cy - sw_h * 0.5).round();
-    let track_col = if on { t.highlight } else { t.shade4 };
+    let box_r = Rect::new(r.x, (cy - side * 0.5).round(), side, side);
     ui.scene.rounded_rect(
-        r.x.round(),
-        sy,
-        sw_w,
-        sw_h,
-        sw_h * 0.5,
-        track_col,
-        (0, 0, 0, 0),
-        0.0,
+        box_r.x,
+        box_r.y,
+        box_r.w,
+        box_r.h,
+        t.radius1(),
+        t.base,
+        t.border3,
+        1.0,
     );
-    let pad = (sw_h * 0.16).round().max(2.0);
-    let d = sw_h - pad * 2.0;
-    let tx = if on { r.x + sw_w - pad - d } else { r.x + pad };
-    ui.scene.rounded_rect(
-        tx.round(),
-        sy + pad,
-        d,
-        d,
-        d * 0.5,
-        rgb(255, 255, 255),
-        (0, 0, 0, 0),
-        0.0,
-    );
+    if on {
+        ui.scene.icon_centered(
+            ui.text_sys,
+            ICON_CHECK,
+            box_r.x + side * 0.5,
+            box_r.y + side * 0.5,
+            side * 0.85,
+            t.text_dim,
+        );
+    }
     let fs = t.font_small();
-    let ltx = r.x + sw_w + t.checkbox_gap();
+    let ltx = box_r.x + side + t.checkbox_gap();
     ui.text_clipped(
         FontFace::Regular,
         ui.font_engine,
@@ -1456,10 +1467,10 @@ fn draw_pitch_time_card(
         [Length::fill(), Length::rem(6.5)],
     );
     if !active {
-        draw_ghost_switch(ui, sw_r, "Preserve Formants", params.formant);
+        draw_ghost_checkbox(ui, sw_r, "Preserve Formants", params.formant);
         draw_ghost_button(ui, btn_r, "Reset");
     } else {
-        if ui.switch(1222, sw_r, "Preserve Formants", &mut params.formant) {
+        if ui.checkbox(1222, sw_r, "Preserve Formants", &mut params.formant) {
             intents.params_changed = true;
         }
         if ui.button(1223, btn_r, "Reset", ICON_RESTART, ButtonVariant::Outline) {
@@ -1491,8 +1502,6 @@ fn draw_tracker_native_card(
     intents: &mut ParamsWindowIntents,
 ) {
     let theme = ui.theme;
-    let title_r = ui.take(Length::Rem(1.5));
-    draw_card_title(ui, title_r, "Tracker Engine · native", true);
     let fs = theme.font_small();
     let sub_h = Length::Rem(1.0).resolve(theme.rem);
     let val_h = Length::Rem(1.9).resolve(theme.rem);
@@ -1529,7 +1538,7 @@ fn draw_tracker_native_card(
     };
 
     let (sub, val, sl, lab) = full_group(ui, 6.6);
-    group_label(ui, sub, "Pitch");
+    group_label(ui, sub, "Pitch Shift");
     let v = format!("{:+.0}", params.trk_pitch_st);
     draw_value_readout(ui, val, &v, "semitones");
     {
@@ -1539,16 +1548,16 @@ fn draw_tracker_native_card(
             1261,
             sl,
             &mut params.trk_pitch_st,
-            -24.0,
-            24.0,
+            -12.0,
+            12.0,
             0.0,
             1.0,
         ) {
-            params.trk_pitch_st = snap_semitones_range(params.trk_pitch_st, -24.0, 24.0);
+            params.trk_pitch_st = snap_semitones_range(params.trk_pitch_st, -12.0, 12.0);
             intents.params_changed |= params.trk_pitch_st != prev;
         }
     }
-    draw_scale_labels(ui, lab, "-24", "0", "+24");
+    draw_scale_labels(ui, lab, "-12", "0", "+12");
 
     let (sub, val, sl, lab) = full_group(ui, 6.6);
     group_label(ui, sub, "Tempo");
@@ -1561,58 +1570,16 @@ fn draw_tracker_native_card(
             1263,
             sl,
             &mut params.trk_tempo_pct,
-            25.0,
-            400.0,
+            50.0,
+            150.0,
             100.0,
             1.0,
         ) {
-            params.trk_tempo_pct = snap_percent(params.trk_tempo_pct, 25.0, 400.0);
+            params.trk_tempo_pct = snap_percent(params.trk_tempo_pct, 50.0, 150.0);
             intents.params_changed |= params.trk_tempo_pct != prev;
         }
     }
-    draw_scale_labels(ui, lab, "25%", "100%", "400%");
-
-    let (sub, val, sl, lab) = full_group(ui, 6.6);
-    group_label(ui, sub, "Stereo Separation");
-    let v = format!("{:.0}", params.trk_separation);
-    draw_value_readout(ui, val, &v, "%");
-    {
-        let prev = params.trk_separation;
-        if slider_one_unit(
-            ui,
-            1265,
-            sl,
-            &mut params.trk_separation,
-            0.0,
-            200.0,
-            100.0,
-            1.0,
-        ) {
-            params.trk_separation = snap_percent(params.trk_separation, 0.0, 200.0);
-            intents.params_changed |= params.trk_separation != prev;
-        }
-    }
-    draw_scale_labels(ui, lab, "0", "100", "200");
-
-    // Interpolation select — full width at standard control height, not the
-    // full value+slider span.
-    let sel_h = Length::Rem(2.2).resolve(theme.rem);
-    let g = ui.take(Length::Rem(4.3));
-    let sub = Rect::new(g.x, g.y, g.w, sub_h);
-    let sel = Rect::new(g.x, g.y + sub_h, g.w, sel_h);
-    let lab = Rect::new(g.x, g.y + sub_h + sel_h, g.w, g.h - sub_h - sel_h);
-    group_label(ui, sub, "Interpolation");
-    // Index into TRK_INTERP_OPTIONS == index into Interpolation::ALL.
-    let mut idx = tracker::Interpolation::ALL
-        .iter()
-        .position(|i| *i == params.trk_interp)
-        .unwrap_or(0);
-    if ui.select(1267, sel, &TRK_INTERP_OPTIONS, &mut idx) {
-        params.trk_interp = tracker::Interpolation::ALL[idx];
-        intents.params_changed = true;
-    }
-    let hint = format!("filter length {}", params.trk_interp.filter_length());
-    draw_scale_labels(ui, lab, &hint, "", "");
+    draw_scale_labels(ui, lab, "50%", "100%", "150%");
 
     let [_, btn_r] = ui.take_cols(
         Length::Rem(1.9),
@@ -1625,20 +1592,186 @@ fn draw_tracker_native_card(
     }
 }
 
-/// Native MIDI Engine card body — MIDI page only. Transpose, BPM override
-/// and the metronome are applied by FluidSynth itself (live, no restart);
-/// the SoundFont select switches fonts without touching position.
+fn toggle_tracker_solo(mutes: &mut [bool], index: usize, additive: bool) {
+    if index >= mutes.len() {
+        return;
+    }
+    let has_solo = mutes.iter().any(|muted| *muted);
+    let is_solo = has_solo && !mutes[index];
+    if additive {
+        if is_solo {
+            mutes[index] = true;
+            if mutes.iter().all(|muted| *muted) {
+                mutes.fill(false);
+            }
+        } else {
+            if !has_solo {
+                mutes.fill(true);
+            }
+            mutes[index] = false;
+        }
+    } else {
+        let only_solo = is_solo
+            && mutes
+                .iter()
+                .enumerate()
+                .all(|(channel, muted)| channel == index || *muted);
+        if only_solo {
+            mutes.fill(false);
+        } else {
+            mutes.fill(true);
+            mutes[index] = false;
+        }
+    }
+}
+
+fn draw_tracker_channel_card(
+    ui: &mut Ui,
+    channel_count: usize,
+    vu: &[tracker::ChannelVu],
+    mutes: &mut Vec<bool>,
+    additive_solo: bool,
+    intents: &mut ParamsWindowIntents,
+) {
+    let theme = ui.theme;
+    let title = ui.take(Length::Rem(1.5));
+    draw_card_title(ui, title, "Channel Mixer", false);
+    let count = format!("{channel_count} channels");
+    let fs = theme.font_small();
+    let count_w = ui
+        .text_sys
+        .measure(FontFace::Regular, ui.font_engine, &count, fs);
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        &count,
+        (title.x + title.w - count_w).round(),
+        (title.y + title.h * 0.5 + fs * 0.35).round(),
+        fs,
+        theme.text_dim,
+    );
+    if mutes.len() != channel_count {
+        mutes.resize(channel_count, false);
+    }
+    let bars = ui.take(Length::Rem(3.2));
+    let labels = ui.take(Length::Rem(1.0));
+    let bar_w = Length::Rem(1.5).resolve(theme.rem).round();
+    let gap = Length::Rem(0.35).resolve(theme.rem).round();
+    let has_solo = mutes.iter().any(|muted| *muted);
+    for channel in 0..channel_count {
+        let x = bars.x + channel as f32 * (bar_w + gap);
+        if x + bar_w > bars.x + bars.w {
+            break;
+        }
+        let bar = Rect::new(x, bars.y, bar_w, bars.h);
+        if engine_card_hit(ui, 1280 + channel as u32, bar, false) {
+            toggle_tracker_solo(mutes, channel, additive_solo);
+            intents.tracker_mutes_changed = true;
+        }
+        let solo = has_solo && !mutes[channel];
+        let border = if solo { theme.highlight } else { theme.border2 };
+        ui.scene.rounded_rect(
+            bar.x,
+            bar.y,
+            bar.w,
+            bar.h,
+            theme.radius1(),
+            theme.base,
+            border,
+            if solo { 2.0 } else { 1.0 },
+        );
+        let level = vu
+            .get(channel)
+            .map(|level| level.peak().clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        let fill_h = (bar.h * level).round();
+        if fill_h > 0.0 && !mutes[channel] {
+            ui.scene.rect(
+                bar.x + 1.0,
+                bar.y + bar.h - fill_h,
+                (bar.w - 2.0).max(1.0),
+                fill_h,
+                rgb(74, 170, 74),
+            );
+        }
+        let label = (channel + 1).to_string();
+        draw_centered_text(
+            ui,
+            Rect::new(x, labels.y, bar_w, labels.h),
+            &label,
+            FontFace::Regular,
+            theme.font_xsmall(),
+            if mutes[channel] {
+                theme.text_dim
+            } else {
+                theme.text
+            },
+        );
+    }
+}
+
+fn draw_tracker_separation_card(
+    ui: &mut Ui,
+    params: &mut ParamState,
+    intents: &mut ParamsWindowIntents,
+) {
+    let theme = ui.theme;
+    let title = ui.take(Length::Rem(1.5));
+    draw_card_title(ui, title, "Stereo Separation", false);
+    let value = ui.take(Length::Rem(1.6));
+    let v = format!("{:.0}", params.trk_separation);
+    draw_value_readout_scaled(ui, value, &v, "%", 1.4);
+    let slider = ui.take(Length::Rem(2.6));
+    let previous = params.trk_separation;
+    if slider_one_unit(
+        ui,
+        1265,
+        slider,
+        &mut params.trk_separation,
+        0.0,
+        200.0,
+        100.0,
+        1.0,
+    ) {
+        params.trk_separation = snap_percent(params.trk_separation, 0.0, 200.0);
+        intents.params_changed |= params.trk_separation != previous;
+    }
+    let labels = ui.take(Length::Rem(0.8));
+    draw_scale_labels(ui, labels, "0%", "100%", "200%");
+
+    let interpolation_label = ui.take(Length::Rem(1.0));
+    ui.text_clipped(
+        FontFace::Regular,
+        ui.font_engine,
+        "Interpolation (extension)",
+        interpolation_label.x,
+        (interpolation_label.y + interpolation_label.h * 0.5 + theme.font_small() * 0.35).round(),
+        theme.font_small(),
+        interpolation_label.w,
+        theme.text_dim,
+    );
+    let select = ui.take(Length::Rem(2.2));
+    let mut index = tracker::Interpolation::ALL
+        .iter()
+        .position(|interpolation| *interpolation == params.trk_interp)
+        .unwrap_or(0);
+    if ui.select(1267, select, &TRK_INTERP_OPTIONS, &mut index) {
+        params.trk_interp = tracker::Interpolation::ALL[index];
+        intents.params_changed = true;
+    }
+}
+
+/// Native MIDI controls — transpose, tempo and metronome are applied by
+/// FluidSynth itself (live, no restart).
 #[allow(clippy::too_many_arguments)]
 fn draw_midi_native_card(
     ui: &mut Ui,
     params: &mut ParamState,
-    fonts: &[PathBuf],
-    selected_font: &mut usize,
+    native_bpm: f32,
     intents: &mut ParamsWindowIntents,
 ) {
     let theme = ui.theme;
-    let title_r = ui.take(Length::Rem(1.5));
-    draw_card_title(ui, title_r, "MIDI Engine · native", true);
     let fs = theme.font_small();
     let sub_h = Length::Rem(1.0).resolve(theme.rem);
     let val_h = Length::Rem(1.9).resolve(theme.rem);
@@ -1656,39 +1789,6 @@ fn draw_midi_native_card(
             theme.text_dim,
         );
     };
-
-    // Row 1: SoundFont select (full width).
-    let g0 = ui.take(Length::Rem(4.2));
-    let sub = Rect::new(g0.x, g0.y, g0.w, sub_h);
-    let sel_h = Length::Rem(2.2).resolve(theme.rem);
-    let sel = Rect::new(g0.x, g0.y + sub_h, g0.w, sel_h);
-    let hint = Rect::new(g0.x, g0.y + sub_h + sel_h, g0.w, g0.h - sub_h - sel_h);
-    group_label(ui, sub, "SoundFont");
-    let names: Vec<String> = fonts
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.display().to_string())
-        })
-        .collect();
-    let options: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let mut font_idx = (*selected_font).min(options.len().saturating_sub(1));
-    if ui.select(1271, sel, &options, &mut font_idx) {
-        *selected_font = font_idx;
-        intents.soundfont_idx = Some(font_idx);
-    }
-    draw_scale_labels(
-        ui,
-        hint,
-        &format!(
-            "{} font{} · FluidSynth 2.6",
-            fonts.len(),
-            if fonts.len() == 1 { "" } else { "s" }
-        ),
-        "",
-        "",
-    );
 
     // Each control group spans the full card width and the groups stack
     // vertically, as on the reference page (`params_midi.png`) — no
@@ -1708,7 +1808,7 @@ fn draw_midi_native_card(
     };
 
     let (sub, val, sl, lab) = full_group(ui, 6.6);
-    group_label(ui, sub, "Transpose");
+    group_label(ui, sub, "Global Transpose");
     let v = format!("{:+.0}", params.midi_transpose_st);
     draw_value_readout(ui, val, &v, "semitones");
     {
@@ -1718,53 +1818,115 @@ fn draw_midi_native_card(
             1272,
             sl,
             &mut params.midi_transpose_st,
-            -24.0,
-            24.0,
+            -12.0,
+            12.0,
             0.0,
             1.0,
         ) {
-            params.midi_transpose_st = snap_semitones_range(params.midi_transpose_st, -24.0, 24.0);
+            params.midi_transpose_st = snap_semitones_range(params.midi_transpose_st, -12.0, 12.0);
             intents.params_changed |= params.midi_transpose_st != prev;
         }
     }
-    draw_scale_labels(ui, lab, "-24", "0", "+24");
+    draw_scale_labels(ui, lab, "-12", "0", "+12");
 
     let (sub, val, sl, lab) = full_group(ui, 6.6);
     group_label(ui, sub, "Tempo");
-    // "native" = the file's own tempo map; the override value is applied
-    // only while the switch below is on (separate visible domain, no copy).
-    if params.midi_bpm_override {
-        let v = format!("{:.0}", params.midi_bpm);
-        draw_value_readout(ui, val, &v, "BPM");
-        let prev = params.midi_bpm;
-        if slider_one_unit(ui, 1273, sl, &mut params.midi_bpm, 30.0, 300.0, 120.0, 1.0) {
-            params.midi_bpm = snap_percent(params.midi_bpm, 30.0, 300.0);
-            intents.params_changed |= params.midi_bpm != prev;
-        }
+    let hint = format!("(Original: {:.0})", native_bpm);
+    let hint_x = sub.x
+        + ui.text_sys
+            .measure(FontFace::SemiBold, ui.font_engine, "Tempo", fs)
+        + theme.rem;
+    ui.text_clipped(
+        FontFace::Regular,
+        ui.font_engine,
+        &hint,
+        hint_x.round(),
+        (sub.y + sub.h * 0.5 + fs * 0.35).round(),
+        fs,
+        (sub.x + sub.w - hint_x).max(0.0),
+        theme.text_dim,
+    );
+    let mut bpm = if params.midi_bpm_override {
+        params.midi_bpm
     } else {
-        draw_value_readout_scaled(ui, val, "native", "", 1.2);
-        draw_static_slider(ui, sl, params.midi_bpm, 30.0, 300.0);
-    }
-    draw_scale_labels(ui, lab, "30", "120", "300");
-
-    // Switches stack full width too: one control per row.
-    let sw1 = ui.take(Length::Rem(2.2));
-    if ui.switch(1274, sw1, "BPM Override", &mut params.midi_bpm_override) {
+        native_bpm
+    };
+    let v = format!("{:.0}", bpm);
+    draw_value_readout(ui, val, &v, "BPM");
+    if slider_one_unit(
+        ui,
+        1273,
+        sl,
+        &mut bpm,
+        40.0,
+        240.0,
+        native_bpm.clamp(40.0, 240.0),
+        1.0,
+    ) {
+        params.midi_bpm = snap_percent(bpm, 40.0, 240.0);
+        params.midi_bpm_override = true;
         intents.params_changed = true;
     }
+    draw_scale_labels(ui, lab, "40", "140", "240");
+
     let sw2 = ui.take(Length::Rem(2.2));
-    if ui.switch(1275, sw2, "Metronome", &mut params.midi_metronome) {
+    if ui.checkbox(1275, sw2, "Metronome", &mut params.midi_metronome) {
         intents.params_changed = true;
     }
 
     let [_, btn_r] = ui.take_cols(
         Length::Rem(1.9),
         Length::rem(1.0),
-        [Length::fill(), Length::rem(6.5)],
+        [Length::fill(), Length::rem(11.0)],
     );
-    if ui.button(1276, btn_r, "Reset", ICON_RESTART, ButtonVariant::Outline) {
+    if ui.button(
+        1276,
+        btn_r,
+        "Reset Parameters",
+        ICON_RESTART,
+        ButtonVariant::Outline,
+    ) {
         params.reset_midi();
         intents.params_changed = true;
+    }
+}
+
+fn draw_midi_soundfont_card(
+    ui: &mut Ui,
+    fonts: &[PathBuf],
+    selected_font: &mut usize,
+    intents: &mut ParamsWindowIntents,
+) {
+    let title_r = ui.take(Length::Rem(1.5));
+    draw_card_title(ui, title_r, "Active SoundFont", false);
+    let sel = ui.take(Length::Rem(2.4));
+    let names: Vec<String> = fonts
+        .iter()
+        .map(|p| {
+            p.file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .collect();
+    let options: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut font_idx = (*selected_font).min(options.len().saturating_sub(1));
+    if ui.select(1271, sel, &options, &mut font_idx) {
+        *selected_font = font_idx;
+        intents.soundfont_idx = Some(font_idx);
+    }
+    let [_, btn_r] = ui.take_cols(
+        Length::Rem(2.2),
+        Length::rem(1.0),
+        [Length::fill(), Length::rem(15.0)],
+    );
+    if ui.button(
+        1277,
+        btn_r,
+        "Open Soundfonts Folder",
+        "",
+        ButtonVariant::Outline,
+    ) {
+        intents.open_soundfonts_folder = true;
     }
 }
 
@@ -1871,14 +2033,37 @@ impl App {
         config: UserConfig,
     ) -> Self {
         let mixer_stems = default_mixer_stems();
+        let soundfonts = midi::soundfont_list();
+        let selected_soundfont = config
+            .selected_soundfont
+            .min(soundfonts.len().saturating_sub(1));
+        if let Some(audio) = &audio {
+            if let Some(font) = soundfonts.get(selected_soundfont) {
+                audio.set_soundfont(font.clone());
+            }
+        }
         let (scan_tx, job_rx) = std::sync::mpsc::channel::<(u64, ScanJob)>();
         let (res_tx, scan_rx) = std::sync::mpsc::channel::<(u64, ScanOutcome)>();
         let _ = std::thread::Builder::new()
             .name("playlist-scan".into())
             .spawn(move || {
-                while let Ok((mut gen, mut job)) = job_rx.recv() {
-                    // Coalesce if newer non-append scans arrived while busy.
+                let mut deferred = None;
+                loop {
+                    let next = match deferred.take() {
+                        Some(job) => Ok(job),
+                        None => job_rx.recv(),
+                    };
+                    let Ok((mut gen, mut job)) = next else {
+                        break;
+                    };
+                    // Coalesce ordinary scans, but never discard Mixer drops.
                     while let Ok((g2, j2)) = job_rx.try_recv() {
+                        if matches!(job, ScanJob::MixerDrop { .. })
+                            || matches!(j2, ScanJob::MixerDrop { .. })
+                        {
+                            deferred = Some((g2, j2));
+                            break;
+                        }
                         gen = g2;
                         job = j2;
                     }
@@ -1911,7 +2096,24 @@ impl App {
                             } else {
                                 playlist_from_single_file(&path).0
                             };
-                            ScanOutcome::MixerStems(files.len().min(20))
+                            ScanOutcome::MixerStems(
+                                files.into_iter().take(mixer::MAX_STEMS).collect(),
+                            )
+                        }
+                        ScanJob::MixerDrop {
+                            path,
+                            replace_slot,
+                            recursive,
+                        } => {
+                            let files = if path.is_dir() {
+                                playlist_from_folder(&path, recursive)
+                            } else {
+                                vec![path]
+                            };
+                            ScanOutcome::MixerDrop {
+                                files: files.into_iter().take(mixer::MAX_STEMS).collect(),
+                                replace_slot,
+                            }
                         }
                     };
                     let _ = res_tx.send((gen, out));
@@ -1966,8 +2168,9 @@ impl App {
             scrub_frac: 0.0,
             selected_track: 0,
             show_controls: config.show_controls,
-            soundfonts: Vec::new(),
-            selected_soundfont: 0,
+            soundfonts,
+            selected_soundfont,
+            tracker_mutes: Vec::new(),
             loop_enabled: false,
             shuffle_enabled: false,
             playlist: Vec::new(),
@@ -1979,11 +2182,14 @@ impl App {
             last_dsp_frames: 0,
             dsp_buf: Vec::new(),
             dsp_snap: DspSnapshot::default(),
+            mixer_audio: None,
             mixer_stems,
-            mixer_playing: true,
+            mixer_playing: false,
             mixer_loop: true,
             mixer_master_vol: 0.85,
-            mixer_pos_frac: 0.74,
+            mixer_pos_frac: 0.0,
+            mixer_strip_targets: Vec::new(),
+            mixer_add_target: None,
             config,
             save_config_req: false,
             apply_zoom_req: false,
@@ -2038,13 +2244,158 @@ impl App {
         self.apply_zoom();
     }
 
-    fn adjusted_window_spec(&self, spec: &WindowSpec) -> WindowSpec {
-        let mut adjusted = spec.clone();
-        if spec.key == "parameters" && (self.tracker_source_active() || self.midi_source_active()) {
-            adjusted.height = 560.0;
-            adjusted.min_height = 540.0;
+    fn open_mixer_with_paths(&mut self, paths: Vec<PathBuf>) {
+        if let Some(main) = &self.audio {
+            main.pause();
         }
-        adjusted
+        if self.mixer_audio.is_none() {
+            match mixer::MixerAudio::start() {
+                Ok(engine) => {
+                    println!(
+                        "[mixer] independent output: {} Hz, {} ch",
+                        engine.rate, engine.channels
+                    );
+                    self.mixer_audio = Some(engine);
+                }
+                Err(e) => {
+                    eprintln!("[mixer] failed to start independent output: {e}");
+                    return;
+                }
+            }
+        }
+        self.mixer_stems = paths
+            .iter()
+            .take(mixer::MAX_STEMS)
+            .enumerate()
+            .map(|(number, path)| MixerStem {
+                number: number + 1,
+                slot: number,
+                path: Some(path.clone()),
+                gain: 1.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+            })
+            .collect();
+        self.mixer_playing = !paths.is_empty();
+        self.mixer_pos_frac = 0.0;
+        if let Some(engine) = &mut self.mixer_audio {
+            engine.load_playlist(&paths);
+            self.sync_mixer_controls();
+        }
+    }
+
+    fn open_mixer_from_playlist(&mut self) {
+        let mut paths: Vec<PathBuf> = self
+            .playlist
+            .iter()
+            .take(mixer::MAX_STEMS)
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            if let Some(path) = self.audio.as_ref().and_then(|a| a.current_file()) {
+                paths.push(path);
+            }
+        }
+        self.open_mixer_with_paths(paths);
+    }
+
+    fn apply_mixer_drop(&mut self, files: Vec<PathBuf>, replace_slot: Option<usize>) {
+        if files.is_empty() || !self.secondary_windows.is_visible("mixer") {
+            return;
+        }
+        if self.mixer_audio.is_none() {
+            self.open_mixer_with_paths(files);
+            return;
+        }
+        if let Some(slot) = replace_slot {
+            let path = files[0].clone();
+            if let Some(stem) = self.mixer_stems.iter_mut().find(|stem| stem.slot == slot) {
+                stem.path = Some(path.clone());
+                if let Some(engine) = &mut self.mixer_audio {
+                    engine.load_stem(slot, path);
+                }
+            }
+        } else {
+            let mut loads = Vec::new();
+            for path in files {
+                if self.mixer_stems.len() + loads.len() >= mixer::MAX_STEMS {
+                    break;
+                }
+                let slot = (0..mixer::MAX_STEMS).find(|slot| {
+                    !self.mixer_stems.iter().any(|stem| stem.slot == *slot)
+                        && !loads.iter().any(|(used, _)| used == slot)
+                });
+                let Some(slot) = slot else { break };
+                loads.push((slot, path));
+            }
+            for (slot, path) in &loads {
+                self.mixer_stems.push(MixerStem {
+                    number: slot + 1,
+                    slot: *slot,
+                    path: Some(path.clone()),
+                    gain: 1.0,
+                    pan: 0.0,
+                    muted: false,
+                    solo: false,
+                });
+            }
+            self.mixer_stems.sort_by_key(|stem| stem.slot);
+            if let Some(engine) = &mut self.mixer_audio {
+                engine.load_stems(&loads);
+            }
+        }
+        self.mixer_playing = self
+            .mixer_audio
+            .as_ref()
+            .map(|engine| engine.is_playing())
+            .unwrap_or(false);
+        self.sync_mixer_controls();
+    }
+
+    fn close_mixer(&mut self) {
+        self.mixer_audio = None;
+        self.mixer_stems.clear();
+        self.mixer_playing = false;
+        self.mixer_pos_frac = 0.0;
+    }
+
+    fn sync_mixer_controls(&self) {
+        let Some(engine) = &self.mixer_audio else {
+            return;
+        };
+        engine.set_loop(self.mixer_loop);
+        engine.set_master_volume(self.mixer_master_vol);
+        let any_solo = self.mixer_stems.iter().any(|stem| stem.solo);
+        for stem in &self.mixer_stems {
+            let inaudible = stem.muted || (any_solo && !stem.solo);
+            engine.set_stem(stem.slot, stem.gain, stem.pan, inaudible);
+        }
+    }
+
+    fn poll_mixer(&mut self) {
+        let Some(engine) = &mut self.mixer_audio else {
+            return;
+        };
+        engine.poll();
+        self.mixer_playing = engine.is_playing();
+        let duration = engine.duration_secs();
+        let scrubbing = self
+            .secondary_windows
+            .find_by_key_mut("mixer")
+            .map(|window| window.ui_state.active_id == Some(1305) && window.ui_state.mouse_down)
+            .unwrap_or(false);
+        if !scrubbing {
+            self.mixer_pos_frac = if duration > 0.0 {
+                (engine.position_secs() / duration) as f32
+            } else {
+                0.0
+            };
+        }
+    }
+
+    fn adjusted_window_spec(&self, spec: &WindowSpec) -> WindowSpec {
+        spec.clone()
     }
 
     /// The current UI parameter state as an engine `PlaybackParams`.
@@ -2093,6 +2444,7 @@ impl App {
     /// `Cmd::Load`, so the decoder computes the new track's tape step from the
     /// fresh values and no stale parameter set survives into the new track.
     fn on_new_track(&mut self) {
+        self.tracker_mutes.clear();
         if self.chk_locked {
             return;
         }
@@ -2194,19 +2546,20 @@ impl App {
                         redraw = true;
                     }
                 }
-                ScanOutcome::MixerStems(n) => {
-                    if n > 0 {
-                        self.mixer_stems = (0..n)
-                            .map(|i| MixerStem {
-                                number: i + 1,
-                                gain: 1.0,
-                                pan: 0.0,
-                                muted: false,
-                                solo: false,
-                            })
-                            .collect();
+                ScanOutcome::MixerStems(files) => {
+                    let opening = self.secondary_windows.is_visible("mixer")
+                        || self.pending_window_toggles.contains(&"mixer");
+                    if opening && !files.is_empty() {
+                        self.open_mixer_with_paths(files);
                         redraw = true;
                     }
+                }
+                ScanOutcome::MixerDrop {
+                    files,
+                    replace_slot,
+                } => {
+                    self.apply_mixer_drop(files, replace_slot);
+                    redraw = true;
                 }
             }
         }
@@ -3176,9 +3529,17 @@ impl App {
                 continue;
             };
             // `show()` requests reveal + redraw itself, so no synchronous paint here.
+            let was_visible = self.secondary_windows.is_visible(key);
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
                 .toggle(event_loop, &spec, self.prefer_backend);
+            if key == "mixer" {
+                if was_visible {
+                    self.close_mixer();
+                } else if self.mixer_audio.is_none() {
+                    self.open_mixer_from_playlist();
+                }
+            }
         }
         // The toggle buttons' Primary/Outline variants follow visibility — refresh.
         if let Some(w) = &self.window {
@@ -3210,6 +3571,9 @@ impl App {
         match event {
             WindowEvent::CloseRequested => {
                 self.secondary_windows.hide(key);
+                if key == "mixer" {
+                    self.close_mixer();
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -3275,6 +3639,55 @@ impl App {
                     }
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::HoveredFile(path) => {
+                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                    w.ui_state.hovered_file = Some(path);
+                    w.window.request_redraw();
+                }
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                    w.ui_state.hovered_file = None;
+                    w.window.request_redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                if key == "mixer" {
+                    let cursor = self
+                        .secondary_windows
+                        .find_by_key_mut(key)
+                        .map(|w| w.ui_state.cursor)
+                        .unwrap_or((-1.0, -1.0));
+                    let target = if self
+                        .mixer_add_target
+                        .map(|r| r.contains(cursor.0, cursor.1))
+                        .unwrap_or(false)
+                    {
+                        Some(None)
+                    } else {
+                        self.mixer_strip_targets
+                            .iter()
+                            .find(|(r, _)| r.contains(cursor.0, cursor.1))
+                            .map(|(_, slot)| Some(*slot))
+                    };
+                    if let Some(replace_slot) = target {
+                        let _ = self.scan_tx.send((
+                            self.scan_gen,
+                            ScanJob::MixerDrop {
+                                path,
+                                replace_slot,
+                                recursive: true,
+                            },
+                        ));
+                    }
+                }
+                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                    w.ui_state.hovered_file = None;
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
@@ -3291,6 +3704,9 @@ impl App {
                             }
                         } else {
                             self.secondary_windows.hide(key);
+                            if key == "mixer" {
+                                self.close_mixer();
+                            }
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }
@@ -3401,17 +3817,13 @@ impl App {
                 // The Parameters window is audio-pipeline only now.
                 let mixer_badge = format!("{} STEMS", self.mixer_stems.len());
                 let (hdr_icon, hdr_title, hdr_badge): (&str, &str, &str) = if key == "parameters" {
-                    (
-                        ICON_TUNE,
-                        "PARAMETERS",
-                        if tracker_page {
-                            "TRACKER"
-                        } else if midi_page {
-                            "MIDI"
-                        } else {
-                            "AUDIO"
-                        },
-                    )
+                    if tracker_page {
+                        (ICON_TUNE, "PARAMETERS - TRACKER (MOD)", "")
+                    } else if midi_page {
+                        (ICON_TUNE, "PARAMETERS - MIDI", "")
+                    } else {
+                        (ICON_TUNE, "PARAMETERS - AUDIO", "")
+                    }
                 } else if key == "monitoring" {
                     (ICON_EQ, "AUDIO MONITORING", "REALTIME DSP")
                 } else if key == "mixer" {
@@ -3425,7 +3837,9 @@ impl App {
                 };
                 let (hdr_h, close) = ui.secondary_window_header(pw, hdr_title, hdr_icon, hdr_badge);
                 close_clicked = close;
-                let m = Length::Rem(1.25).resolve(rem).round();
+                let m = Length::Rem(if key == "parameters" { 2.25 } else { 1.25 })
+                    .resolve(rem)
+                    .round();
 
                 if key == "parameters" {
                     // ========================================================
@@ -3435,9 +3849,9 @@ impl App {
                     // shared audio post-processing is bypassed for these
                     // engines, matching the reference player.
                     // ========================================================
-                    let card_gap = theme.space_half();
+                    let card_gap = Length::Rem(1.5).resolve(rem).round();
                     let card_w = (pw - m * 2.0).max(0.0);
-                    let native_h = Length::Rem(if midi_page { 23.0 } else { 22.2 })
+                    let native_h = Length::Rem(if midi_page { 22.5 } else { 19.25 })
                         .resolve(rem)
                         .round();
                     let tape_h = Length::Rem(13.3).resolve(rem).round();
@@ -3452,14 +3866,58 @@ impl App {
                         ui.nui_card(native_r, |ui| {
                             draw_tracker_native_card(ui, &mut self.params, &mut params_intents);
                         });
+                        let channel_count = self
+                            .audio
+                            .as_ref()
+                            .map(|audio| audio.tracker_channel_count())
+                            .unwrap_or(0);
+                        let channel_vu = self
+                            .audio
+                            .as_ref()
+                            .map(|audio| audio.tracker_vu())
+                            .unwrap_or_default();
+                        let channel_h = Length::Rem(9.75).resolve(rem).round();
+                        let channel_r = Rect::new(m, cy, card_w, channel_h);
+                        cy += channel_h + card_gap;
+                        ui.nui_card(channel_r, |ui| {
+                            draw_tracker_channel_card(
+                                ui,
+                                channel_count,
+                                &channel_vu,
+                                &mut self.tracker_mutes,
+                                self.modifiers.shift_key(),
+                                &mut params_intents,
+                            );
+                        });
+                        let separation_h = Length::Rem(16.75).resolve(rem).round();
+                        let separation_r = Rect::new(m, cy, card_w, separation_h);
+                        cy += separation_h + card_gap;
+                        ui.nui_card(separation_r, |ui| {
+                            draw_tracker_separation_card(ui, &mut self.params, &mut params_intents);
+                        });
                     } else if midi_page {
-                        // ---- MIDI Engine card (native, always active) -------
+                        // ---- MIDI controls + independent SoundFont card -----
+                        let native_bpm = self
+                            .audio
+                            .as_ref()
+                            .map(|a| a.midi_native_bpm())
+                            .unwrap_or(120.0);
                         let native_r = Rect::new(m, cy, card_w, native_h);
                         cy += native_h + card_gap;
                         ui.nui_card(native_r, |ui| {
                             draw_midi_native_card(
                                 ui,
                                 &mut self.params,
+                                native_bpm,
+                                &mut params_intents,
+                            );
+                        });
+                        let font_h = Length::Rem(10.25).resolve(rem).round();
+                        let font_r = Rect::new(m, cy, card_w, font_h);
+                        cy += font_h + card_gap;
+                        ui.nui_card(font_r, |ui| {
+                            draw_midi_soundfont_card(
+                                ui,
                                 &self.soundfonts,
                                 &mut self.selected_soundfont,
                                 &mut params_intents,
@@ -3513,17 +3971,14 @@ impl App {
                         }
                     }
 
-                    // ---- Lock card (persists via user.json) ------------------
-                    let lock_r = Rect::new(m, cy, card_w, lock_h);
-                    ui.nui_card(lock_r, |ui| {
-                        let sw_r = ui.take(Length::Rem(2.0));
-                        ui.switch(
-                            1190,
-                            sw_r,
-                            "Lock Parameters Across Tracks",
-                            &mut self.chk_locked,
-                        );
-                    });
+                    // ---- Lock card (Audio only; persists via user.json) ----
+                    if !tracker_page && !midi_page {
+                        let lock_r = Rect::new(m, cy, card_w, lock_h);
+                        ui.nui_card(lock_r, |ui| {
+                            let sw_r = ui.take(Length::Rem(2.0));
+                            ui.checkbox(1190, sw_r, "Lock Settings", &mut self.chk_locked);
+                        });
+                    }
                 } else {
                     let body = Rect::new(
                         m,
@@ -3980,6 +4435,8 @@ impl App {
                         // Phase 3.4 — MULTITRACK PREVIEW mixer.
                         // ====================================================
                         "mixer" => {
+                            self.mixer_strip_targets.clear();
+                            self.mixer_add_target = None;
                             let pad = Length::Rem(1.25).resolve(rem).round();
                             let inner = Rect::new(
                                 pad,
@@ -4008,7 +4465,9 @@ impl App {
                                 play_icon,
                                 ButtonVariant::Outline,
                             ) {
-                                self.mixer_playing = !self.mixer_playing;
+                                if let Some(engine) = &mut self.mixer_audio {
+                                    self.mixer_playing = engine.toggle_play();
+                                }
                             }
                             if ui.button(
                                 1302,
@@ -4017,6 +4476,9 @@ impl App {
                                 ICON_RESTART,
                                 ButtonVariant::Outline,
                             ) {
+                                if let Some(engine) = &mut self.mixer_audio {
+                                    engine.seek_secs(0.0);
+                                }
                                 self.mixer_pos_frac = 0.0;
                             }
                             let loop_var = if self.mixer_loop {
@@ -4032,10 +4494,16 @@ impl App {
                                 loop_var,
                             ) {
                                 self.mixer_loop = !self.mixer_loop;
+                                if let Some(engine) = &self.mixer_audio {
+                                    engine.set_loop(self.mixer_loop);
+                                }
                             }
                             let vol_w = Length::Rem(15.0).resolve(rem).round();
                             let vol_r = Rect::new(toolbar.x + toolbar.w - vol_w, by, vol_w, bh);
                             master_volume_pill(&mut ui, vol_r, &mut self.mixer_master_vol, 1304);
+                            if let Some(engine) = &self.mixer_audio {
+                                engine.set_master_volume(self.mixer_master_vol);
+                            }
 
                             // ---- Channel strip matrix ----
                             let matrix_y = toolbar.y + toolbar.h + gap;
@@ -4046,22 +4514,27 @@ impl App {
                                 inner.w,
                                 (seek_y - matrix_y - gap).max(40.0),
                             );
-                            let n = self.mixer_stems.len().max(1);
+                            let n = self.mixer_stems.len();
                             let col_gap = Length::Rem(0.4).resolve(rem).round();
                             let plus_w = Length::Rem(3.2).resolve(rem).round();
-                            let strip_w = ((matrix.w - plus_w - col_gap * n as f32) / n as f32)
+                            let strip_w = ((matrix.w - plus_w - col_gap * n.max(1) as f32)
+                                / n.max(1) as f32)
                                 .max(24.0)
                                 .floor();
                             let any_solo = self.mixer_stems.iter().any(|s| s.solo);
                             let m_h = Length::Rem(1.55).resolve(rem).round();
                             let lbl_h = Length::Rem(1.65).resolve(rem).round();
                             let cgap = 2.0f32;
-                            let fader_h = (matrix.h - (m_h + m_h + lbl_h) - cgap * 4.0).max(30.0);
+                            let fader_h = (matrix.h - (m_h * 3.0 + lbl_h) - cgap * 4.0).max(30.0);
                             let mut remove_i: Option<usize> = None;
 
                             for i in 0..n {
                                 let x = matrix.x + i as f32 * (strip_w + col_gap);
                                 let mut y = matrix.y;
+                                self.mixer_strip_targets.push((
+                                    Rect::new(x, matrix.y, strip_w, matrix.h),
+                                    self.mixer_stems[i].slot,
+                                ));
 
                                 // Mute cell
                                 let m_r = Rect::new(x, y, strip_w, m_h);
@@ -4130,14 +4603,18 @@ impl App {
                                     theme.border1,
                                     1.0,
                                 );
-                                let lvl = if self.mixer_stems[i].muted
-                                    || (any_solo && !self.mixer_stems[i].solo)
-                                {
+                                let inaudible = self.mixer_stems[i].muted
+                                    || (any_solo && !self.mixer_stems[i].solo);
+                                let lvl = if inaudible {
                                     0.0
                                 } else {
-                                    let phase = self.t * 2.2 + i as f32 * 0.6;
-                                    let base = 0.45 + 0.35 * (phase.sin() * 0.5 + 0.5);
-                                    (base * gain.min(1.0)).clamp(0.0, 1.0)
+                                    self.mixer_audio
+                                        .as_ref()
+                                        .map(|engine| {
+                                            (engine.meter(self.mixer_stems[i].slot) * 6.0)
+                                                .clamp(0.0, 1.0)
+                                        })
+                                        .unwrap_or(0.0)
                                 };
                                 let vu_h = (fader_r.h * lvl).clamp(0.0, fader_r.h);
                                 if vu_h > 1.0 {
@@ -4259,26 +4736,27 @@ impl App {
                             }
 
                             if let Some(i) = remove_i {
-                                if self.mixer_stems.len() > 1 {
-                                    self.mixer_stems.remove(i);
+                                let slot = self.mixer_stems[i].slot;
+                                if let Some(engine) = &mut self.mixer_audio {
+                                    engine.remove_stem(slot);
+                                }
+                                self.mixer_stems.remove(i);
+                            }
+                            let any_solo_now = self.mixer_stems.iter().any(|stem| stem.solo);
+                            if let Some(engine) = &self.mixer_audio {
+                                engine.set_loop(self.mixer_loop);
+                                engine.set_master_volume(self.mixer_master_vol);
+                                for stem in &self.mixer_stems {
+                                    let inaudible = stem.muted || (any_solo_now && !stem.solo);
+                                    engine.set_stem(stem.slot, stem.gain, stem.pan, inaudible);
                                 }
                             }
 
                             // `+` add-stem column (up to 20 stems).
                             let plus_r =
                                 Rect::new(matrix.x + matrix.w - plus_w, matrix.y, plus_w, matrix.h);
-                            if ui.button(1340, plus_r, "", ICON_ADD, ButtonVariant::Outline) {
-                                if self.mixer_stems.len() < 20 {
-                                    let num = self.mixer_stems.len() + 1;
-                                    self.mixer_stems.push(MixerStem {
-                                        number: num,
-                                        gain: 1.0,
-                                        pan: 0.0,
-                                        muted: false,
-                                        solo: false,
-                                    });
-                                }
-                            }
+                            self.mixer_add_target = Some(plus_r);
+                            let _ = ui.button(1340, plus_r, "", ICON_ADD, ButtonVariant::Outline);
 
                             // ---- Bottom seekbar + time readouts ----
                             let bar_h = 6.0f32;
@@ -4317,27 +4795,43 @@ impl App {
                                 self.mixer_pos_frac =
                                     ((ui.state.cursor.0 - bar_r.x) / bar_r.w).clamp(0.0, 1.0);
                             }
+                            if ui.state.active_id == Some(sid) && ui.state.mouse_released {
+                                if let Some(engine) = &mut self.mixer_audio {
+                                    engine.seek_secs(
+                                        engine.duration_secs() * self.mixer_pos_frac as f64,
+                                    );
+                                }
+                            }
+                            let (position, duration) = self
+                                .mixer_audio
+                                .as_ref()
+                                .map(|engine| (engine.position_secs(), engine.duration_secs()))
+                                .unwrap_or((0.0, 0.0));
+                            let position_text = fmt_time(position);
+                            let total_text = fmt_time(duration);
                             let tfs = theme.font_xsmall();
                             let tbase = (seek_y + seek_h - 2.0).round();
                             ui.scene.text(
                                 ui.text_sys,
                                 FontFace::SemiBold,
                                 ui.font_engine,
-                                "2:34",
+                                &position_text,
                                 inner.x.round(),
                                 tbase,
                                 tfs,
                                 theme.text_dim,
                             );
-                            let tot = "3:26";
-                            let tw =
-                                ui.text_sys
-                                    .measure(FontFace::SemiBold, ui.font_engine, tot, tfs);
+                            let tw = ui.text_sys.measure(
+                                FontFace::SemiBold,
+                                ui.font_engine,
+                                &total_text,
+                                tfs,
+                            );
                             ui.scene.text(
                                 ui.text_sys,
                                 FontFace::SemiBold,
                                 ui.font_engine,
-                                tot,
+                                &total_text,
                                 (inner.x + inner.w - tw).round(),
                                 tbase,
                                 tfs,
@@ -4521,10 +5015,34 @@ impl App {
                 }
             }
         }
+        if params_intents.tracker_mutes_changed {
+            if let Some(audio) = &self.audio {
+                audio.set_tracker_mutes(self.tracker_mutes.clone());
+            }
+        }
+        if params_intents.open_soundfonts_folder {
+            let font = self
+                .soundfonts
+                .get(self.selected_soundfont)
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(midi::DEFAULT_SOUNDFONT));
+            if let Some(folder) = font.parent() {
+                if let Err(e) = std::process::Command::new("explorer.exe")
+                    .arg(folder)
+                    .spawn()
+                {
+                    eprintln!("[parameters] failed to open SoundFont folder: {e}");
+                }
+            }
+        }
 
         if close_clicked {
-            // The header close button hides (never exits) a secondary window.
+            // The Mixer owns a real engine and is destroyed on close; the other
+            // secondary windows only hide their rendering surfaces.
             self.secondary_windows.hide(key);
+            if key == "mixer" {
+                self.close_mixer();
+            }
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -4578,7 +5096,8 @@ impl ApplicationHandler for App {
                 .with_border_color(Some(Color::from_rgb(55, 55, 55)));
         }
 
-        let (window, mut renderer) = Renderer::new(event_loop, attrs, self.prefer_backend, self.theme_base());
+        let (window, mut renderer) =
+            Renderer::new(event_loop, attrs, self.prefer_backend, self.theme_base());
         let sz = window.inner_size();
         self.size = (sz.width, sz.height);
         self.window = Some(window.clone());
@@ -4592,6 +5111,9 @@ impl ApplicationHandler for App {
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
                 .show(event_loop, &spec, self.prefer_backend);
+            if spec.key == "mixer" {
+                self.open_mixer_from_playlist();
+            }
             if let Some(path) = self.screenshot_path.take() {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(spec.key) {
                     w.screenshot_once = Some(path);
@@ -4930,14 +5452,21 @@ impl ApplicationHandler for App {
             }
         }
         self.poll_transport_and_scans();
+        self.poll_mixer();
 
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
+        let mixer_running = self.secondary_windows.is_visible("mixer")
+            && self
+                .mixer_audio
+                .as_ref()
+                .map(|engine| engine.is_playing())
+                .unwrap_or(false);
         let pending_meta =
             self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
         // Widget transitions (hover fades, popups, dialogs) drive their own 60 fps
         // window so they finish and then the loop drops back to `Wait` / 0% CPU.
         let ui_anim = self.ui_state.is_animating() || self.secondary_windows.any_animating();
-        let animating = (playing && self.animate) || pending_meta || ui_anim;
+        let animating = (playing && self.animate) || pending_meta || ui_anim || mixer_running;
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
@@ -5694,5 +6223,26 @@ mod params_tests {
         // Shared controls are untouched by the native reset.
         assert_eq!(p.tape_speed_st, 5.0);
         assert_eq!(p.stretch, 1.5);
+    }
+
+    #[test]
+    fn tracker_click_makes_exclusive_solo_and_second_click_restores_all() {
+        let mut mutes = vec![false; 4];
+        toggle_tracker_solo(&mut mutes, 1, false);
+        assert_eq!(mutes, vec![true, false, true, true]);
+        toggle_tracker_solo(&mut mutes, 1, false);
+        assert_eq!(mutes, vec![false; 4]);
+    }
+
+    #[test]
+    fn tracker_shift_click_edits_solo_group_and_last_solo_restores_all() {
+        let mut mutes = vec![false; 4];
+        toggle_tracker_solo(&mut mutes, 1, true);
+        toggle_tracker_solo(&mut mutes, 3, true);
+        assert_eq!(mutes, vec![true, false, true, false]);
+        toggle_tracker_solo(&mut mutes, 1, true);
+        assert_eq!(mutes, vec![true, true, true, false]);
+        toggle_tracker_solo(&mut mutes, 3, true);
+        assert_eq!(mutes, vec![false; 4]);
     }
 }
