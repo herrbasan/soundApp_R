@@ -2788,6 +2788,7 @@ impl App {
                 self.font_engine,
                 theme,
             );
+            ui.viewport = (pw, ph);
 
             // ---- Window surface: the window itself IS the flat player card ----
             let border_col = if theme.dark {
@@ -3109,22 +3110,6 @@ impl App {
             if ui.state.active_id != Some(scrub_id) && is_finite {
                 self.scrub_frac = (pos / dur).clamp(0.0, 1.0) as f32;
             }
-            let hit = Rect::new(bar_x, bar_y - 6.0 * scale, bar_w, bar_h + 12.0 * scale);
-            ui.state.register_focusable(scrub_id);
-            let scrub_hover = ui.state.can_hover(scrub_id, hit);
-            if scrub_hover {
-                ui.state.hovered_id = Some(scrub_id);
-                if ui.state.mouse_pressed {
-                    ui.state.active_id = Some(scrub_id);
-                    ui.state.focused_id = Some(scrub_id);
-                }
-            }
-            if ui.state.active_id == Some(scrub_id) && ui.state.mouse_down {
-                self.scrub_frac = ((ui.state.cursor.0 - bar_x) / bar_w).clamp(0.0, 1.0);
-            }
-            if ui.state.active_id == Some(scrub_id) && ui.state.mouse_released && is_finite {
-                intents.seek_to = Some(self.scrub_frac as f64 * dur);
-            }
             let track_bar_bg = if theme.dark {
                 rgb(68, 68, 68)
             } else {
@@ -3135,10 +3120,24 @@ impl App {
             } else {
                 rgb(50, 50, 50)
             };
-            ui.scene.rect(bar_x, bar_y, bar_w, bar_h, track_bar_bg);
-            let fill_w = bar_w * self.scrub_frac.clamp(0.0, 1.0);
-            if fill_w > 0.5 {
-                ui.scene.rect(bar_x, bar_y, fill_w, bar_h, track_bar_fill);
+            let track = Rect::new(bar_x, bar_y, bar_w, bar_h);
+            let hit = Rect::new(
+                0.0,
+                bar_y - 14.0 * scale,
+                pw,
+                14.0 * scale + bar_h + 26.0 * scale,
+            );
+            ui.flat_slider(
+                scrub_id,
+                track,
+                hit,
+                &mut self.scrub_frac,
+                0.0,
+                1.0,
+                [track_bar_bg, track_bar_fill],
+            );
+            if ui.state.active_id == Some(scrub_id) && ui.state.mouse_released && is_finite {
+                intents.seek_to = Some(self.scrub_frac as f64 * dur);
             }
 
             let sfs = (11.0 * scale).round();
@@ -3262,23 +3261,17 @@ impl App {
                 let vol_h = (5.0 * scale).round().max(4.0);
                 let vol_y = by + bs * 0.5 - vol_h * 0.5;
                 let vol_id = 640u32;
-                let vol_hit = Rect::new(vol_x, vol_y - 6.0 * scale, vol_w, vol_h + 12.0 * scale);
-                ui.state.register_focusable(vol_id);
-                if ui.state.can_hover(vol_id, vol_hit) {
-                    ui.state.hovered_id = Some(vol_id);
-                    if ui.state.mouse_pressed {
-                        ui.state.active_id = Some(vol_id);
-                        ui.state.focused_id = Some(vol_id);
-                    }
-                }
-                if ui.state.active_id == Some(vol_id) && ui.state.mouse_down {
-                    self.master_vol = ((ui.state.cursor.0 - vol_x) / vol_w).clamp(0.0, 1.0);
+                let vol_hit = Rect::new(vx, by, vol_x + vol_w - vx, bs);
+                if ui.flat_slider(
+                    vol_id,
+                    Rect::new(vol_x, vol_y, vol_w, vol_h),
+                    vol_hit,
+                    &mut self.master_vol,
+                    0.0,
+                    1.0,
+                    [track_bar_bg, track_bar_fill],
+                ) {
                     intents.vol_changed = true;
-                }
-                ui.scene.rect(vol_x, vol_y, vol_w, vol_h, track_bar_bg);
-                let vfill = vol_w * self.master_vol.clamp(0.0, 1.0);
-                if vfill > 0.5 {
-                    ui.scene.rect(vol_x, vol_y, vfill, vol_h, track_bar_fill);
                 }
 
                 // Right transport group.
@@ -3812,6 +3805,7 @@ impl App {
                 let pw = w as f32;
                 let ph = h as f32;
                 let mut ui = Ui::new(ui_state, scene, &mut self.text_sys, self.font_engine, theme);
+                ui.viewport = (pw, ph);
 
                 // The Parameters window is audio-pipeline only now.
                 let mixer_badge = format!("{} STEMS", self.mixer_stems.len());
@@ -3883,6 +3877,15 @@ impl App {
                         });
                         cy += card_h + card_gap;
                     } else if midi_page {
+                        let (_, card_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
+                            draw_midi_soundfont_card(
+                                ui,
+                                &self.soundfonts,
+                                &mut self.selected_soundfont,
+                                &mut params_intents,
+                            );
+                        });
+                        cy += card_h + card_gap;
                         let native_bpm = self
                             .audio
                             .as_ref()
@@ -3893,15 +3896,6 @@ impl App {
                                 ui,
                                 &mut self.params,
                                 native_bpm,
-                                &mut params_intents,
-                            );
-                        });
-                        cy += card_h + card_gap;
-                        let (_, card_h) = ui.nui_card_auto(Rect::new(m, cy, card_w, 0.0), |ui| {
-                            draw_midi_soundfont_card(
-                                ui,
-                                &self.soundfonts,
-                                &mut self.selected_soundfont,
                                 &mut params_intents,
                             );
                         });
@@ -5029,7 +5023,7 @@ impl App {
                 .soundfonts
                 .get(self.selected_soundfont)
                 .cloned()
-                .unwrap_or_else(|| PathBuf::from(midi::DEFAULT_SOUNDFONT));
+                .unwrap_or_else(midi::default_soundfont);
             if let Some(folder) = font.parent() {
                 if let Err(e) = std::process::Command::new("explorer.exe")
                     .arg(folder)
@@ -5695,7 +5689,7 @@ fn main() {
             &PathBuf::from(&out),
             render_limit,
             48_000,
-            &PathBuf::from(midi::DEFAULT_SOUNDFONT),
+            &midi::default_soundfont(),
         ) {
             Ok(r) => {
                 println!(

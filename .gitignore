@@ -1,4 +1,6 @@
 /target
+/Material
+/_Material
 **/*.rs.bk
 *.pdb
 *.png

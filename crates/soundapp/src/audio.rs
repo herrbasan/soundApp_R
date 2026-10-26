@@ -571,7 +571,7 @@ pub fn start(src: Source) -> Result<Audio, String> {
         dsp: Arc::new(Mutex::new(DspTap::new(rate))),
         meta: Arc::new(Mutex::new(None)),
         current: Arc::new(Mutex::new(None)),
-        soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+        soundfont: Arc::new(Mutex::new(crate::midi::default_soundfont())),
         midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
         tracker_channels: Arc::new(AtomicU64::new(0)),
         tracker_vu: Arc::new(Mutex::new(Vec::new())),
@@ -2898,7 +2898,7 @@ mod tests {
             dsp: Arc::new(Mutex::new(DspTap::new(rate))),
             meta: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
-            soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+            soundfont: Arc::new(Mutex::new(crate::midi::default_soundfont())),
             midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
             tracker_channels: Arc::new(AtomicU64::new(0)),
             tracker_vu: Arc::new(Mutex::new(Vec::new())),
@@ -2955,7 +2955,7 @@ mod tests {
             meta: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
             dsp: Arc::new(Mutex::new(DspTap::new(rate))),
-            soundfont: Arc::new(Mutex::new(PathBuf::from(crate::midi::DEFAULT_SOUNDFONT))),
+            soundfont: Arc::new(Mutex::new(crate::midi::default_soundfont())),
             midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
             tracker_channels: Arc::new(AtomicU64::new(0)),
             tracker_vu: Arc::new(Mutex::new(Vec::new())),
@@ -3765,7 +3765,7 @@ mod tests {
             &out_dir.join("tracker_neutral.wav"),
             None,
             rate,
-            Path::new(crate::midi::DEFAULT_SOUNDFONT),
+            &crate::midi::default_soundfont(),
         )
         .expect("neutral tracker render");
         let reported = neutral.in_secs;
@@ -3792,7 +3792,7 @@ mod tests {
             &out_dir.join("tracker_native2x.wav"),
             None,
             rate,
-            Path::new(crate::midi::DEFAULT_SOUNDFONT),
+            &crate::midi::default_soundfont(),
         )
         .expect("native tempo render");
         assert!(
@@ -3814,7 +3814,7 @@ mod tests {
             &out_dir.join("tracker_shared_ignored.wav"),
             None,
             rate,
-            Path::new(crate::midi::DEFAULT_SOUNDFONT),
+            &crate::midi::default_soundfont(),
         )
         .expect("tracker render with ignored audio post params");
         assert!(
@@ -3840,7 +3840,7 @@ mod tests {
     }
 
     fn reference_soundfont() -> Option<PathBuf> {
-        let path = PathBuf::from(crate::midi::DEFAULT_SOUNDFONT);
+        let path = crate::midi::default_soundfont();
         if path.exists() {
             Some(path)
         } else {

@@ -148,11 +148,11 @@ const MIDI_NOTE_ON: c_int = 0x90;
 /// skips it, matching the reference app.
 const PERCUSSION_CHANNEL: c_int = 9;
 
-/// Default General-MIDI SoundFont shipped with the reference SoundApp.
-/// **Packaging:** distribution must bundle a SoundFont next to the app (the
-/// file is 30.8 MB and is intentionally NOT vendored into this repository);
-/// development resolves it from the reference tree.
-pub const DEFAULT_SOUNDFONT: &str = r"D:\Work\_GIT\SoundApp\bin\soundfonts\default.sf2";
+/// Default General-MIDI SoundFont in the portable user-configuration folder.
+/// Distribution packages this 30.8 MB file rather than vendoring it into git.
+pub fn default_soundfont() -> PathBuf {
+    crate::config::UserConfig::soundfonts_dir().join("default.sf2")
+}
 
 /// Reference metronome click WAVs (mixed at `set_metronome(true)`), resolved
 /// from `<exe_dir>/metronome/` first (distribution layout) and the reference
@@ -255,28 +255,12 @@ impl Default for MidiParams {
     }
 }
 
-/// Development SoundFont directory (the reference SoundApp tree). Distribution
-/// scans `<exe_dir>/soundfonts/` first — see [`soundfont_list`].
-const SOUNDFONT_DIR: &str = r"D:\Work\_GIT\SoundApp\bin\soundfonts";
-
-/// Every SF2/SF3 found beside the executable (`soundfonts/`) and in the
-/// reference tree, de-duplicated by file name, sorted. Falls back to
-/// [`DEFAULT_SOUNDFONT`] when no directory yields a font, so the select
-/// always has at least one entry and a failed open logs loudly instead of
-/// silently playing nothing.
+/// Every SF2/SF3 in the portable user-configuration `soundfonts/` folder,
+/// sorted by path. Falls back to the default path when the folder is absent or
+/// empty so the select always has one entry and a failed open logs loudly.
 pub fn soundfont_list() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            dirs.push(d.join("soundfonts"));
-        }
-    }
-    dirs.push(PathBuf::from(SOUNDFONT_DIR));
     let mut out: Vec<PathBuf> = Vec::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
+    if let Ok(entries) = std::fs::read_dir(crate::config::UserConfig::soundfonts_dir()) {
         for entry in entries.flatten() {
             let path = entry.path();
             let is_font = path
@@ -284,14 +268,14 @@ pub fn soundfont_list() -> Vec<PathBuf> {
                 .and_then(|e| e.to_str())
                 .map(|e| matches!(e.to_ascii_lowercase().as_str(), "sf2" | "sf3"))
                 .unwrap_or(false);
-            if is_font && !out.iter().any(|p| p.file_name() == path.file_name()) {
+            if is_font {
                 out.push(path);
             }
         }
     }
     out.sort();
     if out.is_empty() {
-        out.push(PathBuf::from(DEFAULT_SOUNDFONT));
+        out.push(default_soundfont());
     }
     out
 }
@@ -1640,7 +1624,6 @@ mod tests {
 
     // ---- live tests (reference assets required) --------------------------
 
-    const SF2: &str = r"D:\Work\_GIT\SoundApp\bin\soundfonts\default.sf2";
     const RATE: u32 = 48_000;
     const CHUNK: usize = 4096;
 
@@ -1672,7 +1655,7 @@ mod tests {
     }
 
     fn open_midi(path: &str) -> MidiEngine {
-        MidiEngine::open(Path::new(path), RATE, Path::new(SF2))
+        MidiEngine::open(Path::new(path), RATE, &default_soundfont())
             .unwrap_or_else(|e| panic!("open {path}: {e}"))
     }
 
@@ -1787,7 +1770,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, sustained_smf()).expect("write sustained-note SMF");
-        let opened = MidiEngine::open(&path, RATE, Path::new(SF2));
+        let opened = MidiEngine::open(&path, RATE, &default_soundfont());
         std::fs::remove_file(&path).expect("remove sustained-note SMF");
         let mut e = opened.expect("open sustained-note SMF");
         render_secs(&mut e, 0.5);

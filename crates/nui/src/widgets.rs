@@ -7,7 +7,7 @@
 //       * nui-button (Primary, Outline, Ghost, Danger, Success, Icon)
 //       * nui-button-container[variant="segmented"] (joined buttons, 1px dividers, highlight active)
 //       * nui-input + nui-input-group (uppercase label, rgb(45,45,45) surface, caret/selection, clear button)
-//       * nui-select (shade3 control, chevron arrow, top-layer popup with checkmark rows)
+//       * nui-select (shade3 control, chevron arrow, bounded scrolling top-layer popup with checkmark rows)
 //       * nui-slider (0.25rem pill track, highlight fill, 1rem highlight thumb scaling 1.35x on drag, double-click reset)
 //       * nui-checkbox (1.25rem box, 2px shade4 border, base bg, highlight checked + checkmark)
 //       * nui-checkbox[variant="switch"] (2.25x1.25em pill, shade4 -> highlight, white thumb)
@@ -1747,6 +1747,7 @@ impl<'a> Ui<'a> {
     /// `nui-slider`: 0.25rem pill track (`rgba(255,255,255,0.15)` in dark), `highlight` fill,
     /// optional center mark (when `min < 0 && max > 0`), `1rem` circular `highlight` thumb
     /// scaling `1.35x` when active. Supports drag capture, wheel fine-adjust, and double-click/right-click reset.
+    /// The entire `r` is the hit target, independent of the painted track and thumb.
     pub fn slider(
         &mut self,
         id: u32,
@@ -1915,6 +1916,49 @@ impl<'a> Ui<'a> {
         );
         self.draw_focus_ring(id, r, t.radius1());
 
+        changed
+    }
+
+    /// Flat slider with independent interaction and value-mapping geometry.
+    /// `hit` is the touch-friendly target; `track` is painted and maps the pointer to a value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flat_slider(
+        &mut self,
+        id: u32,
+        track: Rect,
+        hit: Rect,
+        val: &mut f32,
+        min: f32,
+        max: f32,
+        colors: [Color; 2],
+    ) -> bool {
+        self.state.register_focusable(id);
+        let hovered = self.state.can_hover(id, hit);
+        if hovered {
+            self.state.hovered_id = Some(id);
+            if self.state.mouse_pressed {
+                self.state.active_id = Some(id);
+                self.state.focused_id = Some(id);
+            }
+        }
+
+        let dragging = self.state.active_id == Some(id) && self.state.mouse_down;
+        let mut changed = false;
+        if dragging {
+            let norm = ((self.state.cursor.0 - track.x) / track.w.max(1.0)).clamp(0.0, 1.0);
+            let new_v = min + norm * (max - min);
+            if (new_v - *val).abs() > 1e-5 {
+                *val = new_v;
+                changed = true;
+            }
+        }
+
+        self.scene.rect(track.x, track.y, track.w, track.h, colors[0]);
+        let fill_w = track.w * ((*val - min) / (max - min)).clamp(0.0, 1.0);
+        if fill_w > 0.5 {
+            self.scene.rect(track.x, track.y, fill_w, track.h, colors[1]);
+        }
+        self.draw_focus_ring(id, hit, self.theme.radius1());
         changed
     }
 
@@ -2283,6 +2327,8 @@ impl<'a> Ui<'a> {
 
     /// `nui-select`: `shade3` control with `shade4` border, `border-radius2`, right chevron,
     /// and a top-layer overlay popup (`shade2` background, checkmark on active option).
+    /// The popup caps at 16rem/window space, flips above when below is tight, and scrolls
+    /// by wheel or scrollbar drag when its options do not fit.
     pub fn select(
         &mut self,
         id: u32,
@@ -2298,6 +2344,7 @@ impl<'a> Ui<'a> {
         let is_open = self.state.open_popup_id == Some(id);
         let hovered = self.state.can_hover(id, r);
         let mut changed = false;
+        let mut opened_this_frame = false;
 
         if hovered {
             self.state.hovered_id = Some(id);
@@ -2310,6 +2357,7 @@ impl<'a> Ui<'a> {
                     self.state.popup_rect = None;
                 } else {
                     self.state.open_popup_id = Some(id);
+                    opened_this_frame = true;
                 }
             }
         }
@@ -2381,24 +2429,123 @@ impl<'a> Ui<'a> {
         if is_open || open_t > 0.01 {
             // Option rows: `padding: var(--nui-space-half) var(--nui-space)` -> 2.25rem.
             let row_h = (t.rem * 2.25).round();
-            let pop_h = row_h * options.len() as f32 + 2.0;
-            let pop_r = Rect::new(r.x, r.y + r.h, r.w, pop_h);
+            let content_h = row_h * options.len() as f32 + 2.0;
+            let margin = t.space();
+            let viewport_h = if self.viewport.1 > 0.0 {
+                self.viewport.1
+            } else {
+                r.y + r.h + content_h + margin
+            };
+            let max_pop_h = (t.rem * 16.0).round();
+            let desired_h = content_h.min(max_pop_h);
+            let below = (viewport_h - (r.y + r.h) - margin).max(0.0);
+            let above = (r.y - margin).max(0.0);
+            let opens_above = if desired_h <= below {
+                false
+            } else if desired_h <= above {
+                true
+            } else {
+                above > below
+            };
+            let available = if opens_above { above } else { below };
+            let view_h = desired_h.min(available).max(1.0);
+            let pop_y = if opens_above {
+                r.y - view_h
+            } else {
+                r.y + r.h
+            };
+            let pop_r = Rect::new(r.x, pop_y, r.w, view_h);
             if is_open {
                 self.state.popup_rect = Some(pop_r);
             }
-            let view_r = Rect::new(
-                pop_r.x,
-                pop_r.y + (1.0 - open_t) * -3.0,
-                pop_r.w,
-                (pop_h * (0.35 + 0.65 * open_t)).round(),
+            let anim_h = (view_h * (0.35 + 0.65 * open_t)).round().max(1.0);
+            let view_r = if opens_above {
+                Rect::new(
+                    pop_r.x,
+                    pop_r.y + view_h - anim_h,
+                    pop_r.w,
+                    anim_h,
+                )
+            } else {
+                Rect::new(pop_r.x, pop_r.y + (1.0 - open_t) * -3.0, pop_r.w, anim_h)
+            };
+
+            let max_scroll = (content_h - view_h).max(0.0);
+            let scroll_id = id ^ 0x2400_0000;
+            let mut scroll_y = self.state.scroll_offset(scroll_id);
+            if opened_this_frame && max_scroll > 0.0 {
+                let idx = (*selected).min(options.len().saturating_sub(1));
+                let item_top = idx as f32 * row_h;
+                let item_bottom = item_top + row_h;
+                if item_top < scroll_y {
+                    scroll_y = item_top;
+                } else if item_bottom > scroll_y + view_h - 2.0 {
+                    scroll_y = item_bottom - (view_h - 2.0);
+                }
+            }
+            if is_open
+                && pop_r.contains(self.state.cursor.0, self.state.cursor.1)
+                && self.state.wheel_y.abs() > 0.01
+            {
+                scroll_y = (scroll_y - self.state.wheel_y * (t.rem * 2.6))
+                    .clamp(0.0, max_scroll);
+                self.state.wheel_y = 0.0;
+            }
+            scroll_y = scroll_y.clamp(0.0, max_scroll);
+
+            let has_sb = max_scroll > 0.5;
+            let sb_w = (t.rem * 0.5).round().max(6.0);
+            let sb_pad = 3.0;
+            let viewport_w = if has_sb {
+                (pop_r.w - 2.0 - sb_w - sb_pad * 2.0).max(10.0)
+            } else {
+                (pop_r.w - 2.0).max(10.0)
+            };
+            let track_rect = Rect::new(
+                pop_r.x + pop_r.w - 1.0 - sb_w - sb_pad,
+                pop_r.y + 1.0 + sb_pad,
+                sb_w,
+                (view_h - 2.0 - sb_pad * 2.0).max(10.0),
             );
+            let thumb_h = if has_sb {
+                ((view_h / content_h.max(1.0)) * track_rect.h)
+                    .round()
+                    .clamp((t.rem * 1.4).round(), track_rect.h)
+            } else {
+                track_rect.h
+            };
+            let thumb_travel = (track_rect.h - thumb_h).max(1.0);
+
+            if has_sb && is_open {
+                let thumb_y = (track_rect.y + (scroll_y / max_scroll) * thumb_travel).round();
+                let thumb_rect = Rect::new(track_rect.x, thumb_y, sb_w, thumb_h);
+                let sb_id = id ^ 0x2500_0000;
+                let over_thumb = self.state.can_hover(sb_id, thumb_rect);
+                let over_track = self.state.can_hover(sb_id, track_rect);
+                if over_thumb && self.state.mouse_pressed {
+                    self.state.active_id = Some(sb_id);
+                    self.state.scroll_drag_grab = self.state.cursor.1 - thumb_rect.y;
+                }
+                if self.state.active_id == Some(sb_id) {
+                    if self.state.mouse_down {
+                        let target =
+                            self.state.cursor.1 - self.state.scroll_drag_grab - track_rect.y;
+                        scroll_y =
+                            ((target / thumb_travel) * max_scroll).clamp(0.0, max_scroll);
+                    }
+                } else if over_track && self.state.mouse_pressed {
+                    let target = self.state.cursor.1 - track_rect.y - thumb_h * 0.5;
+                    scroll_y = ((target / thumb_travel) * max_scroll).clamp(0.0, max_scroll);
+                }
+            }
+            self.state.set_scroll_offset(scroll_id, scroll_y);
 
             self.scene.begin_overlay();
 
             // Rich soft SDF drop shadow + popup surface (`nui-select-popup` with `border-radius: 0 0 r r`)
             self.scene.shadow(
                 view_r.x,
-                view_r.y + 3.0,
+                view_r.y + if opens_above { -3.0 } else { 3.0 },
                 view_r.w,
                 view_r.h,
                 rad,
@@ -2408,40 +2555,70 @@ impl<'a> Ui<'a> {
             let pop_bg = scale_alpha(if t.dark { t.shade2 } else { t.base }, open_t);
             self.scene
                 .push_clip(view_r.x, view_r.y, view_r.w, view_r.h);
-            self.scene.rounded_rect(
-                view_r.x,
-                view_r.y - rad,
-                view_r.w,
-                view_r.h + rad,
-                rad,
-                pop_bg,
-                scale_alpha(border_col, open_t),
-                1.0,
-            );
+            if opens_above {
+                self.scene.rounded_rect(
+                    view_r.x,
+                    view_r.y,
+                    view_r.w,
+                    view_r.h + rad,
+                    rad,
+                    pop_bg,
+                    scale_alpha(border_col, open_t),
+                    1.0,
+                );
+            } else {
+                self.scene.rounded_rect(
+                    view_r.x,
+                    view_r.y - rad,
+                    view_r.w,
+                    view_r.h + rad,
+                    rad,
+                    pop_bg,
+                    scale_alpha(border_col, open_t),
+                    1.0,
+                );
+            }
             self.scene.pop_clip();
             // 1px separator line between trigger and popup
             self.scene.rect(
                 view_r.x + 1.0,
-                view_r.y,
+                if opens_above {
+                    view_r.y + view_r.h - 1.0
+                } else {
+                    view_r.y
+                },
                 view_r.w - 2.0,
                 1.0,
                 scale_alpha(t.shade3, open_t),
             );
 
             self.scene.push_clip(
-                view_r.x + 1.0,
+                pop_r.x + 1.0,
                 view_r.y + 1.0,
-                view_r.w - 2.0,
+                viewport_w,
                 (view_r.h - 2.0).max(1.0),
             );
+            let content_y = pop_r.y + 1.0;
             for (i, &opt) in options.iter().enumerate() {
                 let opt_r = Rect::new(
-                    view_r.x + 1.0,
-                    view_r.y + 1.0 + i as f32 * row_h,
-                    view_r.w - 2.0,
+                    pop_r.x + 1.0,
+                    content_y + i as f32 * row_h - scroll_y,
+                    viewport_w,
                     row_h,
                 );
-                let opt_hov = is_open && opt_r.contains(self.state.cursor.0, self.state.cursor.1);
+                let opt_visible = opt_r.y + opt_r.h > content_y
+                    && opt_r.y < content_y + view_h - 2.0
+                    && opt_r.y + opt_r.h > view_r.y
+                    && opt_r.y < view_r.y + view_r.h;
+                if !opt_visible {
+                    continue;
+                }
+                let opt_hov = is_open
+                    && self.state.cursor.0 >= opt_r.x
+                    && self.state.cursor.0 < opt_r.x + opt_r.w
+                    && self.state.cursor.1 >= content_y.max(view_r.y + 1.0)
+                    && self.state.cursor.1 < (content_y + view_h - 2.0).min(view_r.y + view_r.h - 1.0)
+                    && opt_r.contains(self.state.cursor.0, self.state.cursor.1);
                 let is_sel = *selected == i;
 
                 if opt_hov {
@@ -2491,10 +2668,10 @@ impl<'a> Ui<'a> {
                     },
                     self.font_engine,
                     opt,
-                    (view_r.x + pad_x).round(),
+                    (opt_r.x + pad_x - 1.0).round(),
                     o_base,
                     fs,
-                    (view_r.w - pad_x * 2.0 - arrow_sz).max(0.0),
+                    (opt_r.w - pad_x * 2.0 - arrow_sz).max(0.0),
                     fg,
                 );
 
@@ -2503,7 +2680,7 @@ impl<'a> Ui<'a> {
                     self.scene.icon_centered(
                         self.text_sys,
                         ICON_CHECK,
-                        view_r.x + view_r.w - pad_x - arrow_sz * 0.35,
+                        opt_r.x + opt_r.w - pad_x - arrow_sz * 0.35,
                         o_cy,
                         csz,
                         fg,
@@ -2511,6 +2688,47 @@ impl<'a> Ui<'a> {
                 }
             }
             self.scene.pop_clip();
+
+            if has_sb {
+                let thumb_y = (track_rect.y + (scroll_y / max_scroll) * thumb_travel).round();
+                let thumb_rect = Rect::new(track_rect.x, thumb_y, sb_w, thumb_h);
+                let dragging = self.state.active_id == Some(id ^ 0x2500_0000);
+                let hovered = dragging || self.state.can_hover(id ^ 0x2500_0000, thumb_rect);
+                self.scene.push_clip(
+                    view_r.x + 1.0,
+                    view_r.y + 1.0,
+                    view_r.w - 2.0,
+                    (view_r.h - 2.0).max(1.0),
+                );
+                self.scene.rounded_rect(
+                    track_rect.x,
+                    track_rect.y,
+                    track_rect.w,
+                    track_rect.h,
+                    sb_w * 0.5,
+                    t.shade1,
+                    (0, 0, 0, 0),
+                    0.0,
+                );
+                let col = if dragging {
+                    t.shade6
+                } else if hovered {
+                    t.shade5
+                } else {
+                    t.shade4
+                };
+                self.scene.rounded_rect(
+                    thumb_rect.x,
+                    thumb_rect.y,
+                    thumb_rect.w,
+                    thumb_rect.h,
+                    sb_w * 0.5,
+                    scale_alpha(col, open_t),
+                    (0, 0, 0, 0),
+                    0.0,
+                );
+                self.scene.pop_clip();
+            }
             self.scene.end_overlay();
         }
 
@@ -4111,4 +4329,80 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
         }
     }
     s.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ui() -> Ui<'static> {
+        let state = Box::leak(Box::new(UiState::new()));
+        let scene = Box::leak(Box::new(Scene::new()));
+        let text = Box::leak(Box::new(TextSystem::new()));
+        Ui::new(state, scene, text, FontEngine::Swash, Theme::dark(14.0))
+    }
+
+    #[test]
+    fn flat_slider_separates_hit_target_from_track() {
+        let mut ui = test_ui();
+        let track = Rect::new(100.0, 100.0, 200.0, 4.0);
+        let hit = Rect::new(0.0, 80.0, 400.0, 60.0);
+        let colors = [rgb(40, 40, 40), rgb(180, 180, 180)];
+        let mut value = 0.75;
+
+        ui.state.cursor = (150.0, 130.0);
+        ui.state.on_mouse_press();
+        assert!(ui.flat_slider(1, track, hit, &mut value, 0.0, 1.0, colors));
+        assert_eq!(ui.state.active_id, Some(1));
+        assert!((value - 0.25).abs() < 1e-6);
+
+        ui.state.on_mouse_release();
+        ui.state.end_frame();
+        ui.state.cursor = (150.0, 20.0);
+        ui.state.on_mouse_press();
+        assert!(!ui.flat_slider(1, track, hit, &mut value, 0.0, 1.0, colors));
+        assert_eq!(ui.state.active_id, None);
+        assert!((value - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn select_popup_is_bounded_and_scrolls() {
+        let mut ui = test_ui();
+        ui.viewport = (400.0, 220.0);
+        let options: Vec<&str> = (0..10).map(|_| "option").collect();
+        let trigger = Rect::new(20.0, 20.0, 200.0, 32.0);
+        let mut selected = 8usize;
+
+        ui.state.cursor = (30.0, 30.0);
+        ui.state.on_mouse_press();
+        let _ = ui.select(1, trigger, &options, &mut selected);
+        let popup = ui.state.popup_rect.expect("popup must open");
+        assert!(popup.y + popup.h <= 220.0);
+        assert!(popup.h < 10.0f32 * (14.0f32 * 2.25).round());
+        let scroll_id = 1u32 ^ 0x2400_0000;
+        let opened_at = ui.state.scroll_offset(scroll_id);
+        assert!(opened_at > 0.0, "selected row must be scrolled into view");
+
+        ui.state.cursor = (popup.x + 20.0, popup.y + 30.0);
+        ui.state.wheel_y = -1.0;
+        let _ = ui.select(1, trigger, &options, &mut selected);
+        assert!(ui.state.scroll_offset(scroll_id) > opened_at);
+        assert_eq!(ui.state.wheel_y, 0.0);
+    }
+
+    #[test]
+    fn select_popup_opens_above_when_below_is_tight() {
+        let mut ui = test_ui();
+        ui.viewport = (400.0, 300.0);
+        let options: Vec<&str> = (0..8).map(|_| "option").collect();
+        let trigger = Rect::new(20.0, 260.0, 200.0, 32.0);
+        let mut selected = 0usize;
+
+        ui.state.cursor = (30.0, 270.0);
+        ui.state.on_mouse_press();
+        let _ = ui.select(2, trigger, &options, &mut selected);
+        let popup = ui.state.popup_rect.expect("popup must open");
+        assert!(popup.y >= 0.0);
+        assert!(popup.y + popup.h <= trigger.y);
+    }
 }

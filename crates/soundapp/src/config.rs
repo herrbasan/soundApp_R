@@ -1,7 +1,8 @@
 // Persistent user configuration (Phase 3.5).
 //
 // A tiny dependency-free JSON store kept in `user.json` next to the executable
-// (falling back to `target/user.json`). Values are written by the Settings window's
+// (falling back to `target/user.json`). SoundFonts live in the sibling
+// `soundfonts/` folder. Values are written by the Settings window's
 // "Save Configuration" button and auto-saved on a clean exit, then restored on the
 // next launch. Absent file → sensible defaults (dark mode on, per accessibility).
 
@@ -47,6 +48,10 @@ impl UserConfig {
             }
         }
         PathBuf::from("target").join("user.json")
+    }
+
+    pub fn soundfonts_dir() -> PathBuf {
+        Self::path().with_file_name("soundfonts")
     }
 
     /// Load the config, falling back to defaults when the file is missing or malformed.

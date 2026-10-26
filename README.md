@@ -11,7 +11,7 @@ Native Rust audio player & NUI component library. The workspace holds three crat
     - **GPU (`glow` OpenGL 3.3 Core):** Single-draw-call instanced SDF renderer for rounded rects, borders, soft drop shadows, hierarchical clip rects, and glyph atlas rendering.
     - **CPU Fallback (`softbuffer`):** Direct `u32` pixel blitter with static-layer caching and integer LUT gamma blending.
   - **Browser-Grade Typography (`swash` + `skrifa`):** OpenType kerning & ligatures, TrueType hinting, 4-bin horizontal subpixel positioning (`0.0, 0.25, 0.5, 0.75`), and linear-light gamma-corrected dark-mode contrast.
-  - **Components (`ui.*`):** `tabs`, `button` (`Primary`, `Outline`, `Ghost`, `Success`, `Danger`), `segmented`, `text_input` (caret, drag-selection, horizontal scroll clip, clear button, Win32 clipboard), `select` (floating top-layer overlay popup), `slider` (bipolar center tick mark, wheel fine-adjust, double-click reset), `checkbox`, `switch`, `radio`, `badge`, `virtual_list` (10k rows), `polyline`, `waveform`, `dropzone_overlay`.
+  - **Components (`ui.*`):** `tabs`, `button` (`Primary`, `Outline`, `Ghost`, `Success`, `Danger`), `segmented`, `text_input` (caret, drag-selection, horizontal scroll clip, clear button, Win32 clipboard), `select` (window-bounded, scrollable top-layer overlay popup), `slider` (bipolar center tick mark, wheel fine-adjust, double-click reset), `flat_slider` (hit target independent of the painted track), `checkbox`, `switch`, `radio`, `badge`, `virtual_list` (10k rows), `polyline`, `waveform`, `dropzone_overlay`.
   - **Primitives:** `kind = 0..5` — sharp/rounded rects, SDF soft shadows, Swash/Fontdue glyphs, AA capsule lines (`kind = 4`), and RGBA image quads (`kind = 5`); plus `layout_rotated_ccw45` for atlas-cached `-45°` text.
   - **HiDPI & Vector UI Zoom:** Per-Monitor V2 DPI aware + live vector zoom (`65%`–`200%`), with `DWMWA_CLOAK` zero-flash window reveal.
 - **`crates/nui-demo` — NUI Component Playground (`nui_demo.exe`):**
@@ -32,6 +32,8 @@ cargo build --release
 .\target\release\soundapp_r.exe          # player (default file: Y:\Test Files\Murr_01.mp3)
 .\target\release\nui_demo.exe            # NUI component playground
 ```
+
+Portable user state lives beside the executable: `user.json`; MIDI SoundFonts (`.sf2`/`.sf3`) are loaded from the sibling `soundfonts\` folder.
 
 ### Player Hotkeys & Flags
 

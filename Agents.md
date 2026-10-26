@@ -50,7 +50,8 @@ soundApp_R/
         text.rs           # Swash OpenType shaping + Skrifa hinting + 4x subpixel + linear-light Gamma LUT
                           #   + layout_rotated_ccw45 (-45 deg atlas-cached ribbon text)
         widgets.rs        # nui_wc2 v3.0.0 "slate" theme tokens, interactive widgets, virtual_list,
-                          #   waveform, polyline, Win32 clipboard, dropzone
+                          #   waveform, polyline, Win32 clipboard, dropzone; flat_slider keeps the
+                          #   touch-friendly hit rect independent from its painted/value-mapping track
         layout.rs         # Declarative layout engine (Length, cols, rows, layout_grid, card, nui_card,
                           #   content-sized nui_card_auto, input_group, form_field)
         window.rs         # Multi-Window Manager (WindowManager, ManagedWindow, shared TextSystem atlas_gen sync)
