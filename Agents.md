@@ -54,7 +54,8 @@ soundApp_R/
                           #   touch-friendly hit rect independent from its painted/value-mapping track
         layout.rs         # Declarative layout engine (Length, cols, rows, layout_grid, card, nui_card,
                           #   content-sized nui_card_auto, input_group, form_field)
-        window.rs         # Multi-Window Manager (WindowManager, ManagedWindow, shared TextSystem atlas_gen sync)
+        window.rs         # Multi-Window Manager (WindowManager, ManagedWindow, shared TextSystem atlas_gen sync,
+                          #   live OS-cursor/button probes for OLE file-drag overlays)
     nui-demo/             # Standalone component playground -> nui_demo.exe (no audio/FFmpeg deps)
       src/main.rs         # 6-tab NUI playground (menu bar, collapsible sidebar, modal dialog,
                       # right-click context menu) + secondary UiState Inspector window (W)
@@ -65,7 +66,8 @@ soundApp_R/
       src/
         main.rs           # Winit ApplicationHandler, GUI-subsystem binary (no console window;
                           #   terminal re-attach for harness output), field perf log, adaptive
-                          #   native-only MIDI/tracker Parameters, Monitoring, Mixer, Settings & Help
+                          #   native-only MIDI/tracker Parameters, Monitoring, Mixer, Settings & Help,
+                          #   three-zone file-drop overlay with live OS-cursor zone tracking
         perf.rs           # Field-performance log (perf_log.txt next to user.json): session marker,
                           #   first-frame / audio-started / open-to-track-ready ms, 10 s frame-pacing
                           #   windows (frames + >66 ms stalls) — works with no console attached

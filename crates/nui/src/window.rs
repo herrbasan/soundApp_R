@@ -86,6 +86,68 @@ mod live_drag {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod cursor_probe {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn ScreenToClient(hwnd: isize, point: *mut Point) -> i32;
+        fn GetAsyncKeyState(key: i32) -> i16;
+    }
+
+    pub fn cursor_in_window(window: &Window) -> Option<(f32, f32)> {
+        let handle = window.window_handle().ok()?;
+        let hwnd = match handle.as_raw() {
+            RawWindowHandle::Win32(h) => h.hwnd.get(),
+            _ => return None,
+        };
+        let mut point = Point { x: 0, y: 0 };
+        let ok = unsafe {
+            GetCursorPos(&mut point) != 0 && ScreenToClient(hwnd, &mut point) != 0
+        };
+        ok.then_some((point.x as f32, point.y as f32))
+    }
+
+    pub fn primary_button_down() -> bool {
+        unsafe { (GetAsyncKeyState(0x01) as u16 & 0x8000) != 0 }
+    }
+}
+
+/// Current pointer position in physical client pixels. OLE drag-over and drop
+/// notifications carry a point that winit discards, so drag UI must read the OS
+/// cursor rather than waiting for `CursorMoved`.
+#[cfg(target_os = "windows")]
+pub fn cursor_position_in_window(window: &Window) -> Option<(f32, f32)> {
+    cursor_probe::cursor_in_window(window)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn cursor_position_in_window(_window: &Window) -> Option<(f32, f32)> {
+    None
+}
+
+/// Whether the primary mouse button is currently held. OLE drag notifications
+/// carry no button state, so this closes the gap when `HoveredFileCancelled`
+/// is lost.
+#[cfg(target_os = "windows")]
+pub fn primary_mouse_button_down() -> bool {
+    cursor_probe::primary_button_down()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn primary_mouse_button_down() -> bool {
+    false
+}
+
 /// Start an OS window drag while keeping `RedrawRequested` active at ~60 Hz during
 /// the Win32 modal move loop.
 pub fn drag_window_live(window: &Window) {

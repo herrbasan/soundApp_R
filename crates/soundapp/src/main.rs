@@ -1932,6 +1932,16 @@ fn draw_midi_soundfont_card(
     }
 }
 
+fn drop_zone_at(cx: f32, cy: f32, pw: f32, ph: f32) -> DropZone {
+    if cx >= 0.78 * pw {
+        DropZone::Mixer
+    } else if cy >= 0.5 * ph {
+        DropZone::Replace
+    } else {
+        DropZone::Add
+    }
+}
+
 /// Three-zone drop overlay: add / replace / open-in-mixer. Returns the dropped
 /// path and the zone the pointer was over when it landed.
 fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathBuf, DropZone)> {
@@ -1943,13 +1953,7 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
     let mid_y = 0.5 * ph;
     let cx = ui.state.cursor.0;
     let cy = ui.state.cursor.1;
-    let zone = if cx >= split_x {
-        DropZone::Mixer
-    } else if cy >= mid_y {
-        DropZone::Replace
-    } else {
-        DropZone::Add
-    };
+    let zone = drop_zone_at(cx, cy, pw, ph);
 
     ui.scene.begin_overlay();
     ui.scene.rect(0.0, 0.0, pw, ph, rgba(20, 20, 20, 225));
@@ -1964,6 +1968,7 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
             ),
             DropZone::Add,
             "Add to current",
+            "Release to add",
         ),
         (
             Rect::new(
@@ -1974,6 +1979,7 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
             ),
             DropZone::Replace,
             "Replace playlist",
+            "Release to replace",
         ),
         (
             Rect::new(
@@ -1984,10 +1990,11 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
             ),
             DropZone::Mixer,
             "Open in Mixer",
+            "Release for Mixer",
         ),
     ];
     let fs = (13.0 * scale).round();
-    for (r, z, label) in zones {
+    for (r, z, label, active_label) in zones {
         let hot = z == zone;
         ui.scene.rounded_rect(
             r.x,
@@ -1996,7 +2003,7 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
             r.h,
             (4.0 * scale).round(),
             if hot {
-                rgba(76, 132, 229, 70)
+                rgba(76, 132, 229, 96)
             } else {
                 rgba(255, 255, 255, 10)
             },
@@ -2005,19 +2012,26 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
             } else {
                 rgba(255, 255, 255, 30)
             },
-            1.0,
+            if hot { 2.0 } else { 1.0 },
         );
-        draw_centered_text(
-            ui,
-            r,
-            label,
+        let baseline = (r.y + r.h * 0.5 + fs * 0.33).round();
+        let (text, color) = if hot {
+            (active_label, rgb(255, 255, 255))
+        } else {
+            (label, rgb(165, 165, 165))
+        };
+        let tw = ui
+            .text_sys
+            .measure(FontFace::SemiBold, ui.font_engine, text, fs);
+        ui.scene.text(
+            ui.text_sys,
             FontFace::SemiBold,
+            ui.font_engine,
+            text,
+            (r.x + (r.w - tw) * 0.5).round(),
+            baseline,
             fs,
-            if hot {
-                rgb(255, 255, 255)
-            } else {
-                rgb(165, 165, 165)
-            },
+            color,
         );
     }
     ui.scene.end_overlay();
@@ -3364,6 +3378,12 @@ impl App {
             }
         }
         if let Some((path, zone)) = pending_drop {
+            perf::note(&format!(
+                "drop zone={zone:?} cursor=({:.0},{:.0}) path={}",
+                self.ui_state.cursor.0,
+                self.ui_state.cursor.1,
+                path.display()
+            ));
             // Ctrl held → flat (non-recursive) folder collection.
             let recursive = !self.modifiers.control_key();
             match zone {
@@ -3412,6 +3432,31 @@ impl App {
         }
     }
 
+    fn refresh_drag_cursor(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if let Some(pos) = nui::cursor_position_in_window(window) {
+            self.ui_state.cursor = pos;
+        }
+    }
+
+    fn sync_file_drag(&mut self) {
+        if self.ui_state.hovered_file.is_none() {
+            return;
+        }
+        if !nui::primary_mouse_button_down() {
+            self.ui_state.set_hovered_file(None);
+            return;
+        }
+        self.refresh_drag_cursor();
+        let (w, h) = self.size;
+        let (x, y) = self.ui_state.cursor;
+        if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
+            self.ui_state.set_hovered_file(None);
+        }
+    }
+
     fn render(&mut self) {
         self.poll_transport_and_scans();
         let Some(window) = self.window.clone() else {
@@ -3421,6 +3466,7 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
+        self.sync_file_drag();
         let scale = window.scale_factor() as f32;
 
         if self.nopaint {
@@ -5148,6 +5194,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::HoveredFile(path) => {
+                self.refresh_drag_cursor();
                 self.ui_state.set_hovered_file(Some(path));
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -5160,6 +5207,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::DroppedFile(path) => {
+                self.refresh_drag_cursor();
                 self.ui_state.set_hovered_file(None);
                 self.ui_state.dropped_files.push(path);
                 if let Some(w) = &self.window {
@@ -5464,10 +5512,11 @@ impl ApplicationHandler for App {
                 .unwrap_or(false);
         let pending_meta =
             self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
+        let file_drag = self.ui_state.hovered_file.is_some();
         // Widget transitions (hover fades, popups, dialogs) drive their own 60 fps
         // window so they finish and then the loop drops back to `Wait` / 0% CPU.
         let ui_anim = self.ui_state.is_animating() || self.secondary_windows.any_animating();
-        let animating = (playing && self.animate) || pending_meta || ui_anim || mixer_running;
+        let animating = (playing && self.animate) || pending_meta || ui_anim || mixer_running || file_drag;
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
@@ -5475,7 +5524,7 @@ impl ApplicationHandler for App {
             // progress bar and MM:SS text; full-rate only while a DSP window is up.
             let dsp_open = self.secondary_windows.is_visible("monitoring")
                 || self.secondary_windows.is_visible("mixer");
-            let frame_ms = if pending_meta || dsp_open || ui_anim {
+            let frame_ms = if pending_meta || dsp_open || ui_anim || file_drag {
                 self.frame_ms
             } else {
                 66
@@ -5843,6 +5892,15 @@ fn main() {
 mod playlist_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn drop_zone_partitions_match_the_drawn_overlay() {
+        let (pw, ph) = (480.0, 278.0);
+        assert_eq!(drop_zone_at(100.0, 50.0, pw, ph), DropZone::Add);
+        assert_eq!(drop_zone_at(100.0, 200.0, pw, ph), DropZone::Replace);
+        assert_eq!(drop_zone_at(450.0, 50.0, pw, ph), DropZone::Mixer);
+        assert_eq!(drop_zone_at(450.0, 200.0, pw, ph), DropZone::Mixer);
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
