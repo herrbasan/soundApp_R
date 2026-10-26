@@ -67,7 +67,8 @@ soundApp_R/
         main.rs           # Winit ApplicationHandler, GUI-subsystem binary (no console window;
                           #   terminal re-attach for harness output), field perf log, adaptive
                           #   native-only MIDI/tracker Parameters, Monitoring, Mixer, Settings & Help,
-                          #   three-zone file-drop overlay with live OS-cursor zone tracking
+                          #   three-zone file-drop overlay with live OS-cursor zone tracking;
+                          #   main/static windows CPU-rendered, Monitoring/Mixer GPU-rendered
         perf.rs           # Field-performance log (perf_log.txt next to user.json): session marker,
                           #   first-frame / audio-started / open-to-track-ready ms, 10 s frame-pacing
                           #   windows (frames + >66 ms stalls) — works with no console attached

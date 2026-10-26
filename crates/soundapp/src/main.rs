@@ -258,7 +258,11 @@ struct App {
     reported: bool,
     animate: bool,
     quit_at: Option<Instant>,
+    /// Backend requested on the command line. By default the player and static
+    /// utility windows use the CPU renderer; Monitoring and Mixer use the GPU.
+    /// `--backend` locks this value for every window (benchmark/debug override).
     prefer_backend: BackendKind,
+    backend_locked: bool,
     font_engine: FontEngine,
     dark_mode: bool,
     ui_zoom: f32,
@@ -495,7 +499,6 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("M", "Mixer window"),
     ("S", "Settings window"),
     ("H", "This Help window"),
-    ("B", "Toggle GPU / CPU backend"),
     ("F", "Toggle Swash / Fontdue engine"),
     ("T", "Toggle dark / light theme"),
     ("Ctrl + / - / 0", "UI zoom in / out / reset"),
@@ -2405,6 +2408,25 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
 }
 
 impl App {
+    fn main_backend(&self) -> BackendKind {
+        if self.backend_locked {
+            self.prefer_backend
+        } else {
+            BackendKind::Cpu
+        }
+    }
+
+    fn secondary_backend(&self, key: &str) -> BackendKind {
+        if self.backend_locked {
+            self.prefer_backend
+        } else {
+            match key {
+                "monitoring" | "mixer" => BackendKind::Gpu,
+                _ => BackendKind::Cpu,
+            }
+        }
+    }
+
     fn new(
         audio: Option<Audio>,
         animate: bool,
@@ -2511,6 +2533,7 @@ impl App {
             animate,
             quit_at,
             prefer_backend,
+            backend_locked: false,
             font_engine,
             dark_mode: config.dark_mode, // Dark mode by default (accessibility requirement)
             ui_zoom: config.ui_zoom.clamp(0.75, 2.0),
@@ -3944,10 +3967,11 @@ impl App {
                 continue;
             };
             // `show()` requests reveal + redraw itself, so no synchronous paint here.
+            let backend = self.secondary_backend(key);
             let was_visible = self.secondary_windows.is_visible(key);
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
-                .toggle(event_loop, &spec, self.prefer_backend);
+                .toggle(event_loop, &spec, backend);
             if key == "parameters" && !was_visible {
                 self.parameters_window_height = None;
             }
@@ -5616,8 +5640,9 @@ impl ApplicationHandler for App {
                 .with_border_color(Some(Color::from_rgb(55, 55, 55)));
         }
 
+        let main_backend = self.main_backend();
         let (window, mut renderer) =
-            Renderer::new(event_loop, attrs, self.prefer_backend, self.theme_base());
+            Renderer::new(event_loop, attrs, main_backend, self.theme_base());
         let sz = window.inner_size();
         self.size = (sz.width, sz.height);
         self.window = Some(window.clone());
@@ -5629,8 +5654,8 @@ impl ApplicationHandler for App {
         // startup; a `--screenshot` alongside it captures THAT window, not the primary.
         if let Some(spec) = self.open_window_spec {
             let spec = self.adjusted_window_spec(spec);
-            self.secondary_windows
-                .show(event_loop, &spec, self.prefer_backend);
+            let backend = self.secondary_backend(spec.key);
+            self.secondary_windows.show(event_loop, &spec, backend);
             if spec.key == "mixer" {
                 self.open_mixer_from_playlist();
             }
@@ -5876,11 +5901,6 @@ impl ApplicationHandler for App {
                         {
                             self.ui_state.key_cmds.push(KeyCmd::Paste);
                         }
-                        Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("b") => {
-                            if let Some(r) = &mut self.renderer {
-                                r.toggle_backend();
-                            }
-                        }
                         Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("f") => {
                             self.font_engine = match self.font_engine {
                                 FontEngine::Swash => FontEngine::Fontdue,
@@ -6101,6 +6121,7 @@ fn main() {
     let mut seconds: Option<f64> = None;
     let mut fps: f64 = 60.0;
     let mut backend = BackendKind::Gpu;
+    let mut backend_locked = false;
     let mut font_engine = FontEngine::Swash;
     let mut app_screenshot: Option<String> = None;
     let mut open_window: Option<String> = None;
@@ -6147,6 +6168,7 @@ fn main() {
             "--latency-probe" => latency_probe = true,
             "--backend" => {
                 if let Some(b) = args.next() {
+                    backend_locked = true;
                     if b.eq_ignore_ascii_case("cpu") || b.eq_ignore_ascii_case("softbuffer") {
                         backend = BackendKind::Cpu;
                     } else {
@@ -6337,6 +6359,7 @@ fn main() {
     let cfg = UserConfig::load();
     println!("[poc] config: {}", UserConfig::path().display());
     let mut app = App::new(audio, animate, quit_at, backend, font_engine, cfg);
+    app.backend_locked = backend_locked;
     // Push the initial UI state into the engine (gain + the full parameter set).
     let initial_params = app.playback_params();
     let initial_vol = app.master_vol;

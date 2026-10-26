@@ -39,7 +39,7 @@ Portable user state lives beside the executable: `user.json`; MIDI SoundFonts (`
 
 - **`Space`** play/pause · **`Left`/`Right`** seek · **`Up`/`Down`** volume
 - **`C`**: Show/hide the transport bar (`480×278` ↔ `480×221`)
-- **`B`**: Toggle GPU (`OpenGL 3.3 SDF`) <-> CPU (`Softbuffer Pixel Fallback`)
+- **Rendering:** player and static utility windows default to the CPU Softbuffer backend for instant startup; Monitoring and Mixer use the GPU OpenGL backend. `--backend cpu|gpu` forces every window for benchmarking.
 - **`F`**: Toggle Font Engine (`Swash Hinted+Gamma` <-> `Fontdue Legacy`)
 - **`T`**: Toggle Dark / Light Theme (dark by default)
 - **`P` / `N` / `M` / `S` / `H`**: Parameters / Monitoring / Mixer / Settings / Help windows

@@ -772,6 +772,53 @@ impl Renderer {
     }
 
     #[cfg(target_os = "windows")]
+    fn focus_window_fast(win: &Window) {
+        use raw_window_handle::RawWindowHandle;
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetForegroundWindow() -> isize;
+            fn SetForegroundWindow(hwnd: isize) -> i32;
+            fn SetWindowPos(
+                hwnd: isize,
+                after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+        }
+        const HWND_TOP: isize = 0;
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_SHOWWINDOW: u32 = 0x0040;
+        if let Ok(wh) = win.window_handle() {
+            if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                let hwnd = h.hwnd.get() as isize;
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                    if GetForegroundWindow() != hwnd {
+                        // winit's focus_window sends a synthetic Alt tap to steal
+                        // foreground rights; that blocks ~800 ms on this system.
+                        // A plain SetForegroundWindow is instant for a
+                        // user-launched process and is sufficient here.
+                        SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     fn set_win32_cloak(win: &Window, cloak: bool) {
         use raw_window_handle::RawWindowHandle;
         #[link(name = "dwmapi")]
@@ -943,6 +990,13 @@ impl Renderer {
         #[cfg(target_os = "windows")]
         Self::set_win32_cloak(&self.window, true);
         self.window.set_visible(true);
+        #[cfg(target_os = "windows")]
+        {
+            // `set_visible` restores winit's frame bits. Strip them while the
+            // window is still cloaked: doing this during reveal makes
+            // `SWP_FRAMECHANGED` block for over a second on some drivers.
+            Self::strip_frame_styles(&self.window);
+        }
         self.window.request_redraw();
     }
 
@@ -967,6 +1021,9 @@ impl Renderer {
                 Self::strip_frame_styles(&self.window);
                 Self::set_win32_cloak(&self.window, false);
             }
+            #[cfg(target_os = "windows")]
+            Self::focus_window_fast(&self.window);
+            #[cfg(not(target_os = "windows"))]
             self.window.focus_window();
         }
     }
