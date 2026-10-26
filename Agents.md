@@ -75,7 +75,8 @@ soundApp_R/
                           #   + audible-edge Tape/Rubber Band chain (FFmpeg only) + cosine fades/DSP tap
                           #   + --render offline / --latency-probe harness (scripts/audiotest/)
         mixer.rs          # Independent 20-stem Mixer output graph: per-stem FFmpeg workers + 4 s rings,
-                          #   synchronized prebuffer/transport/seek/loop, equal-power pan, mute/solo,
+                          #   synchronized prebuffer/transport/seek/loop, equal-power pan, mute/solo
+                          #   (inaudible stems still consume transport frames), per-stem sync telemetry,
                           #   real VU meters, master gain; main player pauses and Mixer close destroys engine
         ffmpeg_bridge.cpp # C ABI bridge over SoundApp's FFmpegDecoder (decode, seek, metadata + embedded
                           #   cover art decode to 128x128 RGBA, rubberband/atempo filter graph)

@@ -30,6 +30,10 @@ struct SlotShared {
     duration_frames: AtomicU64,
     flush_gen: AtomicU64,
     flush_ack: AtomicU64,
+    played_frames: AtomicU64,
+    underrun_frames: AtomicU64,
+    ring_frames: AtomicU64,
+    start_frames: AtomicU64,
 }
 
 impl SlotShared {
@@ -44,6 +48,10 @@ impl SlotShared {
             duration_frames: AtomicU64::new(0),
             flush_gen: AtomicU64::new(0),
             flush_ack: AtomicU64::new(0),
+            played_frames: AtomicU64::new(0),
+            underrun_frames: AtomicU64::new(0),
+            ring_frames: AtomicU64::new(0),
+            start_frames: AtomicU64::new(0),
         }
     }
 }
@@ -54,9 +62,37 @@ struct Shared {
     looping: AtomicBool,
     master: AtomicU32,
     position_frames: AtomicU64,
+    transport_frames: AtomicU64,
     transport_gen: AtomicU64,
     shutdown: AtomicBool,
     slots: Vec<SlotShared>,
+}
+
+/// Per-stem synchronization telemetry sampled from the Mixer's shared state.
+#[derive(Clone, Debug)]
+pub struct StemSyncSnapshot {
+    pub slot: usize,
+    pub enabled: bool,
+    pub ready: bool,
+    pub muted: bool,
+    pub played_frames: u64,
+    pub underrun_frames: u64,
+    pub ring_frames: u64,
+    pub start_frames: u64,
+}
+
+impl StemSyncSnapshot {
+    pub fn drift_frames(&self, transport_frames: u64) -> i64 {
+        transport_frames as i64 - self.played_frames as i64
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MixerSyncSnapshot {
+    pub rate: u32,
+    pub position_secs: f64,
+    pub transport_frames: u64,
+    pub stems: Vec<StemSyncSnapshot>,
 }
 
 enum StemCmd {
@@ -94,6 +130,7 @@ impl MixerAudio {
             looping: AtomicBool::new(true),
             master: AtomicU32::new(0.85f32.to_bits()),
             position_frames: AtomicU64::new(0),
+            transport_frames: AtomicU64::new(0),
             transport_gen: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             slots: (0..MAX_STEMS).map(|_| SlotShared::new()).collect(),
@@ -135,6 +172,7 @@ impl MixerAudio {
     pub fn load_playlist(&mut self, paths: &[PathBuf]) {
         self.clear();
         self.shared.position_frames.store(0, Ordering::SeqCst);
+        self.shared.transport_gen.fetch_add(1, Ordering::SeqCst);
         for (index, path) in paths.iter().take(MAX_STEMS).enumerate() {
             self.load_slot(index, path.clone(), 0.0);
         }
@@ -163,6 +201,7 @@ impl MixerAudio {
             .any(|slot| slot.enabled.load(Ordering::Acquire));
         let resume = self.is_playing() || !had_loaded;
         let position = self.position_secs();
+        self.shared.transport_gen.fetch_add(1, Ordering::SeqCst);
         if resume {
             self.shared.playing.store(false, Ordering::SeqCst);
             for (index, sender) in self.stem_tx.iter().enumerate() {
@@ -412,6 +451,31 @@ impl MixerAudio {
             .unwrap_or(0.0)
     }
 
+    pub fn sync_snapshot(&self) -> MixerSyncSnapshot {
+        let stems = self
+            .shared
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(slot, state)| StemSyncSnapshot {
+                slot,
+                enabled: state.enabled.load(Ordering::Acquire),
+                ready: state.ready.load(Ordering::Acquire),
+                muted: state.muted.load(Ordering::Relaxed),
+                played_frames: state.played_frames.load(Ordering::Relaxed),
+                underrun_frames: state.underrun_frames.load(Ordering::Relaxed),
+                ring_frames: state.ring_frames.load(Ordering::Relaxed),
+                start_frames: state.start_frames.load(Ordering::Relaxed),
+            })
+            .collect();
+        MixerSyncSnapshot {
+            rate: self.rate,
+            position_secs: self.position_secs(),
+            transport_frames: self.shared.transport_frames.load(Ordering::Relaxed),
+            stems,
+        }
+    }
+
     #[cfg(test)]
     pub fn stem_loaded(&self, index: usize) -> bool {
         self.shared
@@ -442,6 +506,8 @@ struct MixerOutput {
     consumers: Vec<Option<rtrb::Consumer<f32>>>,
     flush: Vec<u64>,
     levels: Vec<f32>,
+    played: Vec<u64>,
+    underruns: Vec<u64>,
     fade: f32,
     transport_gen: u64,
 }
@@ -453,6 +519,8 @@ impl MixerOutput {
             consumers: (0..MAX_STEMS).map(|_| None).collect(),
             flush: vec![0; MAX_STEMS],
             levels: vec![0.0; MAX_STEMS],
+            played: vec![0; MAX_STEMS],
+            underruns: vec![0; MAX_STEMS],
             fade: 0.0,
             transport_gen: 0,
         }
@@ -477,6 +545,13 @@ impl MixerOutput {
         if transport_gen != self.transport_gen {
             self.transport_gen = transport_gen;
             self.fade = 0.0;
+            sh.transport_frames.store(0, Ordering::Relaxed);
+            for slot in &sh.slots {
+                slot.played_frames.store(0, Ordering::Relaxed);
+                slot.underrun_frames.store(0, Ordering::Relaxed);
+            }
+            self.played.fill(0);
+            self.underruns.fill(0);
         }
         let playing = sh.playing.load(Ordering::Acquire);
         let master = f32::from_bits(sh.master.load(Ordering::Relaxed));
@@ -484,20 +559,22 @@ impl MixerOutput {
         let mut left_gain = [0.0f32; MAX_STEMS];
         let mut right_gain = [0.0f32; MAX_STEMS];
         let mut gains = [0.0f32; MAX_STEMS];
+        let mut enabled = [false; MAX_STEMS];
         let mut audible = [false; MAX_STEMS];
         for (index, slot) in sh.slots.iter().enumerate() {
             let (left, right) = pan_gains(f32::from_bits(slot.pan.load(Ordering::Relaxed)));
             left_gain[index] = left;
             right_gain[index] = right;
             gains[index] = f32::from_bits(slot.gain.load(Ordering::Relaxed));
-            audible[index] =
-                slot.enabled.load(Ordering::Relaxed) && !slot.muted.load(Ordering::Relaxed);
+            enabled[index] = slot.enabled.load(Ordering::Relaxed);
+            audible[index] = enabled[index] && !slot.muted.load(Ordering::Relaxed);
             self.levels[index] *= 0.985;
             if !audible[index] {
                 self.levels[index] = 0.0;
             }
         }
         let frames = data.len() / out_ch;
+        let mut frames_consumed = 0u64;
         for frame in 0..frames {
             let target = if playing { 1.0 } else { 0.0 };
             self.fade += (target - self.fade).clamp(-fade_step, fade_step);
@@ -506,14 +583,27 @@ impl MixerOutput {
             let mut mix_r = 0.0f32;
             if consuming {
                 for index in 0..MAX_STEMS {
-                    if !audible[index] {
+                    if !enabled[index] {
                         continue;
                     }
-                    let mut left = 0.0f32;
-                    let mut right = 0.0f32;
-                    if let Some(consumer) = &mut self.consumers[index] {
-                        left = consumer.pop().unwrap_or(0.0);
-                        right = consumer.pop().unwrap_or(0.0);
+                    let popped = if let Some(consumer) = &mut self.consumers[index] {
+                        match (consumer.pop(), consumer.pop()) {
+                            (Ok(left), Ok(right)) => Some((left, right)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let Some((left, right)) = popped else {
+                        self.underruns[index] += 1;
+                        continue;
+                    };
+                    // Muted stems must keep consuming the same transport frames.
+                    // Skipping them freezes their ring and desynchronizes playback
+                    // when they are unmuted.
+                    self.played[index] += 1;
+                    if !audible[index] {
+                        continue;
                     }
                     let (left, right) = shape_stem(
                         left,
@@ -530,6 +620,7 @@ impl MixerOutput {
                     }
                 }
                 sh.position_frames.fetch_add(1, Ordering::Relaxed);
+                frames_consumed += 1;
             }
             let base = frame * out_ch;
             data[base] = mix_l * master * self.fade;
@@ -543,6 +634,20 @@ impl MixerOutput {
         for (index, slot) in sh.slots.iter().enumerate() {
             slot.meter
                 .store(self.levels[index].to_bits(), Ordering::Relaxed);
+            if self.played[index] > 0 {
+                slot.played_frames
+                    .fetch_add(self.played[index], Ordering::Relaxed);
+                self.played[index] = 0;
+            }
+            if self.underruns[index] > 0 {
+                slot.underrun_frames
+                    .fetch_add(self.underruns[index], Ordering::Relaxed);
+                self.underruns[index] = 0;
+            }
+        }
+        if frames_consumed > 0 {
+            sh.transport_frames
+                .fetch_add(frames_consumed, Ordering::Relaxed);
         }
     }
 }
@@ -558,6 +663,7 @@ fn stem_worker(
     let mut eof = true;
     let mut decoded_frames = 0u64;
     let mut tmp = vec![0.0f32; 8192 * 2];
+    let ring_cap_samples = rate as usize * RING_SECONDS * 2;
     loop {
         if sh.shutdown.load(Ordering::Acquire) {
             break;
@@ -569,6 +675,8 @@ fn stem_worker(
                     let slot = &sh.slots[index];
                     slot.duration_frames.store(0, Ordering::Release);
                     slot.ready.store(false, Ordering::Release);
+                    slot.start_frames
+                        .store((start.max(0.0) * rate as f64) as u64, Ordering::Relaxed);
                     match FFmpegStream::open(&path, rate) {
                         Ok(mut opened) => {
                             let duration = opened.duration_secs();
@@ -597,6 +705,8 @@ fn stem_worker(
                 StemCmd::Seek(seconds) => {
                     let slot = &sh.slots[index];
                     slot.ready.store(false, Ordering::Release);
+                    slot.start_frames
+                        .store((seconds.max(0.0) * rate as f64) as u64, Ordering::Relaxed);
                     decoded_frames = 0;
                     if let Some(active) = &mut decoder {
                         if let Err(e) = active.seek(seconds) {
@@ -614,6 +724,8 @@ fn stem_worker(
                     slot.enabled.store(false, Ordering::Release);
                     slot.duration_frames.store(0, Ordering::Release);
                     slot.ready.store(false, Ordering::Release);
+                    slot.start_frames.store(0, Ordering::Relaxed);
+                    slot.ring_frames.store(0, Ordering::Relaxed);
                     let generation = slot.flush_gen.fetch_add(1, Ordering::AcqRel) + 1;
                     wait_flush_ack(slot, generation, &sh);
                 }
@@ -623,6 +735,10 @@ fn stem_worker(
         if sh.shutdown.load(Ordering::Acquire) {
             break;
         }
+        let ring_frames = ring_cap_samples.saturating_sub(producer.slots()) / 2;
+        sh.slots[index]
+            .ring_frames
+            .store(ring_frames as u64, Ordering::Relaxed);
         if decoder.is_none() || eof {
             thread::sleep(Duration::from_millis(4));
             continue;
@@ -699,6 +815,7 @@ mod tests {
             looping: AtomicBool::new(true),
             master: AtomicU32::new(1.0f32.to_bits()),
             position_frames: AtomicU64::new(0),
+            transport_frames: AtomicU64::new(0),
             transport_gen: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             slots: (0..MAX_STEMS).map(|_| SlotShared::new()).collect(),
@@ -769,6 +886,43 @@ mod tests {
             f32::from_bits(sh.slots[1].meter.load(Ordering::Relaxed)),
             0.0
         );
+    }
+
+    #[test]
+    fn muted_stem_keeps_consuming_transport_frames() {
+        let sh = test_shared();
+        sh.slots[0].enabled.store(true, Ordering::Relaxed);
+        sh.slots[1].enabled.store(true, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        let (mut producer0, consumer0) = RingBuffer::<f32>::new(16);
+        let (mut producer1, consumer1) = RingBuffer::<f32>::new(16);
+        tx.send(CallbackCmd::Attach(0, consumer0)).unwrap();
+        tx.send(CallbackCmd::Attach(1, consumer1)).unwrap();
+        for value in [0.5f32, 0.5, 0.5, 0.5] {
+            producer0.push(value).unwrap();
+        }
+        for value in [0.5f32, 0.5, 1.0, 1.0] {
+            producer1.push(value).unwrap();
+        }
+        let mut output = MixerOutput::new(rx);
+        output.fade = 1.0;
+        let center = std::f32::consts::FRAC_1_SQRT_2;
+
+        sh.slots[1].muted.store(true, Ordering::Relaxed);
+        let mut data = [0.0f32; 2];
+        output.render(&mut data, 2, 48_000, &sh);
+        assert!((data[0] - 0.5 * center).abs() < 1e-6);
+        assert_eq!(sh.slots[1].played_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(sh.slots[1].underrun_frames.load(Ordering::Relaxed), 0);
+
+        sh.slots[1].muted.store(false, Ordering::Relaxed);
+        output.render(&mut data, 2, 48_000, &sh);
+        assert!(
+            (data[0] - 1.5 * center).abs() < 1e-6,
+            "unmuted stem must resume on the next transport frame, not its stale sample"
+        );
+        assert_eq!(sh.slots[1].played_frames.load(Ordering::Relaxed), 2);
+        assert_eq!(sh.transport_frames.load(Ordering::Relaxed), 2);
     }
 
     #[test]

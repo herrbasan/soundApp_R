@@ -348,6 +348,10 @@ struct App {
     mixer_pos_frac: f32,
     mixer_strip_targets: Vec<(Rect, usize)>,
     mixer_add_target: Option<Rect>,
+    mixer_sync_debug: bool,
+    mixer_sync_copied_at: Option<Instant>,
+    mixer_sync_close_rect: Option<Rect>,
+    mixer_sync_copy_rect: Option<Rect>,
 
     // Phase 3.5 — persistent user configuration.
     config: UserConfig,
@@ -735,6 +739,367 @@ fn master_volume_pill(ui: &mut Ui, r: Rect, vol: &mut f32, id: u32) {
         (0, 0, 0, 0),
         0.0,
     );
+}
+
+fn mixer_sync_snapshot_text(snapshot: &mixer::MixerSyncSnapshot, stems: &[MixerStem]) -> String {
+    let mut out = format!(
+        "SoundApp Mixer Sync\nrate={} transport={:.3}s epoch_frames={}\n",
+        snapshot.rate,
+        snapshot.position_secs,
+        snapshot.transport_frames
+    );
+    for stem in stems {
+        let Some(s) = snapshot.stems.iter().find(|s| s.slot == stem.slot) else {
+            continue;
+        };
+        let name = stem
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "-".into());
+        out.push_str(&format!(
+            "{:02} slot={} {:<32} ready={} muted={} drift={:+.1}ms buffer={:.1}ms underrun={:.1}ms source={:.3}s\n",
+            stem.number,
+            stem.slot,
+            name,
+            s.ready,
+            s.muted,
+            s.drift_frames(snapshot.transport_frames) as f64 / snapshot.rate.max(1) as f64 * 1000.0,
+            s.ring_frames as f64 / snapshot.rate.max(1) as f64 * 1000.0,
+            s.underrun_frames as f64 / snapshot.rate.max(1) as f64 * 1000.0,
+            (s.start_frames + s.played_frames) as f64 / snapshot.rate.max(1) as f64,
+        ));
+    }
+    out
+}
+
+fn draw_mixer_sync_debug(
+    ui: &mut Ui,
+    area: Rect,
+    snapshot: Option<&mixer::MixerSyncSnapshot>,
+    stems: &[MixerStem],
+    copied: bool,
+) -> (bool, bool, Rect, Rect) {
+    let t = ui.theme;
+    let panel_w = (area.w - t.rem).max(t.rem * 22.0).min(t.rem * 54.0);
+    let panel_h = (area.h * 0.72).max(t.rem * 8.0).min(t.rem * 16.0);
+    let panel = Rect::new(
+        area.x + (area.w - panel_w) * 0.5,
+        area.y + area.h - panel_h - t.space_half(),
+        panel_w,
+        panel_h,
+    );
+    let header_h = (t.rem * 2.2).round();
+    let fs = (t.rem * 0.62).round().max(10.0);
+    let row_h = (fs * 1.65).round().max(18.0);
+    let pad = t.space();
+
+    ui.scene.begin_overlay();
+    ui.scene.shadow(
+        panel.x,
+        panel.y + 4.0,
+        panel.w,
+        panel.h,
+        t.radius2(),
+        10.0,
+        rgba(0, 0, 0, 120),
+    );
+    ui.scene.rounded_rect(
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        t.radius2(),
+        t.shade1,
+        t.border3,
+        1.0,
+    );
+    ui.scene.rounded_rect(
+        panel.x + 1.0,
+        panel.y + 1.0,
+        panel.w - 2.0,
+        header_h,
+        t.radius2(),
+        t.shade2,
+        (0, 0, 0, 0),
+        0.0,
+    );
+
+    let header_base = (panel.y + header_h * 0.5 + fs * 0.35).round();
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::SemiBold,
+        ui.font_engine,
+        "SYNC DEBUG",
+        (panel.x + pad).round(),
+        header_base,
+        fs,
+        t.highlight,
+    );
+    let hint = "Ctrl+Shift+D";
+    let hint_w = ui
+        .text_sys
+        .measure(FontFace::Regular, ui.font_engine, hint, fs);
+    let close_d = (t.rem * 1.4).round();
+    let copy_w = (t.rem * 5.2).round();
+    let copy_r = Rect::new(
+        panel.x + panel.w - pad - close_d - t.space_half() - copy_w,
+        panel.y + (header_h - t.rem * 1.6) * 0.5,
+        copy_w,
+        (t.rem * 1.6).round(),
+    );
+    let mut copy_clicked = false;
+    if ui.button(
+        1397,
+        copy_r,
+        if copied { "COPIED" } else { "COPY" },
+        "",
+        ButtonVariant::Outline,
+    ) {
+        if let Some(snapshot) = snapshot {
+            nui::clipboard_set_text(&mixer_sync_snapshot_text(snapshot, stems));
+        }
+        copy_clicked = true;
+    }
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        hint,
+        (copy_r.x - hint_w - t.space_half()).round(),
+        header_base,
+        fs,
+        t.text_muted,
+    );
+    let close_r = Rect::new(
+        panel.x + panel.w - pad - close_d,
+        panel.y + (header_h - close_d) * 0.5,
+        close_d,
+        close_d,
+    );
+    let close_hot = ui.state.can_hover(1398, close_r);
+    let mut close_clicked = false;
+    if close_hot && ui.state.mouse_pressed {
+        ui.state.mouse_pressed = false;
+        close_clicked = true;
+    }
+    ui.scene.icon_centered(
+        ui.text_sys,
+        ICON_CLOSE,
+        close_r.x + close_r.w * 0.5,
+        close_r.y + close_r.h * 0.5,
+        (t.rem * 0.9).round(),
+        if close_hot { t.text } else { t.shade6 },
+    );
+
+    let (rate, transport, epoch, stems_snap) = snapshot
+        .map(|s| (s.rate, s.position_secs, s.transport_frames, s.stems.as_slice()))
+        .unwrap_or((0, 0.0, 0, &[]));
+    let summary = format!(
+        "T={:.3}s  EPOCH={:.1}ms  SR={}  N={}",
+        transport,
+        epoch as f64 / rate.max(1) as f64 * 1000.0,
+        rate,
+        stems.len()
+    );
+    let summary_base = (panel.y + header_h + fs * 1.15).round();
+    ui.scene.text(
+        ui.text_sys,
+        FontFace::Regular,
+        ui.font_engine,
+        &summary,
+        (panel.x + pad).round(),
+        summary_base,
+        fs,
+        t.text_dim,
+    );
+
+    let col_y = (summary_base + row_h * 0.85).round();
+    let x_num = panel.x + pad;
+    let x_name = panel.x + t.rem * 2.0;
+    let x_state = panel.x + panel.w * 0.30;
+    let x_drift = panel.x + panel.w * 0.42;
+    let x_buf = panel.x + panel.w * 0.58;
+    let x_under = panel.x + panel.w * 0.72;
+    let x_src = panel.x + panel.w * 0.86;
+    ui.scene.rect(
+        panel.x + 1.0,
+        col_y + fs * 0.35,
+        panel.w - 2.0,
+        1.0,
+        t.border2,
+    );
+    for (label, x) in [
+        ("#", x_num),
+        ("STEM", x_name),
+        ("STATE", x_state),
+        ("DRIFT", x_drift),
+        ("BUF", x_buf),
+        ("UND", x_under),
+        ("SRC", x_src),
+    ] {
+        ui.scene.text(
+            ui.text_sys,
+            FontFace::SemiBold,
+            ui.font_engine,
+            label,
+            x.round(),
+            (col_y + fs).round(),
+            fs,
+            t.text_muted,
+        );
+    }
+
+    let row_y0 = col_y + row_h;
+    let rows_r = Rect::new(
+        panel.x + 1.0,
+        row_y0,
+        panel.w - 2.0,
+        (panel.y + panel.h - t.space_half() - row_y0).max(row_h),
+    );
+    let content_h = (stems.len() as f32 * row_h).max(row_h);
+    ui.scroll_area(1396, rows_r, content_h, false, |ui, vp, scroll_y| {
+        let first = (scroll_y / row_h).floor().max(0.0) as usize;
+        let last = (((scroll_y + vp.h) / row_h).ceil() as usize + 1).min(stems.len());
+        for i in first..last {
+            let Some(stem) = stems.get(i) else { break };
+            let y = (vp.y + i as f32 * row_h - scroll_y).round();
+            if i % 2 == 0 {
+                ui.scene
+                    .rect(vp.x, y, vp.w, row_h, rgba(255, 255, 255, 6));
+            }
+            let snap = stems_snap.iter().find(|s| s.slot == stem.slot);
+            let (ready, muted, drift, buf, under, src) = if let Some(s) = snap {
+                (
+                    s.ready,
+                    s.muted,
+                    s.drift_frames(epoch) as f64,
+                    s.ring_frames as f64,
+                    s.underrun_frames as f64,
+                    (s.start_frames + s.played_frames) as f64,
+                )
+            } else {
+                (false, false, 0.0, 0.0, 0.0, 0.0)
+            };
+            let rate = rate.max(1) as f64;
+            let drift_ms = drift / rate * 1000.0;
+            let buf_ms = buf / rate * 1000.0;
+            let under_ms = under / rate * 1000.0;
+            let src_s = src / rate;
+            let state = if snap.map(|s| s.enabled).unwrap_or(false) {
+                if !ready {
+                    "PRE"
+                } else if muted {
+                    "MUTE"
+                } else {
+                    "PLAY"
+                }
+            } else {
+                "LOAD"
+            };
+            let base = (y + row_h * 0.68).round();
+            let name = stem
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "-".into());
+            let drift_color = if drift_ms.abs() <= 2.0 {
+                t.palette_activate
+            } else if drift_ms.abs() <= 10.0 {
+                t.palette_mark
+            } else {
+                t.palette_alert
+            };
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &format!("{:02}", stem.number),
+                x_num.round(),
+                base,
+                fs,
+                t.text_muted,
+            );
+            ui.text_clipped(
+                FontFace::Regular,
+                ui.font_engine,
+                &name,
+                x_name.round(),
+                base,
+                fs,
+                (x_state - x_name - t.space_half()).max(0.0),
+                t.text,
+            );
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                state,
+                x_state.round(),
+                base,
+                fs,
+                if state == "PLAY" {
+                    t.palette_activate
+                } else if state == "MUTE" {
+                    t.palette_alert
+                } else {
+                    t.palette_mark
+                },
+            );
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::SemiBold,
+                ui.font_engine,
+                &format!("{drift_ms:+.1}ms"),
+                x_drift.round(),
+                base,
+                fs,
+                drift_color,
+            );
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &format!("{buf_ms:.0}ms"),
+                x_buf.round(),
+                base,
+                fs,
+                if buf_ms < 20.0 {
+                    t.palette_alert
+                } else {
+                    t.text_dim
+                },
+            );
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &format!("{under_ms:.1}ms"),
+                x_under.round(),
+                base,
+                fs,
+                if under_ms > 0.0 {
+                    t.palette_alert
+                } else {
+                    t.text_dim
+                },
+            );
+            ui.scene.text(
+                ui.text_sys,
+                FontFace::Regular,
+                ui.font_engine,
+                &format!("{src_s:.2}s"),
+                x_src.round(),
+                base,
+                fs,
+                t.text_dim,
+            );
+        }
+    });
+    ui.scene.end_overlay();
+    (copy_clicked, close_clicked, close_r, copy_r)
 }
 
 /// Every audio extension FFmpeg decodes that SoundApp treats as playable.
@@ -2207,6 +2572,10 @@ impl App {
             mixer_pos_frac: 0.0,
             mixer_strip_targets: Vec::new(),
             mixer_add_target: None,
+            mixer_sync_debug: false,
+            mixer_sync_copied_at: None,
+            mixer_sync_close_rect: None,
+            mixer_sync_copy_rect: None,
             config,
             save_config_req: false,
             apply_zoom_req: false,
@@ -2375,6 +2744,10 @@ impl App {
         self.mixer_stems.clear();
         self.mixer_playing = false;
         self.mixer_pos_frac = 0.0;
+        self.mixer_sync_debug = false;
+        self.mixer_sync_copied_at = None;
+        self.mixer_sync_close_rect = None;
+        self.mixer_sync_copy_rect = None;
     }
 
     fn sync_mixer_controls(&self) {
@@ -3653,6 +4026,49 @@ impl App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
+                    if state == ElementState::Pressed
+                        && key == "mixer"
+                        && self.mixer_sync_debug
+                    {
+                        let cursor = self
+                            .secondary_windows
+                            .find_by_key_mut(key)
+                            .map(|w| w.ui_state.cursor);
+                        if let Some(cursor) = cursor {
+                            let on_close = self
+                                .mixer_sync_close_rect
+                                .map(|r| r.contains(cursor.0, cursor.1))
+                                .unwrap_or(false);
+                            let on_copy = self
+                                .mixer_sync_copy_rect
+                                .map(|r| r.contains(cursor.0, cursor.1))
+                                .unwrap_or(false);
+                            if on_close {
+                                self.mixer_sync_debug = false;
+                                self.mixer_sync_copied_at = None;
+                                self.mixer_sync_close_rect = None;
+                                self.mixer_sync_copy_rect = None;
+                                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                                    w.window.request_redraw();
+                                }
+                                return;
+                            }
+                            if on_copy {
+                                if let Some(engine) = &self.mixer_audio {
+                                    let snapshot = engine.sync_snapshot();
+                                    nui::clipboard_set_text(&mixer_sync_snapshot_text(
+                                        &snapshot,
+                                        &self.mixer_stems,
+                                    ));
+                                }
+                                self.mixer_sync_copied_at = Some(Instant::now());
+                                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                                    w.window.request_redraw();
+                                }
+                                return;
+                            }
+                        }
+                    }
                     if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
                         match state {
                             ElementState::Pressed => {
@@ -3738,6 +4154,25 @@ impl App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
+                    if key == "mixer"
+                        && self.modifiers.control_key()
+                        && self.modifiers.shift_key()
+                    {
+                        if let Key::Character(ch) = &event.logical_key {
+                            if ch.eq_ignore_ascii_case("d") {
+                                self.mixer_sync_debug = !self.mixer_sync_debug;
+                                self.mixer_sync_copied_at = None;
+                                if !self.mixer_sync_debug {
+                                    self.mixer_sync_close_rect = None;
+                                    self.mixer_sync_copy_rect = None;
+                                }
+                                if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                                    w.window.request_redraw();
+                                }
+                                return;
+                            }
+                        }
+                    }
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
                         let popup_open = self
                             .secondary_windows
@@ -4458,6 +4893,13 @@ impl App {
                         "mixer" => {
                             self.mixer_strip_targets.clear();
                             self.mixer_add_target = None;
+                            // The sync panel is a developer overlay: while it is open,
+                            // wheel input belongs to its table, not the faders behind it.
+                            let mixer_sync_wheel = if self.mixer_sync_debug {
+                                Some(std::mem::take(&mut ui.state.wheel_y))
+                            } else {
+                                None
+                            };
                             let pad = Length::Rem(1.25).resolve(rem).round();
                             let inner = Rect::new(
                                 pad,
@@ -4858,6 +5300,37 @@ impl App {
                                 tfs,
                                 theme.text_dim,
                             );
+
+                            if self.mixer_sync_debug {
+                                if let Some(wheel) = mixer_sync_wheel {
+                                    ui.state.wheel_y = wheel;
+                                }
+                                let snapshot = self
+                                    .mixer_audio
+                                    .as_ref()
+                                    .map(|engine| engine.sync_snapshot());
+                                let copied = self
+                                    .mixer_sync_copied_at
+                                    .map(|at| at.elapsed() < Duration::from_millis(1200))
+                                    .unwrap_or(false);
+                                let (copy, close, close_r, copy_r) = draw_mixer_sync_debug(
+                                    &mut ui,
+                                    matrix,
+                                    snapshot.as_ref(),
+                                    &self.mixer_stems,
+                                    copied,
+                                );
+                                self.mixer_sync_close_rect = Some(close_r);
+                                self.mixer_sync_copy_rect = Some(copy_r);
+                                if copy {
+                                    self.mixer_sync_copied_at = Some(Instant::now());
+                                }
+                                if close {
+                                    self.mixer_sync_debug = false;
+                                    self.mixer_sync_close_rect = None;
+                                    self.mixer_sync_copy_rect = None;
+                                }
+                            }
                         }
 
                         // ====================================================
@@ -5513,10 +5986,12 @@ impl ApplicationHandler for App {
         let pending_meta =
             self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
         let file_drag = self.ui_state.hovered_file.is_some();
+        let sync_debug = self.mixer_sync_debug && self.secondary_windows.is_visible("mixer");
         // Widget transitions (hover fades, popups, dialogs) drive their own 60 fps
         // window so they finish and then the loop drops back to `Wait` / 0% CPU.
         let ui_anim = self.ui_state.is_animating() || self.secondary_windows.any_animating();
-        let animating = (playing && self.animate) || pending_meta || ui_anim || mixer_running || file_drag;
+        let animating =
+            (playing && self.animate) || pending_meta || ui_anim || mixer_running || file_drag || sync_debug;
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
@@ -5524,7 +5999,7 @@ impl ApplicationHandler for App {
             // progress bar and MM:SS text; full-rate only while a DSP window is up.
             let dsp_open = self.secondary_windows.is_visible("monitoring")
                 || self.secondary_windows.is_visible("mixer");
-            let frame_ms = if pending_meta || dsp_open || ui_anim || file_drag {
+            let frame_ms = if pending_meta || dsp_open || ui_anim || file_drag || sync_debug {
                 self.frame_ms
             } else {
                 66
@@ -5629,6 +6104,7 @@ fn main() {
     let mut font_engine = FontEngine::Swash;
     let mut app_screenshot: Option<String> = None;
     let mut open_window: Option<String> = None;
+    let mut sync_debug = false;
     // Offline render / latency harness (phase A instruments).
     let mut render_in: Option<String> = None;
     let mut render_out: Option<String> = None;
@@ -5653,6 +6129,7 @@ fn main() {
             "--static" => animate = false,
             "--nopaint" => nopaint = true,
             "--open-window" => open_window = args.next(),
+            "--sync-debug" => sync_debug = true,
             "--render" => render_in = args.next(),
             "--out" => render_out = args.next(),
             "--pitch" => render_pitch = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
@@ -5880,6 +6357,7 @@ fn main() {
     // Phase 1.5: pop a secondary window at startup. With `--screenshot` alongside it,
     // the capture is taken from THAT window (handled in `resumed`).
     app.open_window_spec = open_window.as_deref().and_then(window_spec_by_key);
+    app.mixer_sync_debug = sync_debug;
     if let Some(k) = open_window.as_deref() {
         if app.open_window_spec.is_none() {
             eprintln!("[poc] --open-window: unknown key '{k}' (parameters|monitoring|mixer|settings|help)");

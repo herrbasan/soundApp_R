@@ -19,7 +19,7 @@ Native Rust audio player & NUI component library. The workspace holds three crat
   - Secondary `UiState` Inspector window (`W`) and file-drop preview (`D`). No audio or FFmpeg dependencies — this is where `crates/nui` components are designed and polished.
 - **`crates/soundapp` — Minimalist Player (`soundapp_r.exe`):**
   - Fast-opening FFmpeg decode + lock-free `rtrb` ring buffer + `cpal` WASAPI output, cosine fades, 8-tap Lanczos resampling, and Rubber Band pitch/tempo/formant processing.
-  - **Independent multi-track Mixer (`M`):** a separate output graph and transport with up to 20 streaming stems, synchronized start/seek/loop, per-stem gain/equal-power pan/mute/solo, real VU meters, master gain, and recursive drop-to-add/replace. Opening Mixer pauses the main player; closing Mixer destroys its engine.
+  - **Independent multi-track Mixer (`M`):** a separate output graph and transport with up to 20 streaming stems, synchronized start/seek/loop, per-stem gain/equal-power pan/mute/solo, real VU meters, master gain, and recursive drop-to-add/replace. `Ctrl+Shift+D` opens live per-stem drift/buffer/underrun diagnostics. Opening Mixer pauses the main player; closing Mixer destroys its engine.
   - Native MIDI and tracker parameters, including SoundFont selection, file-tempo display, tracker channel VU, and click/Shift-click channel solo.
   - Implicit sibling-folder playlist on single-file open, recursive folder drop, and a three-zone live-tracking drop overlay (*Add to current*, *Replace playlist*, *Open in Mixer*; `Ctrl` = non-recursive).
   - Embedded cover art decoded to `128×128` RGBA from the same FFmpeg metadata open, with a `-45°` format sash.
@@ -43,6 +43,7 @@ Portable user state lives beside the executable: `user.json`; MIDI SoundFonts (`
 - **`F`**: Toggle Font Engine (`Swash Hinted+Gamma` <-> `Fontdue Legacy`)
 - **`T`**: Toggle Dark / Light Theme (dark by default)
 - **`P` / `N` / `M` / `S` / `H`**: Parameters / Monitoring / Mixer / Settings / Help windows
+- **`Ctrl+Shift+D`** in Mixer: toggle the `SYNC DEBUG` panel (drift, ring buffer, underruns, source time per stem; `COPY` snapshots it to the clipboard)
 - **`Ctrl + MouseWheel`** (or **`+`** / **`-`** / **`0`**, or drag a window edge/corner): Zoom UI scale
 - **`--screenshot <path.png> --seconds <n>`**: Save the exact GPU/CPU framebuffer to PNG
 - **`--open-window <key>`**: Open a secondary window for capture
