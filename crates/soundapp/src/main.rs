@@ -614,6 +614,35 @@ fn known_music_dir() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Physical modifier state RIGHT NOW (Ctrl/Alt/Win keys down at this instant),
+/// asked of the OS instead of tracked from ModifiersChanged events - which go
+/// stale whenever focus leaves while a modifier is held (Alt+Tab: the key-up
+/// never reaches us, and a late-queued ModifiersChanged can even re-poison
+/// the state after a focus-reset). GetAsyncKeyState cannot lie about the
+/// present.
+#[cfg(windows)]
+fn modifiers_physically_down() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12; // Alt
+    const VK_LWIN: i32 = 0x5B;
+    const VK_RWIN: i32 = 0x5C;
+    unsafe {
+        GetAsyncKeyState(VK_CONTROL) < 0
+            || GetAsyncKeyState(VK_MENU) < 0
+            || GetAsyncKeyState(VK_LWIN) < 0
+            || GetAsyncKeyState(VK_RWIN) < 0
+    }
+}
+
+#[cfg(not(windows))]
+fn modifiers_physically_down() -> bool {
+    false
+}
+
 /// First supported audio file directly inside `dir` (name-sorted). The startup
 /// track for the default-directory feature: its implicit sibling-folder
 /// playlist then behaves exactly like any dropped file (flat, not recursive —
@@ -4732,8 +4761,9 @@ impl App {
         let Key::Character(ch) = &event.logical_key else {
             return false;
         };
-        let m = &self.modifiers;
-        if m.control_key() || m.alt_key() || self.any_text_input_focused() {
+        // Physical modifier check (OS truth) - the tracked self.modifiers is
+        // not trustworthy across focus changes.
+        if modifiers_physically_down() || self.any_text_input_focused() {
             return false;
         }
         match global_action_for(ch) {
@@ -4888,7 +4918,16 @@ impl App {
             }
             WindowEvent::Focused(true) => {
                 self.note_focus(key);
+                self.modifiers = ModifiersState::empty();
                 nui::restore_taskbar_group_if_needed();
+            }
+            // Modifiers can go stale when focus leaves while a modifier is
+            // held (Alt+Tab, Win-key, AltGr): the key-up never reaches us, so
+            // the tracked state would silently swallow every global shortcut
+            // until some other modifier event clears it. Reset on both ends
+            // of every focus transition.
+            WindowEvent::Focused(false) => {
+                self.modifiers = ModifiersState::empty();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
@@ -6748,7 +6787,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(true) => {
                 self.note_focus("main");
+                self.modifiers = ModifiersState::empty();
                 nui::restore_taskbar_group_if_needed();
+            }
+            WindowEvent::Focused(false) => {
+                self.modifiers = ModifiersState::empty();
             }
             WindowEvent::HoveredFile(path) => {
                 self.refresh_drag_cursor();
