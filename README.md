@@ -56,6 +56,7 @@ Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/rele
 - **`F`**: Toggle Font Engine (`Swash Hinted+Gamma` <-> `Fontdue Legacy`)
 - **`X`**: Toggle Dark / Light Theme (dark by default)
 - **`P` / `N` / `M` / `S` / `H`**: Parameters / Monitoring / Mixer / Settings / Help windows — global toggles from any SoundApp window, so pressing `S` while Settings is focused closes it
+- **`I`**: Show the currently playing file selected in Windows Explorer (works from any window)
 - **`Ctrl+Shift+D`** in Mixer: toggle the `SYNC DEBUG` panel (drift, ring buffer, underruns, source time per stem; `COPY` snapshots it to the clipboard)
 - **`Ctrl + MouseWheel`** (or **`+`** / **`-`** / **`0`**, or drag a window edge/corner): Zoom UI scale
 - **`--screenshot <path.png> --seconds <n>`**: Save the exact GPU/CPU framebuffer to PNG

@@ -35,7 +35,7 @@ use nui::{
     rgb, rgba, BackendKind, ButtonVariant, FontEngine, FontFace, KeyCmd, Length, Rect, Renderer,
     Scene, TextSystem, Theme, Ui, UiState, WindowManager, WindowSpec, ICON_ADD, ICON_CHECK,
     ICON_CLOSE, ICON_EQ, ICON_LOOP, ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREV, ICON_RESTART,
-    ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE, ICON_VOLUME,
+    ICON_LOCK, ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE, ICON_VOLUME,
 };
 
 /// One channel strip in the Phase 3.4 multitrack preview mixer.
@@ -490,6 +490,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("M", "Mixer window"),
     ("S", "Settings window"),
     ("H", "This Help window"),
+    ("I", "Show current file in Explorer"),
     ("F", "Toggle Swash / Fontdue engine"),
     ("X", "Toggle dark / light theme"),
     ("Ctrl + / - / 0", "UI zoom in / out / reset"),
@@ -509,6 +510,52 @@ fn window_toggle_for_key(ch: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// A key that works regardless of which SoundApp window is focused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GlobalAction {
+    ToggleWindow(&'static str),
+    ToggleTheme,
+    ToggleControls,
+    RevealInExplorer,
+}
+
+/// Pure classification for the global key pass — unit-testable without winit.
+fn global_action_for(ch: &str) -> Option<GlobalAction> {
+    if let Some(key) = window_toggle_for_key(ch) {
+        return Some(GlobalAction::ToggleWindow(key));
+    }
+    match ch.chars().next()?.to_ascii_lowercase() {
+        'x' | 't' => Some(GlobalAction::ToggleTheme),
+        'c' => Some(GlobalAction::ToggleControls),
+        'i' => Some(GlobalAction::RevealInExplorer),
+        _ => None,
+    }
+}
+
+/// Open the OS file browser with `path` selected. `explorer.exe /select` needs
+/// `/select,"<path>"` as ONE raw argument — std's default MSVC quoting escapes
+/// the embedded quotes and Explorer then opens the folder without selecting.
+/// spawn() only: Explorer hands off to the running shell process and a
+/// blocking wait could hang. Falls back to opening the parent folder.
+#[cfg(windows)]
+fn reveal_in_explorer(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    let raw = format!("/select,\"{}\"", path.display());
+    if std::process::Command::new("explorer.exe")
+        .raw_arg(raw)
+        .spawn()
+        .is_err()
+    {
+        eprintln!("[app] explorer /select failed; opening parent folder");
+        if let Some(dir) = path.parent() {
+            let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn reveal_in_explorer(_path: &std::path::Path) {}
 
 // ---------------------------------------------------------------------------
 // Small draw helpers shared by the Monitoring / Mixer windows
@@ -2972,7 +3019,7 @@ impl App {
     }
 
     /// New-track rule: transient playback parameters reset to their defaults
-    /// unless "Lock Parameters Across Tracks" is set. The reset is pushed to
+    /// unless "Lock Settings" is set. The reset is pushed to
     /// the engine in the same breath — `Cmd::SetParams` is queued before
     /// `Cmd::Load`, so the decoder computes the new track's tape step from the
     /// fresh values and no stale parameter set survives into the new track.
@@ -3505,6 +3552,7 @@ impl App {
 
         let monitoring_visible = self.secondary_windows.is_visible("monitoring");
         let parameters_visible = self.secondary_windows.is_visible("parameters");
+        let parameters_icon = if self.chk_locked { ICON_LOCK } else { ICON_TUNE };
         if let Some(a) = &self.audio {
             a.set_dsp_enabled(monitoring_visible);
         }
@@ -3967,7 +4015,7 @@ impl App {
                     &mut ui,
                     621,
                     Rect::new(bleft + bs + bgap, by, bs, bs),
-                    ICON_TUNE,
+                    parameters_icon,
                     parameters_visible,
                     scale,
                 ) {
@@ -4331,6 +4379,87 @@ impl App {
     /// keyboard shortcuts and the main window's toggle buttons (both handled during
     /// scene build, where no `event_loop` exists) and executed here from the primary
     /// window's `RedrawRequested` arm in `window_event`.
+    /// True while a text input owns keyboard focus (global shortcuts must
+    /// never steal typing). `focused_id` alone is NOT this — every clickable
+    /// widget takes focus on click; only ids registered here count as text
+    /// inputs. soundapp has none today; ids join this list as fields appear.
+    fn any_text_input_focused(&self) -> bool {
+        const TEXT_INPUT_IDS: &[u32] = &[];
+        let is_text = |id: Option<u32>| id.is_some_and(|id| TEXT_INPUT_IDS.contains(&id));
+        is_text(self.ui_state.focused_id)
+            || self
+                .secondary_windows
+                .windows
+                .iter()
+                .any(|w| is_text(w.ui_state.focused_id))
+    }
+
+    /// One key pass that runs BEFORE the per-window partition, so its
+    /// vocabulary works no matter which window is focused. Guards: no
+    /// Ctrl/Alt/OS-logo (Ctrl+P & co. must stay free), no text focus.
+    fn handle_global_shortcut(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &winit::event::KeyEvent,
+    ) -> bool {
+        let Key::Character(ch) = &event.logical_key else {
+            return false;
+        };
+        let m = &self.modifiers;
+        if m.control_key() || m.alt_key() || self.any_text_input_focused() {
+            return false;
+        }
+        match global_action_for(ch) {
+            Some(GlobalAction::ToggleWindow(key)) => {
+                self.pending_window_toggles.push(key);
+                self.process_window_toggles(event_loop);
+            }
+            Some(GlobalAction::ToggleTheme) => {
+                self.dark_mode = !self.dark_mode;
+                self.secondary_windows.request_redraw_all();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Some(GlobalAction::ToggleControls) => {
+                self.show_controls = !self.show_controls;
+                self.apply_zoom();
+            }
+            Some(GlobalAction::RevealInExplorer) => self.reveal_current_file_in_explorer(),
+            None => return false,
+        }
+        true
+    }
+
+    /// `I`: show the currently playing file in the OS file browser, falling
+    /// back to the selected playlist entry when no engine is running.
+    fn reveal_current_file_in_explorer(&self) {
+        let path = self
+            .audio
+            .as_ref()
+            .and_then(|a| a.current_file())
+            .or_else(|| self.playlist.get(self.selected_track).cloned());
+        if let Some(path) = path {
+            reveal_in_explorer(&path);
+        }
+    }
+
+    /// Parameters-window close rule: transient edits reset to defaults unless
+    /// "Lock Settings" is active — one flag, one meaning: locked parameters
+    /// are sticky across track changes AND window close. Pushed to the engine
+    /// exactly like `on_new_track`.
+    fn on_parameters_window_closed(&mut self) {
+        if self.chk_locked {
+            return;
+        }
+        self.params = ParamState::default();
+        self.tracker_mutes.clear();
+        self.sync_pipeline_and_params();
+        if let Some(a) = &self.audio {
+            a.set_tracker_mutes(self.tracker_mutes.clone());
+        }
+    }
+
     fn process_window_toggles(&mut self, event_loop: &ActiveEventLoop) {
         if self.pending_window_toggles.is_empty() {
             return;
@@ -4346,8 +4475,13 @@ impl App {
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
                 .toggle(event_loop, &spec, backend);
-            if key == "parameters" && !was_visible {
-                self.parameters_window_height = None;
+            if key == "parameters" {
+                if was_visible {
+                    // Toggled off: the same close rule as the other paths.
+                    self.on_parameters_window_closed();
+                } else {
+                    self.parameters_window_height = None;
+                }
             }
             if key == "mixer" {
                 if was_visible {
@@ -4374,7 +4508,7 @@ impl App {
     /// `TextSystem`.
     fn secondary_window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         id: WindowId,
         event: WindowEvent,
     ) {
@@ -4394,6 +4528,7 @@ impl App {
                 self.secondary_windows.hide(key);
                 if key == "parameters" {
                     self.parameters_window_height = None;
+                    self.on_parameters_window_closed();
                 }
                 if key == "mixer" {
                     self.close_mixer();
@@ -4562,28 +4697,8 @@ impl App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    if let Key::Character(ch) = &event.logical_key {
-                        if let Some(target) = window_toggle_for_key(ch) {
-                            self.pending_window_toggles.push(target);
-                            self.process_window_toggles(event_loop);
-                            return;
-                        }
-                        if !self.modifiers.control_key()
-                            && (ch.eq_ignore_ascii_case("x") || ch.eq_ignore_ascii_case("t"))
-                        {
-                            self.dark_mode = !self.dark_mode;
-                            self.secondary_windows.request_redraw_all();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
-                            return;
-                        }
-                        if !self.modifiers.control_key() && ch.eq_ignore_ascii_case("c") {
-                            self.show_controls = !self.show_controls;
-                            self.apply_zoom();
-                            return;
-                        }
-                    }
+                    // Global keys are handled before the window partition in
+                    // `window_event`; only window-local keys remain here.
                     if key == "mixer"
                         && self.modifiers.control_key()
                         && self.modifiers.shift_key()
@@ -4619,6 +4734,7 @@ impl App {
                             self.secondary_windows.hide(key);
                             if key == "parameters" {
                                 self.parameters_window_height = None;
+                                self.on_parameters_window_closed();
                             }
                             if key == "mixer" {
                                 self.close_mixer();
@@ -4724,12 +4840,14 @@ impl App {
 
                 // The Parameters window is audio-pipeline only now.
                 let (hdr_icon, hdr_title): (&str, &str) = if key == "parameters" {
+                    // Locked parameters are sticky — the padlock says so at a glance.
+                    let ic = if self.chk_locked { ICON_LOCK } else { ICON_TUNE };
                     if tracker_page {
-                        (ICON_TUNE, "PARAMETERS - TRACKER (MOD)")
+                        (ic, "PARAMETERS - TRACKER (MOD)")
                     } else if midi_page {
-                        (ICON_TUNE, "PARAMETERS - MIDI")
+                        (ic, "PARAMETERS - MIDI")
                     } else {
-                        (ICON_TUNE, "PARAMETERS - AUDIO")
+                        (ic, "PARAMETERS - AUDIO")
                     }
                 } else if key == "monitoring" {
                     (ICON_EQ, "AUDIO MONITORING")
@@ -5848,12 +5966,7 @@ impl App {
                                     Length::rem(1.0),
                                     [Length::fill(), Length::fill()],
                                 );
-                                ui.checkbox(
-                                    754,
-                                    c3,
-                                    "Lock Parameters Across Tracks",
-                                    &mut self.chk_locked,
-                                );
+                                ui.checkbox(754, c3, "Lock Settings", &mut self.chk_locked);
                                 ui.checkbox(
                                     755,
                                     c4,
@@ -6066,6 +6179,7 @@ impl App {
             self.secondary_windows.hide(key);
             if key == "parameters" {
                 self.parameters_window_height = None;
+                self.on_parameters_window_closed();
             }
             if key == "mixer" {
                 self.close_mixer();
@@ -6155,6 +6269,17 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Global keys first: window toggles, theme, controls and the Explorer
+        // reveal work from ANY app window. (ModifiersChanged events keep
+        // `self.modifiers` current before the key arrives, whichever branch
+        // owns the window.)
+        if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+            if key.state == ElementState::Pressed
+                && self.handle_global_shortcut(event_loop, key)
+            {
+                return;
+            }
+        }
         // Phase 1.5 routing: the primary window owns the process lifetime; every other
         // window is a managed secondary (Escape / CloseRequested hide, not exit).
         if self.window.as_ref().map(|w| w.id()) != Some(id) {
@@ -6304,8 +6429,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    let focused_text = self.ui_state.focused_id == Some(301)
-                        || self.ui_state.focused_id == Some(401);
+                    let focused_text = self.any_text_input_focused();
 
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
@@ -6407,14 +6531,6 @@ impl ApplicationHandler for App {
                             };
                         }
                         Key::Character(ch)
-                            if !focused_text
-                                && (ch.eq_ignore_ascii_case("x")
-                                    || ch.eq_ignore_ascii_case("t")) =>
-                        {
-                            self.dark_mode = !self.dark_mode;
-                            self.secondary_windows.request_redraw_all();
-                        }
-                        Key::Character(ch)
                             if (!focused_text || self.modifiers.control_key())
                                 && (ch == "+" || ch == "=") =>
                         {
@@ -6435,19 +6551,6 @@ impl ApplicationHandler for App {
                             self.loop_enabled = !self.loop_enabled;
                             if let Some(a) = &self.audio {
                                 a.set_loop(self.loop_enabled);
-                            }
-                        }
-                        Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("c") => {
-                            self.show_controls = !self.show_controls;
-                            self.apply_zoom();
-                        }
-                        Key::Character(ch)
-                            if !focused_text && window_toggle_for_key(ch).is_some() =>
-                        {
-                            // Queue the secondary-window toggle; executed right after this
-                            // frame in the RedrawRequested arm where `event_loop` lives.
-                            if let Some(key) = window_toggle_for_key(ch) {
-                                self.pending_window_toggles.push(key);
                             }
                         }
                         _ => {
@@ -7264,6 +7367,43 @@ mod params_tests {
         app.params = modified();
         let before = app.params;
         app.load_playlist_index(0);
+        assert_eq!(app.params, before);
+    }
+
+    #[test]
+    fn global_keys_classify() {
+        assert_eq!(
+            global_action_for("p"),
+            Some(GlobalAction::ToggleWindow("parameters"))
+        );
+        assert_eq!(
+            global_action_for("M"),
+            Some(GlobalAction::ToggleWindow("mixer"))
+        );
+        assert_eq!(global_action_for("x"), Some(GlobalAction::ToggleTheme));
+        assert_eq!(global_action_for("T"), Some(GlobalAction::ToggleTheme));
+        assert_eq!(global_action_for("c"), Some(GlobalAction::ToggleControls));
+        assert_eq!(global_action_for("i"), Some(GlobalAction::RevealInExplorer));
+        assert_eq!(global_action_for("q"), None);
+        assert_eq!(global_action_for(""), None);
+    }
+
+    #[test]
+    fn unlocked_parameters_close_resets_params() {
+        let mut app = test_app();
+        app.chk_locked = false;
+        app.params = modified();
+        app.on_parameters_window_closed();
+        assert_eq!(app.params, ParamState::default());
+    }
+
+    #[test]
+    fn locked_parameters_close_keeps_params() {
+        let mut app = test_app();
+        app.chk_locked = true;
+        app.params = modified();
+        let before = app.params;
+        app.on_parameters_window_closed();
         assert_eq!(app.params, before);
     }
 
