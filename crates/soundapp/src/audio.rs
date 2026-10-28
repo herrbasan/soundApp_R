@@ -23,18 +23,24 @@
 // The ring therefore always holds raw decoded frames: a mode switch never
 // re-processes audio the previous mode already shaped.
 //
-// Two state machines keep playback clean:
+// Three state machines keep playback clean:
 //   * The callback owns a cosine-fade machine — 12 ms out on pause/seek, 15 ms
 //     in on play/resume — plus an exponential volume smoother.
 //   * The decoder thread owns a transport machine — decode/render → (optional)
 //     pitch-shift → push, checking its command channel between bounded chunks.
+//   * The engine-power monitor owns the device stream state: once the fade
+//     reached steady silence and no flush handshake is pending, it stops the
+//     WASAPI stream (`Stream::pause` → `IAudioClient::Stop`); resume restarts
+//     it before the fade-in. cpal 0.18.2's WASAPI `Stream` is Send + Sync
+//     (explicit unsafe impls + compile-time assertions), so the monitor shares
+//     it via `Arc` while `Audio` keeps the owning handle.
 
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -322,6 +328,16 @@ struct Shared {
     midi_native_bpm: Arc<AtomicU32>,
     tracker_channels: Arc<AtomicU64>,
     tracker_vu: Arc<Mutex<Vec<crate::tracker::ChannelVu>>>,
+    /// Device-level stream state: true once the engine-power monitor called
+    /// `Stream::pause()` after the callback's fade-out drained. Gates the
+    /// meter sources (DspTap / tracker VU) so paused displays read zeros.
+    engine_stopped: Arc<AtomicBool>,
+    /// Callback-published quiescence: steady gain-off, nothing being pulled.
+    callback_idle: Arc<AtomicBool>,
+    /// Idle-park condvar: transport-visible flips (play/pause/seek/load/
+    /// params) notify it so the decoder, stretcher and monitor threads sleep
+    /// deeply instead of polling. Payload is a notify generation.
+    wake: Arc<(Mutex<u64>, Condvar)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +350,10 @@ struct Shared {
 pub struct DspTap {
     cap: usize,
     buf: VecDeque<(f32, f32)>,
+    /// Set when the engine-power monitor stopped the device stream: the
+    /// window no longer refreshes, so snapshots must report silence instead
+    /// of letting meters freeze on the last pre-pause audio.
+    engine_stopped: Arc<AtomicBool>,
 }
 
 impl DspTap {
@@ -343,7 +363,14 @@ impl DspTap {
         Self {
             cap,
             buf: VecDeque::with_capacity(cap.min(1 << 16)),
+            engine_stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Wire the shared engine-stopped state (only the production `start_with`
+    /// does; tests keep the fresh, never-stopped flag).
+    fn set_engine_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.engine_stopped = flag;
     }
 
     #[inline]
@@ -355,8 +382,14 @@ impl DspTap {
     }
 
     /// Copy the most recent frames (oldest → newest) into `out`, clearing it first.
+    /// With the engine stopped no fresh frames arrive, so this publishes an
+    /// empty window — the Monitoring consumer falls back to its synthetic
+    /// signal instead of freezing on stale audio.
     pub fn snapshot_into(&self, out: &mut Vec<(f32, f32)>) {
         out.clear();
+        if self.engine_stopped.load(Ordering::Relaxed) {
+            return;
+        }
         out.extend(self.buf.iter().copied());
     }
 }
@@ -366,7 +399,7 @@ impl DspTap {
 // ---------------------------------------------------------------------------
 
 pub struct Audio {
-    _stream: cpal::Stream,
+    _stream: Arc<cpal::Stream>,
     pub rate: u32,
     pub channels: u16,
     pub total_frames: Arc<AtomicU64>,
@@ -388,6 +421,8 @@ pub struct Audio {
     midi_native_bpm: Arc<AtomicU32>,
     tracker_channels: Arc<AtomicU64>,
     tracker_vu: Arc<Mutex<Vec<crate::tracker::ChannelVu>>>,
+    engine_stopped: Arc<AtomicBool>,
+    wake: Arc<(Mutex<u64>, Condvar)>,
 }
 
 impl Audio {
@@ -430,9 +465,11 @@ impl Audio {
             self.seek(0.0);
         }
         self.playing.store(true, Ordering::SeqCst);
+        wake_all(&self.wake);
     }
     pub fn pause(&self) {
         self.playing.store(false, Ordering::SeqCst);
+        wake_all(&self.wake);
     }
     /// Flip the play/pause intent; returns the new state (`true` = playing).
     pub fn toggle_play(&self) -> bool {
@@ -455,6 +492,7 @@ impl Audio {
     }
     pub fn seek(&self, seconds: f64) {
         let _ = self.cmd_tx.send(Cmd::Seek(seconds.max(0.0)));
+        wake_all(&self.wake);
     }
     /// Load any supported source by path. Immediately clears the published
     /// metadata and updates `current` on the caller thread so the very next UI
@@ -464,6 +502,7 @@ impl Audio {
         *self.meta.lock().unwrap() = None;
         *self.current.lock().unwrap() = Some(path.clone());
         let _ = self.cmd_tx.send(Cmd::Load(path));
+        wake_all(&self.wake);
     }
     pub fn set_volume(&self, vol: f32) {
         self.volume
@@ -471,6 +510,7 @@ impl Audio {
     }
     pub fn set_params(&self, params: PlaybackParams) {
         let _ = self.cmd_tx.send(Cmd::SetParams(params));
+        wake_all(&self.wake);
     }
     /// Switch the SoundFont. A playing MIDI engine adopts it live (no
     /// restart); otherwise it becomes the font the next MIDI track opens
@@ -478,6 +518,7 @@ impl Audio {
     /// active font stays until a valid one is chosen.
     pub fn set_soundfont(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::SetSoundfont(path));
+        wake_all(&self.wake);
     }
     pub fn midi_native_bpm(&self) -> f32 {
         f32::from_bits(self.midi_native_bpm.load(Ordering::Relaxed))
@@ -485,11 +526,18 @@ impl Audio {
     pub fn tracker_channel_count(&self) -> usize {
         self.tracker_channels.load(Ordering::Relaxed) as usize
     }
+    /// Tracker channel meters. While the device stream is stopped no fresh VU
+    /// arrives — report silence instead of freezing on the last values.
     pub fn tracker_vu(&self) -> Vec<crate::tracker::ChannelVu> {
-        self.tracker_vu.lock().unwrap().clone()
+        let vu = self.tracker_vu.lock().unwrap().clone();
+        if self.engine_stopped.load(Ordering::Relaxed) {
+            return vec![crate::tracker::ChannelVu::default(); vu.len()];
+        }
+        vu
     }
     pub fn set_tracker_mutes(&self, mutes: Vec<bool>) {
         let _ = self.cmd_tx.send(Cmd::SetTrackerMutes(mutes));
+        wake_all(&self.wake);
     }
     pub fn metadata(&self) -> Option<TrackMetadata> {
         self.meta.lock().unwrap().clone()
@@ -616,7 +664,14 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
         tracker_channels: Arc::new(AtomicU64::new(0)),
         tracker_vu: Arc::new(Mutex::new(Vec::new())),
+        engine_stopped: Arc::new(AtomicBool::new(false)),
+        callback_idle: Arc::new(AtomicBool::new(false)),
+        wake: Arc::new((Mutex::new(0u64), Condvar::new())),
     };
+    shared.dsp
+        .lock()
+        .unwrap()
+        .set_engine_flag(shared.engine_stopped.clone());
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
 
@@ -776,6 +831,14 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
                     }
                     dsp_frames.clear();
                 }
+                // Publish quiescence for the engine-power monitor: the fade
+                // machine is steady and nothing is being pulled, so the device
+                // stream may stop. Republished every buffer — the monitor's
+                // wait timeout is the safety net against a missed edge.
+                sh.callback_idle.store(
+                    matches!(fade, Fade::Steady) && !last_playing,
+                    Ordering::Release,
+                );
             },
             err_fn,
             None,
@@ -783,6 +846,23 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         .map_err(|e| e.to_string())?;
 
     stream.play().map_err(|e| e.to_string())?;
+
+    // Engine-power monitor: shares the stream via Arc (cpal 0.18.2's WASAPI
+    // `Stream` is Send + Sync) and stops the device while paused. Ordering
+    // contracts: stop only AFTER the callback's fade-out reached steady
+    // silence (stopping mid-fade would cut the fade, and a stopped callback
+    // could not acknowledge a flush); resume BEFORE the fade-in frames are
+    // expected — the callback cannot run while stopped, so play() necessarily
+    // precedes them.
+    let stream = Arc::new(stream);
+    {
+        let sh = shared.clone();
+        let st = stream.clone();
+        thread::Builder::new()
+            .name("engine-power".into())
+            .spawn(move || engine_power_thread(st, sh))
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(Audio {
         _stream: stream,
@@ -805,7 +885,55 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         midi_native_bpm: shared.midi_native_bpm.clone(),
         tracker_channels: shared.tracker_channels.clone(),
         tracker_vu: shared.tracker_vu.clone(),
+        engine_stopped: shared.engine_stopped.clone(),
+        wake: shared.wake.clone(),
     })
+}
+
+/// Notify every idle-parked thread (decoder, stretcher, engine-power monitor).
+fn wake_all(wake: &(Mutex<u64>, Condvar)) {
+    let mut gen = wake.0.lock().unwrap();
+    *gen = gen.wrapping_add(1);
+    wake.1.notify_all();
+}
+
+/// Timed idle wait that a `wake_all` shortens. Drop-in for the idle-poll
+/// sleeps: same timeout bound, deep sleep between transport events.
+fn idle_wait(sh: &Shared, ms: u64) {
+    let guard = sh.wake.0.lock().unwrap();
+    let _ = sh.wake.1.wait_timeout(guard, Duration::from_millis(ms));
+}
+
+/// Pause decision for [`engine_power_thread`]. Requires callback quiescence
+/// (fade drained) and a settled flush handshake: the callback acknowledges
+/// `flush_gen`, and a stopped stream cannot run it.
+fn engine_wants_stop(sh: &Shared) -> bool {
+    !sh.playing.load(Ordering::Relaxed)
+        && !sh.flushing.load(Ordering::Acquire)
+        && sh.callback_idle.load(Ordering::Acquire)
+        && sh.flush_gen.load(Ordering::Acquire) == sh.flush_ack.load(Ordering::Acquire)
+}
+
+fn engine_power_thread(stream: Arc<cpal::Stream>, sh: Shared) {
+    loop {
+        idle_wait(&sh, 50);
+        let stopped = sh.engine_stopped.load(Ordering::Acquire);
+        let want_stop = engine_wants_stop(&sh);
+        if want_stop && !stopped {
+            match stream.pause() {
+                Ok(()) => sh.engine_stopped.store(true, Ordering::Release),
+                Err(e) => eprintln!("[audio] engine stop failed: {e}"),
+            }
+        } else if !want_stop && stopped {
+            // Clear the meter gate before play(): the first frames after the
+            // callback restarts are real audio and must reach the tap.
+            sh.engine_stopped.store(false, Ordering::Release);
+            if let Err(e) = stream.play() {
+                eprintln!("[audio] engine start failed: {e}");
+                sh.engine_stopped.store(true, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// Cosine fade state machine — see the module header.
@@ -1651,18 +1779,18 @@ fn decoder_thread(
             continue;
         }
         if silence {
-            thread::sleep(Duration::from_millis(5));
+            idle_wait(&sh, 5);
             continue;
         }
 
         if matches!(engine, Engine::None) || !sh.playing.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(5));
+            idle_wait(&sh, 5);
             continue;
         }
 
         let free_frames = producer.slots() / out_ch;
         if free_frames == 0 {
-            thread::sleep(Duration::from_millis(3));
+            idle_wait(&sh, 3);
             continue;
         }
         let mut cap = free_frames.min(CHUNK_FRAMES);
@@ -1676,7 +1804,7 @@ fn decoder_thread(
         if matches!(engine, Engine::Openmpt(_) | Engine::Midi(_)) {
             let occupied = src_ring_frames - free_frames;
             if occupied >= native_high_water {
-                thread::sleep(Duration::from_millis(3));
+                idle_wait(&sh, 3);
                 continue;
             }
             cap = cap.min(native_high_water - occupied);
@@ -1689,7 +1817,7 @@ fn decoder_thread(
             Engine::Ffmpeg(handle) => {
                 let h = *handle;
                 if h.is_null() {
-                    thread::sleep(Duration::from_millis(5));
+                    idle_wait(&sh, 5);
                     continue;
                 }
                 let want_in = read_pos.ceil() as usize + LOOKAHEAD + 1;
@@ -1755,7 +1883,7 @@ fn decoder_thread(
                     // up to RING_SECONDS of audio. Signal the callback, which owns
                     // the real end-of-track transition.
                     sh.decoder_eof.store(true, Ordering::Release);
-                    thread::sleep(Duration::from_millis(5));
+                    idle_wait(&sh, 5);
                     continue;
                 }
             }
@@ -1780,7 +1908,7 @@ fn decoder_thread(
                         eof = false;
                     } else {
                         sh.decoder_eof.store(true, Ordering::Release);
-                        thread::sleep(Duration::from_millis(5));
+                        idle_wait(&sh, 5);
                         continue;
                     }
                 }
@@ -1828,7 +1956,7 @@ fn decoder_thread(
                         eof = false;
                     } else {
                         sh.decoder_eof.store(true, Ordering::Release);
-                        thread::sleep(Duration::from_millis(5));
+                        idle_wait(&sh, 5);
                         continue;
                     }
                 }
@@ -2015,7 +2143,7 @@ fn stretcher_thread(
                     sh.stage_eof.store(true, Ordering::Release);
                 }
             } else if !sh.decoder_eof.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(3));
+                idle_wait(&sh, 3);
             }
         }
 
@@ -2387,7 +2515,7 @@ fn push_tone(producer: &mut rtrb::Producer<f32>, sh: &Shared, _hz: f32, _rate: u
         }
     }
     if n == 0 {
-        thread::sleep(Duration::from_millis(3));
+        idle_wait(sh, 3);
     }
 }
 
@@ -2942,6 +3070,9 @@ mod tests {
             midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
             tracker_channels: Arc::new(AtomicU64::new(0)),
             tracker_vu: Arc::new(Mutex::new(Vec::new())),
+            engine_stopped: Arc::new(AtomicBool::new(false)),
+            callback_idle: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new((Mutex::new(0u64), Condvar::new())),
         };
         let (mut src_prod, src_cons) = RingBuffer::<f32>::new(48_000 * 2);
         let (out_prod, mut out_cons) = RingBuffer::<f32>::new(4096 * 2);
@@ -2999,7 +3130,42 @@ mod tests {
             midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
             tracker_channels: Arc::new(AtomicU64::new(0)),
             tracker_vu: Arc::new(Mutex::new(Vec::new())),
+            engine_stopped: Arc::new(AtomicBool::new(false)),
+            callback_idle: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new((Mutex::new(0u64), Condvar::new())),
         }
+    }
+
+    #[test]
+    fn engine_pause_waits_for_fade_and_flush() {
+        let sh = test_shared(48_000);
+        // Playing: never stop.
+        assert!(!engine_wants_stop(&sh));
+        // Paused, but the callback has not drained its fade-out yet.
+        sh.playing.store(false, Ordering::SeqCst);
+        assert!(!engine_wants_stop(&sh));
+        sh.callback_idle.store(true, Ordering::Release);
+        // Unsettled flush handshake: a stopped stream could not acknowledge it.
+        sh.flush_gen.store(1, Ordering::SeqCst);
+        assert!(!engine_wants_stop(&sh));
+        sh.flush_ack.store(1, Ordering::SeqCst);
+        assert!(engine_wants_stop(&sh));
+        // An in-flight flush blocks the stop outright (seek while paused).
+        sh.flushing.store(true, Ordering::SeqCst);
+        assert!(!engine_wants_stop(&sh));
+    }
+
+    #[test]
+    fn dsp_tap_reports_silence_while_engine_stopped() {
+        let mut tap = DspTap::new(48_000);
+        tap.push(0.5, -0.5);
+        let mut out = Vec::new();
+        tap.snapshot_into(&mut out);
+        assert_eq!(out, vec![(0.5, -0.5)]);
+        let flag = Arc::new(AtomicBool::new(true));
+        tap.set_engine_flag(flag);
+        tap.snapshot_into(&mut out);
+        assert!(out.is_empty(), "stopped engine must not publish stale audio");
     }
 
     /// Estimate dominant frequency of `win` (mono f32) via upward zero
