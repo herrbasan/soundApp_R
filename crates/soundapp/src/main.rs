@@ -633,7 +633,7 @@ fn first_audio_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 /// bridge caps embedded art at 128).
 const COVER_TILE_SIDE: u32 = 128;
 /// Duration of one cover crossfade.
-const COVER_FADE_SECS: f32 = 0.3;
+const COVER_FADE_SECS: f32 = 0.2;
 
 /// One cover transition: the outgoing view (`None` = default tile) fading
 /// into the incoming view over [`COVER_FADE_SECS`].
