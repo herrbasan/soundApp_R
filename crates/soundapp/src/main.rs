@@ -11,6 +11,7 @@ mod config;
 mod dsp;
 mod midi;
 mod mixer;
+mod eventlog;
 mod perf;
 mod single_instance;
 mod tracker;
@@ -307,6 +308,8 @@ struct App {
     cover_resting: Option<(u32, u32, Vec<u8>)>,
     /// Active cover crossfade, if any.
     cover_fade: Option<CoverFade>,
+    /// Last logged foreground window (OS-observed, `None` = outside the app).
+    focus_log: Option<String>,
     pending_window_toggles: Vec<&'static str>,
     /// MRU focus ring (`"main"` or a secondary key). Hiding the focused window
     /// restores focus to the previous visible entry, so keyboard shortcuts never
@@ -718,6 +721,31 @@ struct SavedGeom {
     w: f32,
     h: f32,
     visible: bool,
+}
+
+/// Log which SoundApp window owns OS keyboard focus, on every change. Polled
+/// from the OS rather than inferred from events: focus can move without any
+/// event reaching us, and a missing trace of that is exactly what makes focus
+/// bugs unreproducible.
+fn log_focus_change(app: &mut App) {
+    let mut current: Option<&'static str> = None;
+    if let Some(w) = &app.window {
+        if nui::is_foreground(w) {
+            current = Some("main");
+        }
+    }
+    if current.is_none() {
+        for mw in &app.secondary_windows.windows {
+            if mw.visible && nui::is_foreground(&mw.window) {
+                current = Some(mw.key);
+                break;
+            }
+        }
+    }
+    if current != app.focus_log.as_deref() {
+        eventlog::note(&format!("focus -> {}", current.unwrap_or("outside")));
+        app.focus_log = current.map(str::to_string);
+    }
 }
 
 /// Parse `key x y w h visible;key ...`. Unknown/garbage entries are skipped,
@@ -2830,6 +2858,7 @@ impl App {
             default_dir,
             cover_resting: None,
             cover_fade: None,
+            focus_log: Some("<unset>".to_string()),
             pending_window_toggles: Vec::new(),
             focus_ring: VecDeque::from(["main"]),
             open_requests: None,
@@ -4764,9 +4793,14 @@ impl App {
         // Physical modifier check (OS truth) - the tracked self.modifiers is
         // not trustworthy across focus changes.
         if modifiers_physically_down() || self.any_text_input_focused() {
+            eventlog::note(&format!("global '{ch}' SUPPRESSED (modifier down or text focus)"));
             return false;
         }
-        match global_action_for(ch) {
+        let action = global_action_for(ch);
+        if let Some(a) = action {
+            eventlog::note(&format!("global '{ch}' -> {a:?}"));
+        }
+        match action {
             Some(GlobalAction::ToggleWindow(key)) => {
                 self.pending_window_toggles.push(key);
                 self.process_window_toggles(event_loop);
@@ -4823,12 +4857,16 @@ impl App {
         }
         let pending = std::mem::take(&mut self.pending_window_toggles);
         for key in pending {
+            let was_visible = self.secondary_windows.is_visible(key);
+            eventlog::note(&format!(
+                "toggle '{key}' visible={was_visible} -> {}",
+                !was_visible
+            ));
             let Some(spec) = window_spec_by_key(key) else {
                 continue;
             };
             // `show()` requests reveal + redraw itself, so no synchronous paint here.
             let backend = self.secondary_backend(key);
-            let was_visible = self.secondary_windows.is_visible(key);
             let existed = self.secondary_windows.windows.iter().any(|w| w.key == key);
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
@@ -4897,6 +4935,7 @@ impl App {
 
         match event {
             WindowEvent::CloseRequested => {
+                eventlog::note(&format!("close-requested {key}"));
                 self.secondary_windows.hide(key);
                 if key == "parameters" {
                     self.parameters_window_height = None;
@@ -4920,6 +4959,7 @@ impl App {
                 self.note_focus(key);
                 self.modifiers = ModifiersState::empty();
                 nui::restore_taskbar_group_if_needed();
+                eventlog::note(&format!("focus {key} true"));
             }
             // Modifiers can go stale when focus leaves while a modifier is
             // held (Alt+Tab, Win-key, AltGr): the key-up never reaches us, so
@@ -4928,6 +4968,7 @@ impl App {
             // of every focus transition.
             WindowEvent::Focused(false) => {
                 self.modifiers = ModifiersState::empty();
+                eventlog::note(&format!("focus {key} false"));
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
@@ -5112,6 +5153,7 @@ impl App {
                                 w.window.request_redraw();
                             }
                         } else {
+                            eventlog::note(&format!("escape-hide {key}"));
                             self.secondary_windows.hide(key);
                             if key == "parameters" {
                                 self.parameters_window_height = None;
@@ -6634,6 +6676,7 @@ impl App {
         if close_clicked {
             // The Mixer owns a real engine and is destroyed on close; the other
             // secondary windows only hide their rendering surfaces.
+            eventlog::note(&format!("header-close {key}"));
             self.secondary_windows.hide(key);
             if key == "parameters" {
                 self.parameters_window_height = None;
@@ -6756,6 +6799,17 @@ impl ApplicationHandler for App {
         // `self.modifiers` current before the key arrives, whichever branch
         // owns the window.)
         if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+            eventlog::note(&format!(
+                "key {:?} {:?} repeat={} win={}",
+                key.logical_key,
+                key.state,
+                key.repeat,
+                if self.window.as_ref().map(|w| w.id()) == Some(id) {
+                    "main"
+                } else {
+                    "secondary"
+                },
+            ));
             if key.state == ElementState::Pressed
                 && self.handle_global_shortcut(event_loop, key)
             {
@@ -6789,9 +6843,11 @@ impl ApplicationHandler for App {
                 self.note_focus("main");
                 self.modifiers = ModifiersState::empty();
                 nui::restore_taskbar_group_if_needed();
+                eventlog::note("focus main true");
             }
             WindowEvent::Focused(false) => {
                 self.modifiers = ModifiersState::empty();
+                eventlog::note("focus main false");
             }
             WindowEvent::HoveredFile(path) => {
                 self.refresh_drag_cursor();
@@ -7068,6 +7124,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        log_focus_change(self);
         match nui::take_tray_action() {
             Some(nui::TrayAction::Show) => self.reveal_and_focus_main(),
             Some(nui::TrayAction::Quit) => {
@@ -7222,6 +7279,7 @@ fn attach_parent_console() {
 fn main() {
     attach_parent_console();
     perf::init();
+    eventlog::init();
     let mut file: Option<String> = None;
     let mut tone = false;
     let mut silence = false;

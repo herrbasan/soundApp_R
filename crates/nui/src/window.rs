@@ -660,6 +660,30 @@ pub fn try_start_window_resize(window: &Window, cursor: (f32, f32), win_size: (u
     }
 }
 
+/// Whether `window` currently owns OS keyboard focus. Asked of the OS on every
+/// call — focus can move without any event reaching us (and tracked state goes
+/// stale exactly then), so callers must never infer it from event history.
+#[cfg(target_os = "windows")]
+pub fn is_foreground(window: &winit::window::Window) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> isize;
+    }
+    let Ok(wh) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(h) = wh.as_raw() else {
+        return false;
+    };
+    unsafe { GetForegroundWindow() == h.hwnd.get() }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_foreground(_window: &winit::window::Window) -> bool {
+    false
+}
+
 /// Declarative creation spec for a managed window (`WindowManager::ensure_window`).
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
