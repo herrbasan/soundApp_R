@@ -151,19 +151,32 @@ if (-not $NoSmokeTest) {
         -WorkingDirectory $dist `
         -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -Wait
     $stdout = Get-Content $out -Raw
-    if ($p.ExitCode -ne 0 -or $stdout -notmatch 'output config' -or $stdout -notmatch 'first frame') {
+    $stderr = Get-Content $err -Raw -ErrorAction SilentlyContinue
+    # A headless runner has no audio device: the app then reports
+    # `audio init failed: no output device` and never prints `output config`.
+    # The smoke test is about the dist running standalone (window created,
+    # frame presented, clean exit) — not about the machine having a sound card.
+    $noDevice = "$stdout$stderr" -match 'no output device'
+    $audioOk = ($stdout -match 'output config') -or $noDevice
+    if ($p.ExitCode -ne 0 -or -not $audioOk -or $stdout -notmatch 'first frame') {
         Write-Output $stdout
         Get-Content $err
         throw "dist smoke test failed (exit $($p.ExitCode))"
     }
     Write-Output ($stdout.Trim() -split "`r?`n" | Where-Object { $_ -match 'output config|first frame' })
-    Write-Output 'smoke test: dist runs standalone (silent output, no audio)'
+    if ($noDevice) {
+        Write-Output 'smoke test: dist runs standalone (no audio device on this machine)'
+    } else {
+        Write-Output 'smoke test: dist runs standalone (silent output, no audio)'
+    }
 }
 
 # --- 8. Archive ---------------------------------------------------------------
-# The smoke test (or a manual run) leaves runtime state in the staging
-# folder — the archive ships the app, not a used profile.
-Remove-Item (Join-Path $dist 'perf_log.txt'), (Join-Path $dist 'user.json') -Force -ErrorAction SilentlyContinue
+# The smoke test (or a manual run) leaves runtime state in the staging folder —
+# the archive ships the app, not a used profile. Everything the app writes next
+# to `user.json` is runtime state: config, the perf log and the event log.
+Remove-Item (Join-Path $dist 'perf_log.txt'), (Join-Path $dist 'user.json'), `
+    (Join-Path $dist 'event_log.txt') -Force -ErrorAction SilentlyContinue
 if (-not $NoZip) {
     $zip = Join-Path $root 'dist\soundapp_r.zip'
     if (Test-Path $zip) { Remove-Item $zip -Force }
