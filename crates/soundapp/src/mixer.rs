@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use rtrb::RingBuffer;
 
 use crate::audio::FFmpegStream;
@@ -116,11 +116,11 @@ pub struct MixerAudio {
 
 impl MixerAudio {
     pub fn start() -> Result<Self, String> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or("no default output device")?;
-        let config = device.default_output_config().map_err(|e| e.to_string())?;
+        Self::start_with(None)
+    }
+
+    pub fn start_with(device_name: Option<&str>) -> Result<Self, String> {
+        let (device, config) = crate::audio::output_target(device_name)?;
         let rate = config.sample_rate();
         let channels = config.channels();
         let out_ch = channels as usize;
@@ -202,16 +202,17 @@ impl MixerAudio {
         let resume = self.is_playing() || !had_loaded;
         let position = self.position_secs();
         self.shared.transport_gen.fetch_add(1, Ordering::SeqCst);
-        if resume {
-            self.shared.playing.store(false, Ordering::SeqCst);
-            for (index, sender) in self.stem_tx.iter().enumerate() {
-                if self.shared.slots[index].enabled.load(Ordering::Acquire) {
-                    self.shared.slots[index]
-                        .ready
-                        .store(false, Ordering::Release);
-                    if let Some(tx) = sender {
-                        let _ = tx.send(StemCmd::Seek(position));
-                    }
+        self.shared.playing.store(false, Ordering::SeqCst);
+        // Re-arm every existing stem at the transport position, even while
+        // paused: adding or replacing a stem after an underrun/pause would
+        // otherwise leave the old stems at different source positions.
+        for (index, sender) in self.stem_tx.iter().enumerate() {
+            if self.shared.slots[index].enabled.load(Ordering::Acquire) {
+                self.shared.slots[index]
+                    .ready
+                    .store(false, Ordering::Release);
+                if let Some(tx) = sender {
+                    let _ = tx.send(StemCmd::Seek(position));
                 }
             }
         }
@@ -923,6 +924,44 @@ mod tests {
         );
         assert_eq!(sh.slots[1].played_frames.load(Ordering::Relaxed), 2);
         assert_eq!(sh.transport_frames.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    #[ignore = "requires real output hardware and the reference Mixer media"]
+    fn adding_stem_while_playing_keeps_stems_aligned() {
+        let dir = PathBuf::from(r"D:\Work\_GIT\SoundApp\_Material\mixer_media\Again");
+        let paths = [dir.join("01.m4a"), dir.join("02.m4a")];
+        let added = dir.join("03.m4a");
+        if paths.iter().any(|path| !path.exists()) || !added.exists() {
+            eprintln!("reference Mixer media unavailable");
+            return;
+        }
+        let mut engine = MixerAudio::start().expect("Mixer output");
+        engine.set_master_volume(0.03);
+        engine.load_playlist(&paths);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && engine.position_secs() < 0.6 {
+            engine.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(engine.position_secs() >= 0.6, "initial stems did not run");
+
+        engine.load_stems(&[(2, added)]);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && engine.position_secs() < 1.4 {
+            engine.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let snapshot = engine.sync_snapshot();
+        assert!(snapshot.stems.iter().filter(|s| s.enabled).count() >= 3);
+        for stem in snapshot.stems.iter().filter(|s| s.enabled) {
+            let drift = stem.drift_frames(snapshot.transport_frames).abs();
+            assert!(
+                drift < 480,
+                "stem {} drifted {drift} frames after a live add",
+                stem.slot
+            );
+        }
     }
 
     #[test]

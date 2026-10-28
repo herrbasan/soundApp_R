@@ -12,10 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SOUNDAPP_ROOT: &str = r"D:\Work\_GIT\SoundApp";
 const FFMPEG_INC_DEPS: &str =
     r"D:\Work\_GIT\SoundApp\libs\ffmpeg-napi-interface\deps\ffmpeg\include";
-const FFMPEG_INC_SRC: &str = r"D:\Work\_GIT\SoundApp\libs\ffmpeg-napi-interface\src";
 const FFMPEG_LIB_DIR: &str = r"D:\Work\_GIT\SoundApp\libs\ffmpeg-napi-interface\deps\win\lib";
 const FFMPEG_BIN_DIR: &str = r"D:\Work\_GIT\SoundApp\bin\win_bin";
 
@@ -218,11 +216,18 @@ const RUNTIME_DLLS: [&str; 7] = [
 /// is its SF3 loader dependency.
 const FLUIDSYNTH_DLLS: [&str; 2] = ["libfluidsynth-3.dll", "sndfile.dll"];
 
+fn env_path(name: &str, fallback: &str) -> PathBuf {
+    println!("cargo:rerun-if-env-changed={name}");
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=src/ffmpeg_bridge.cpp");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={FFMPEG_INC_SRC}/decoder.cpp");
-    println!("cargo:rerun-if-changed={FFMPEG_INC_SRC}/decoder.h");
+    println!("cargo:rerun-if-changed=vendor/ffmpeg-decoder/decoder.cpp");
+    println!("cargo:rerun-if-changed=vendor/ffmpeg-decoder/decoder.h");
     println!("cargo:rerun-if-changed=vendor/rubberband/shim.cpp");
     for src in RUBBERBAND_SOURCES {
         println!("cargo:rerun-if-changed=vendor/rubberband/{src}");
@@ -230,6 +235,10 @@ fn main() {
 
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let ffmpeg_include = env_path("SOUNDAPP_FFMPEG_INCLUDE", FFMPEG_INC_DEPS);
+    let ffmpeg_lib = env_path("SOUNDAPP_FFMPEG_LIB", FFMPEG_LIB_DIR);
+    let ffmpeg_bin = env_path("SOUNDAPP_FFMPEG_BIN", FFMPEG_BIN_DIR);
+    let decoder_dir = manifest_dir.join("vendor").join("ffmpeg-decoder");
     let cpp = manifest_dir.join("src").join("ffmpeg_bridge.cpp");
     let obj = out_dir.join("ffmpeg_bridge.obj");
     let lib = out_dir.join("ffmpeg_bridge.lib");
@@ -238,12 +247,64 @@ fn main() {
     let rb_shim = rb_root.join("shim.cpp");
     let rb_obj_dir = out_dir.join("rb");
     std::fs::create_dir_all(&rb_obj_dir).expect("failed to create rb obj dir");
+    let app_ico = manifest_dir
+        .join("assets")
+        .join("icons")
+        .join("app.ico");
+    println!("cargo:rerun-if-changed={}", app_ico.display());
+    let app_rc = out_dir.join("soundapp.rc");
+    let app_res = out_dir.join("soundapp.res");
+    let icon_rc_path = app_ico.to_string_lossy().replace('\\', "/");
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".into());
+    let mut numeric: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect();
+    numeric.resize(4, 0);
+    let numeric_version = format!(
+        "{},{},{},{}",
+        numeric[0], numeric[1], numeric[2], numeric[3]
+    );
+    std::fs::write(
+        &app_rc,
+        format!(
+            "1 ICON \"{icon_rc_path}\"\n\
+             1 VERSIONINFO\n\
+             FILEVERSION {numeric_version}\n\
+             PRODUCTVERSION {numeric_version}\n\
+             FILEFLAGSMASK 0x3fL\n\
+             FILEFLAGS 0x0L\n\
+             FILEOS 0x40004L\n\
+             FILETYPE 0x1L\n\
+             FILESUBTYPE 0x0L\n\
+             BEGIN\n\
+               BLOCK \"StringFileInfo\"\n\
+               BEGIN\n\
+                 BLOCK \"040904b0\"\n\
+                 BEGIN\n\
+                   VALUE \"CompanyName\", \"David Renelt\\0\"\n\
+                   VALUE \"FileDescription\", \"SoundApp R\\0\"\n\
+                   VALUE \"FileVersion\", \"{version}\\0\"\n\
+                   VALUE \"InternalName\", \"soundapp_r\\0\"\n\
+                   VALUE \"OriginalFilename\", \"soundapp_r.exe\\0\"\n\
+                   VALUE \"ProductName\", \"SoundApp R\\0\"\n\
+                   VALUE \"ProductVersion\", \"{version}\\0\"\n\
+                 END\n\
+               END\n\
+               BLOCK \"VarFileInfo\"\n\
+               BEGIN\n\
+                 VALUE \"Translation\", 0x409, 1200\n\
+               END\n\
+             END\n"
+        ),
+    )
+    .expect("failed to write application resource script");
 
     let vcvars = find_vcvars().unwrap_or_else(|| {
         panic!(
             "could not locate vcvars64.bat — install Visual Studio 2022 with the \
-             \"Desktop development with C++\" workload, or set it under {}",
-            SOUNDAPP_ROOT
+             \"Desktop development with C++\" workload. Optional dependency overrides: \
+             SOUNDAPP_FFMPEG_INCLUDE, SOUNDAPP_FFMPEG_LIB, SOUNDAPP_FFMPEG_BIN"
         )
     });
 
@@ -268,6 +329,7 @@ fn main() {
     let bat_body = format!(
         "@echo off\r\n\
          call \"{vcvars}\" || exit /b 1\r\n\
+         rc.exe /nologo /fo \"{res}\" \"{rc}\" || exit /b 1\r\n\
          cl.exe /nologo /c /O2 /EHsc /std:c++17 /MD \
          /I\"{inc_deps}\" /I\"{inc_src}\" \
          \"{cpp}\" /Fo\"{obj}\" || exit /b 1\r\n\
@@ -276,8 +338,10 @@ fn main() {
          \"{shim}\"{rb_paths} /Fo{rb_obj_dir}\\ || exit /b 1\r\n\
          lib.exe /nologo /OUT:\"{lib}\" \"{obj}\"{rb_objs} || exit /b 1\r\n",
         vcvars = vcvars.display(),
-        inc_deps = FFMPEG_INC_DEPS,
-        inc_src = FFMPEG_INC_SRC,
+        res = app_res.display(),
+        rc = app_rc.display(),
+        inc_deps = ffmpeg_include.display(),
+        inc_src = decoder_dir.display(),
         cpp = cpp.display(),
         obj = obj.display(),
         defines = defines,
@@ -309,13 +373,17 @@ fn main() {
             lib.display()
         );
     }
+    if !app_res.exists() {
+        panic!("application resource was not produced at {}", app_res.display());
+    }
+    println!("cargo:rustc-link-arg={}", app_res.display());
     build_openmpt(&manifest_dir, &out_dir, &vcvars);
 
     // --- Link instructions ------------------------------------------------------
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=ffmpeg_bridge");
     println!("cargo:rustc-link-lib=static=openmpt");
-    println!("cargo:rustc-link-search=native={FFMPEG_LIB_DIR}");
+    println!("cargo:rustc-link-search=native={}", ffmpeg_lib.display());
     for lib in LINK_LIBS {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
@@ -338,7 +406,7 @@ fn main() {
     let mut destinations = vec![profile_dir.clone()];
     destinations.push(profile_dir.join("deps"));
 
-    let bin_dir = Path::new(FFMPEG_BIN_DIR);
+    let bin_dir = ffmpeg_bin.as_path();
     for dll in RUNTIME_DLLS {
         let src = bin_dir.join(dll);
         if !src.exists() {

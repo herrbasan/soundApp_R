@@ -148,10 +148,21 @@ const MIDI_NOTE_ON: c_int = 0x90;
 /// skips it, matching the reference app.
 const PERCUSSION_CHANNEL: c_int = 9;
 
-/// Default General-MIDI SoundFont in the portable user-configuration folder.
+/// Default General-MIDI SoundFont: the user's config folder when present, else
+/// the read-only copy shipped inside the installed application directory.
 /// Distribution packages this 30.8 MB file rather than vendoring it into git.
 pub fn default_soundfont() -> PathBuf {
-    crate::config::UserConfig::soundfonts_dir().join("default.sf2")
+    let config = crate::config::UserConfig::soundfonts_dir().join("default.sf2");
+    if config.exists() {
+        return config;
+    }
+    if let Some(bundled) = crate::config::UserConfig::bundled_soundfonts_dir() {
+        let path = bundled.join("default.sf2");
+        if path.exists() {
+            return path;
+        }
+    }
+    config
 }
 
 /// Reference metronome click WAVs (mixed at `set_metronome(true)`), resolved
@@ -255,12 +266,21 @@ impl Default for MidiParams {
     }
 }
 
-/// Every SF2/SF3 in the portable user-configuration `soundfonts/` folder,
-/// sorted by path. Falls back to the default path when the folder is absent or
-/// empty so the select always has one entry and a failed open logs loudly.
+/// Every SF2/SF3 in the user-configuration `soundfonts/` folder plus the
+/// application's bundled folder, sorted by path. A file present in both is
+/// listed once, preferring the user's copy so an upgrade cannot shadow an
+/// edited font. Falls back to the default path when nothing is found so the
+/// select always has one entry and a failed open logs loudly.
 pub fn soundfont_list() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(crate::config::UserConfig::soundfonts_dir()) {
+    let mut dirs = vec![crate::config::UserConfig::soundfonts_dir()];
+    if let Some(bundled) = crate::config::UserConfig::bundled_soundfonts_dir() {
+        dirs.push(bundled);
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             let is_font = path
@@ -268,7 +288,8 @@ pub fn soundfont_list() -> Vec<PathBuf> {
                 .and_then(|e| e.to_str())
                 .map(|e| matches!(e.to_ascii_lowercase().as_str(), "sf2" | "sf3"))
                 .unwrap_or(false);
-            if is_font {
+            let known = out.iter().any(|p| p.file_name() == path.file_name());
+            if is_font && !known {
                 out.push(path);
             }
         }

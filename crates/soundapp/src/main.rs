@@ -12,9 +12,12 @@ mod dsp;
 mod midi;
 mod mixer;
 mod perf;
+mod single_instance;
 mod tracker;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -296,6 +299,12 @@ struct App {
     // show/hide toggles executed in `window_event` where `event_loop` is available.
     secondary_windows: WindowManager,
     pending_window_toggles: Vec<&'static str>,
+    /// MRU focus ring (`"main"` or a secondary key). Hiding the focused window
+    /// restores focus to the previous visible entry, so keyboard shortcuts never
+    /// fall into a focus void.
+    focus_ring: VecDeque<&'static str>,
+    /// File/focus requests from later process launches via the single-instance pipe.
+    open_requests: Option<Receiver<String>>,
     open_window_spec: Option<&'static WindowSpec>,
     /// Last content-driven Parameters window height requested (physical px).
     parameters_window_height: Option<f32>,
@@ -304,12 +313,12 @@ struct App {
     /// Playback parameters shown in the Parameters window (engine mode + the
     /// per-engine sliders). See `ParamState`.
     params: ParamState,
-    selected_device: usize,
-    selected_rate: usize,
-    master_vol: f32,
-    chk_locked: bool,
     sw_hq_mode: bool,
     sw_keep_tray: bool,
+    audio_devices: Vec<String>,
+    selected_device_idx: usize,
+    master_vol: f32,
+    chk_locked: bool,
     scrub_frac: f32,
     selected_track: usize,
     /// Master volume in `0.0..=2.0` (`1.0` = unity); persisted in `user.json`.
@@ -368,19 +377,6 @@ struct App {
     /// Transient status text shown in the Settings footer after a save.
     config_status: String,
 }
-
-const DEVICES: &[&str] = &[
-    "WASAPI Shared · Default Output (48 kHz)",
-    "WASAPI Exclusive · Studio DAC (96 kHz)",
-    "ASIO · RME Babyface Pro FS",
-    "Null Output (Benchmark Sink)",
-];
-
-const SAMPLE_RATES: &[&str] = &[
-    "48,000 Hz (Standard)",
-    "96,000 Hz (HQ Oversampled)",
-    "192,000 Hz (Ultra HQ)",
-];
 
 /// Phase 1.5 secondary windows (SoundApp `P` / `N` / `M` / `S` / `H`), all undecorated
 /// like the primary window and managed by `nui::WindowManager`.
@@ -457,16 +453,6 @@ fn window_header_icon(key: &str) -> &'static str {
     }
 }
 
-fn window_header_badge(key: &str) -> &'static str {
-    match key {
-        "parameters" => "LIVE PARAMS",
-        "monitoring" => "DSP TAP",
-        "mixer" => "STEMS",
-        "settings" => "CONFIG",
-        _ => "SHORTCUTS",
-    }
-}
-
 /// Mixer strips are created only for real media paths; no synthetic demo audio.
 fn default_mixer_stems() -> Vec<MixerStem> {
     Vec::new()
@@ -490,7 +476,8 @@ fn synth_dsp_frames(t: f32, n: usize) -> Vec<(f32, f32)> {
 /// Keyboard-shortcut rows for the Help window's two-column table.
 const HELP_ROWS: &[(&str, &str)] = &[
     ("Space", "Play / Pause transport"),
-    ("Left / Right", "Seek -5 s / +5 s"),
+    ("Left / Right", "Previous / next track"),
+    ("Ctrl+Left / Right", "Seek -10 s / +10 s"),
     ("Up / Down", "Master volume +5% / -5%"),
     ("L", "Toggle loop"),
     ("C", "Show / hide transport controls"),
@@ -500,13 +487,24 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("S", "Settings window"),
     ("H", "This Help window"),
     ("F", "Toggle Swash / Fontdue engine"),
-    ("T", "Toggle dark / light theme"),
+    ("X", "Toggle dark / light theme"),
     ("Ctrl + / - / 0", "UI zoom in / out / reset"),
     ("Ctrl+C / X / V", "Copy / Cut / Paste text"),
     ("Tab / Shift+Tab", "Move keyboard focus"),
     ("Dbl-Click / Right-Click", "Reset slider / fader to default"),
     ("Esc", "Close window / quit app"),
 ];
+
+fn window_toggle_for_key(ch: &str) -> Option<&'static str> {
+    match ch.chars().next()?.to_ascii_lowercase() {
+        'p' => Some("parameters"),
+        'n' => Some("monitoring"),
+        'm' => Some("mixer"),
+        's' => Some("settings"),
+        'h' => Some("help"),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Small draw helpers shared by the Monitoring / Mixer windows
@@ -680,7 +678,7 @@ fn master_volume_pill(ui: &mut Ui, r: Rect, vol: &mut f32, id: u32) {
         icon_sz,
         t.text_dim,
     );
-    let track_x0 = r.x + t.rem * 1.5;
+    let track_x0 = r.x + t.rem * 2.0;
     let track_w = (r.x + r.w - t.rem * 0.6 - track_x0).max(1.0);
 
     ui.state.register_focusable(id);
@@ -2445,6 +2443,12 @@ impl App {
                 audio.set_soundfont(font.clone());
             }
         }
+        let audio_devices = audio::output_device_names();
+        let selected_device_idx = config
+            .output_device_name()
+            .and_then(|name| audio_devices.iter().position(|d| d == name))
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
         let (scan_tx, job_rx) = std::sync::mpsc::channel::<(u64, ScanJob)>();
         let (res_tx, scan_rx) = std::sync::mpsc::channel::<(u64, ScanOutcome)>();
         let _ = std::thread::Builder::new()
@@ -2527,6 +2531,8 @@ impl App {
         } else {
             Theme::light(1.0).base
         };
+        let mut secondary_windows = WindowManager::new(theme_base);
+        secondary_windows.set_icon_resource(1);
         Self {
             start: Instant::now(),
             reported: false,
@@ -2558,18 +2564,20 @@ impl App {
             pace_frames: 0,
             pace_slow: 0,
 
-            secondary_windows: WindowManager::new(theme_base),
+            secondary_windows: secondary_windows,
             pending_window_toggles: Vec::new(),
+            focus_ring: VecDeque::from(["main"]),
+            open_requests: None,
             open_window_spec: None,
             parameters_window_height: None,
 
             params: ParamState::default(),
-            selected_device: 0,
-            selected_rate: 0,
-            master_vol: config.master_vol.clamp(0.0, 2.0),
-            chk_locked: config.chk_locked,
             sw_hq_mode: config.sw_hq_mode,
             sw_keep_tray: config.sw_keep_tray,
+            audio_devices,
+            selected_device_idx,
+            master_vol: config.master_vol.clamp(0.0, 2.0),
+            chk_locked: config.chk_locked,
             scrub_frac: 0.0,
             selected_track: 0,
             show_controls: config.show_controls,
@@ -2615,6 +2623,12 @@ impl App {
         self.config.chk_locked = self.chk_locked;
         self.config.sw_hq_mode = self.sw_hq_mode;
         self.config.sw_keep_tray = self.sw_keep_tray;
+        self.config.output_device = self
+            .selected_device_idx
+            .checked_sub(1)
+            .and_then(|idx| self.audio_devices.get(idx))
+            .cloned()
+            .unwrap_or_default();
         self.config.selected_soundfont = self.selected_soundfont;
         match self.config.save() {
             Ok(()) => {
@@ -2851,6 +2865,93 @@ impl App {
         }
     }
 
+    /// Rebuild the output stream for the selected device/sample rate while
+    /// preserving the current file, position, transport state and parameters.
+    fn restart_audio_output(&mut self) {
+        let device = self
+            .selected_device_idx
+            .checked_sub(1)
+            .and_then(|idx| self.audio_devices.get(idx))
+            .cloned();
+        let (file, position, playing, looping, volume) = match &self.audio {
+            Some(audio) => (
+                audio.current_file(),
+                audio.position_secs(),
+                audio.is_playing(),
+                self.loop_enabled,
+                self.master_vol,
+            ),
+            None => (None, 0.0, false, self.loop_enabled, self.master_vol),
+        };
+        let params = self.playback_params();
+        let font = self.soundfonts.get(self.selected_soundfont).cloned();
+        let mixer_open = self.secondary_windows.is_visible("mixer");
+        let mixer_playing = self
+            .mixer_audio
+            .as_ref()
+            .map(|engine| engine.is_playing())
+            .unwrap_or(false);
+        let mixer_position = self
+            .mixer_audio
+            .as_ref()
+            .map(|engine| engine.position_secs())
+            .unwrap_or(0.0);
+        let mixer_loads: Vec<(usize, PathBuf)> = self
+            .mixer_stems
+            .iter()
+            .filter_map(|stem| stem.path.clone().map(|path| (stem.slot, path)))
+            .collect();
+        match audio::start_with(Source::Silence, device.as_deref()) {
+            Ok(audio) => {
+                audio.set_volume(volume);
+                audio.set_params(params);
+                audio.set_loop(looping);
+                if let Some(font) = font {
+                    audio.set_soundfont(font);
+                }
+                if let Some(file) = file {
+                    audio.load_file(file);
+                    if position > 0.001 {
+                        audio.seek(position);
+                    }
+                    if playing {
+                        audio.play();
+                    } else {
+                        audio.pause();
+                    }
+                }
+                self.audio = Some(audio);
+                if mixer_open {
+                    match mixer::MixerAudio::start_with(device.as_deref()) {
+                        Ok(mut engine) => {
+                            engine.set_master_volume(self.mixer_master_vol);
+                            engine.set_loop(self.mixer_loop);
+                            if !mixer_loads.is_empty() {
+                                engine.load_stems(&mixer_loads);
+                                if mixer_position > 0.001 {
+                                    engine.seek_secs(mixer_position);
+                                }
+                                engine.set_playing(mixer_playing);
+                            }
+                            self.mixer_audio = Some(engine);
+                        }
+                        Err(error) => {
+                            eprintln!("[mixer] output restart failed: {error}");
+                            self.mixer_audio = None;
+                        }
+                    }
+                }
+                self.config_status = format!(
+                    "Output: {} / device default rate",
+                    device.as_deref().unwrap_or("System Default")
+                );
+            }
+            Err(error) => {
+                self.config_status = format!("Output change failed: {error}");
+            }
+        }
+    }
+
     /// New-track rule: transient playback parameters reset to their defaults
     /// unless "Lock Parameters Across Tracks" is set. The reset is pushed to
     /// the engine in the same breath — `Cmd::SetParams` is queued before
@@ -2876,6 +2977,23 @@ impl App {
             cur + 1
         } else if wrap {
             0
+        } else {
+            return false;
+        };
+        self.load_playlist_index(idx);
+        true
+    }
+
+    /// Load the previous playlist entry (wrapping only when `wrap` is set).
+    fn retreat_track(&mut self, wrap: bool) -> bool {
+        if self.playlist.is_empty() {
+            return false;
+        }
+        let cur = self.selected_track.min(self.playlist.len() - 1);
+        let idx = if cur > 0 {
+            cur - 1
+        } else if wrap {
+            self.playlist.len() - 1
         } else {
             return false;
         };
@@ -2930,6 +3048,73 @@ impl App {
                     recursive: recursive_dirs,
                 },
             ));
+        }
+    }
+
+    /// Drain paths forwarded by later launches. An empty message is a plain
+    /// "bring the player forward" request.
+    fn poll_open_requests(&mut self) {
+        let mut messages = Vec::new();
+        if let Some(receiver) = &self.open_requests {
+            while let Ok(message) = receiver.try_recv() {
+                messages.push(message);
+            }
+        }
+        for message in messages {
+            if !message.is_empty() {
+                perf::note(&format!("single-instance open {message}"));
+                let path = PathBuf::from(&message);
+                if path.exists() {
+                    self.open_path(path, false, true);
+                } else {
+                    eprintln!("[single-instance] forwarded path not found: {message}");
+                }
+            } else {
+                perf::note("single-instance focus request");
+            }
+            self.reveal_and_focus_main();
+        }
+    }
+
+    fn reveal_and_focus_main(&mut self) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.request_reveal();
+        } else if let Some(window) = &self.window {
+            window.set_visible(true);
+        }
+        if let Some(window) = &self.window {
+            let _ = window.set_minimized(false);
+            nui::focus_window_now(window);
+        }
+        self.note_focus("main");
+    }
+
+    /// Keep the shell tray icon in sync with the Settings checkbox.
+    fn sync_tray_icon(&mut self) {
+        if self.sw_keep_tray {
+            if let Some(window) = &self.window {
+                nui::install_tray_icon(window, 1, "SoundApp R");
+            }
+        } else {
+            nui::remove_tray_icon();
+        }
+    }
+
+    /// Hide the player to the tray when the option is enabled; otherwise close.
+    fn hide_to_tray(&mut self) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.cloak_and_hide();
+        }
+        perf::note("hidden to system tray");
+    }
+
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self.sw_keep_tray {
+            self.hide_to_tray();
+        } else {
+            self.quitting = true;
+            self.quit_at = Some(Instant::now());
+            event_loop.exit();
         }
     }
 
@@ -3797,10 +3982,14 @@ impl App {
             }
         }
         if intents.close {
-            self.quitting = true;
-            self.quit_at = Some(Instant::now());
-            if let Some(w) = &self.window {
-                w.request_redraw();
+            if self.sw_keep_tray {
+                self.hide_to_tray();
+            } else {
+                self.quitting = true;
+                self.quit_at = Some(Instant::now());
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
         }
     }
@@ -3953,6 +4142,46 @@ impl App {
         }
     }
 
+    /// Record a window as the most recently focused SoundApp window.
+    fn note_focus(&mut self, key: &'static str) {
+        self.focus_ring.retain(|entry| *entry != key);
+        self.focus_ring.push_front(key);
+        while self.focus_ring.len() > 8 {
+            self.focus_ring.pop_back();
+        }
+    }
+
+    /// After hiding `hidden`, focus the newest still-visible window in the ring
+    /// (falling back to the player). Without this, closing a secondary window can
+    /// leave the process with no foreground window and keyboard shortcuts stop.
+    fn restore_focus_after_hide(&mut self, hidden: &'static str) {
+        self.focus_ring.retain(|entry| *entry != hidden);
+        let target = self
+            .focus_ring
+            .iter()
+            .copied()
+            .find(|key| {
+                if *key == "main" {
+                    self.window.is_some()
+                } else {
+                    self.secondary_windows.is_visible(key)
+                }
+            })
+            .unwrap_or("main");
+        if target == "main" {
+            if let Some(window) = &self.window {
+                nui::focus_window_now(window);
+            }
+        } else if let Some(managed) = self
+            .secondary_windows
+            .windows
+            .iter()
+            .find(|window| window.key == target)
+        {
+            nui::focus_window_now(&managed.window);
+        }
+    }
+
     /// Execute queued secondary-window show/hide toggles. Toggles are queued from the
     /// keyboard shortcuts and the main window's toggle buttons (both handled during
     /// scene build, where no `event_loop` exists) and executed here from the primary
@@ -3982,6 +4211,11 @@ impl App {
                     self.open_mixer_from_playlist();
                 }
             }
+            if was_visible {
+                self.restore_focus_after_hide(key);
+            } else {
+                self.note_focus(key);
+            }
         }
         // The toggle buttons' Primary/Outline variants follow visibility — refresh.
         if let Some(w) = &self.window {
@@ -3995,7 +4229,7 @@ impl App {
     /// `TextSystem`.
     fn secondary_window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
         id: WindowId,
         event: WindowEvent,
     ) {
@@ -4019,6 +4253,7 @@ impl App {
                 if key == "mixer" {
                     self.close_mixer();
                 }
+                self.restore_focus_after_hide(key);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -4028,6 +4263,10 @@ impl App {
                     w.size = (sz.width, sz.height);
                     w.window.request_redraw();
                 }
+            }
+            WindowEvent::Focused(true) => {
+                self.note_focus(key);
+                nui::restore_taskbar_group_if_needed();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
@@ -4178,6 +4417,28 @@ impl App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
+                    if let Key::Character(ch) = &event.logical_key {
+                        if let Some(target) = window_toggle_for_key(ch) {
+                            self.pending_window_toggles.push(target);
+                            self.process_window_toggles(event_loop);
+                            return;
+                        }
+                        if !self.modifiers.control_key()
+                            && (ch.eq_ignore_ascii_case("x") || ch.eq_ignore_ascii_case("t"))
+                        {
+                            self.dark_mode = !self.dark_mode;
+                            self.secondary_windows.request_redraw_all();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
+                        if !self.modifiers.control_key() && ch.eq_ignore_ascii_case("c") {
+                            self.show_controls = !self.show_controls;
+                            self.apply_zoom();
+                            return;
+                        }
+                    }
                     if key == "mixer"
                         && self.modifiers.control_key()
                         && self.modifiers.shift_key()
@@ -4217,6 +4478,7 @@ impl App {
                             if key == "mixer" {
                                 self.close_mixer();
                             }
+                            self.restore_focus_after_hide(key);
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }
@@ -4249,6 +4511,9 @@ impl App {
         // check asks the linked library, the MIDI check its extensions).
         let tracker_page = key == "parameters" && self.tracker_source_active();
         let midi_page = key == "parameters" && !tracker_page && self.midi_source_active();
+        let mut settings_output_changed = false;
+        let mut settings_hq_changed = false;
+        let mut settings_tray_changed = false;
 
         // Phase 1 — build the scene (borrows: mw.scene/ui_state + self.text_sys).
         let (w, h, close_clicked, shot) = {
@@ -4313,27 +4578,22 @@ impl App {
                 ui.viewport = (pw, ph);
 
                 // The Parameters window is audio-pipeline only now.
-                let mixer_badge = format!("{} STEMS", self.mixer_stems.len());
-                let (hdr_icon, hdr_title, hdr_badge): (&str, &str, &str) = if key == "parameters" {
+                let (hdr_icon, hdr_title): (&str, &str) = if key == "parameters" {
                     if tracker_page {
-                        (ICON_TUNE, "PARAMETERS - TRACKER (MOD)", "")
+                        (ICON_TUNE, "PARAMETERS - TRACKER (MOD)")
                     } else if midi_page {
-                        (ICON_TUNE, "PARAMETERS - MIDI", "")
+                        (ICON_TUNE, "PARAMETERS - MIDI")
                     } else {
-                        (ICON_TUNE, "PARAMETERS - AUDIO", "")
+                        (ICON_TUNE, "PARAMETERS - AUDIO")
                     }
                 } else if key == "monitoring" {
-                    (ICON_EQ, "AUDIO MONITORING", "REALTIME DSP")
+                    (ICON_EQ, "AUDIO MONITORING")
                 } else if key == "mixer" {
-                    (ICON_EQ, "MULTITRACK PREVIEW", &mixer_badge)
+                    (ICON_EQ, "MULTITRACK PREVIEW")
                 } else {
-                    (
-                        window_header_icon(key),
-                        spec.title,
-                        window_header_badge(key),
-                    )
+                    (window_header_icon(key), spec.title)
                 };
-                let (hdr_h, close) = ui.secondary_window_header(pw, hdr_title, hdr_icon, hdr_badge);
+                let (hdr_h, close) = ui.secondary_window_header(pw, hdr_title, hdr_icon, "");
                 close_clicked = close;
                 let m = Length::Rem(if key == "parameters" { 2.25 } else { 1.25 })
                     .resolve(rem)
@@ -4999,7 +5259,7 @@ impl App {
                                 inner.x,
                                 matrix_y,
                                 inner.w,
-                                (seek_y - matrix_y - gap).max(40.0),
+                                (seek_y - matrix_y - gap * 3.0).max(40.0),
                             );
                             let n = self.mixer_stems.len();
                             let col_gap = Length::Rem(0.4).resolve(rem).round();
@@ -5199,7 +5459,7 @@ impl App {
                                     FontFace::SemiBold,
                                     ui.font_engine,
                                     &num,
-                                    (lbl_r.x + 5.0).round(),
+                                    (lbl_r.x + (rem * 0.45).round()).round(),
                                     (lbl_r.y + lbl_r.h * 0.5 + lfs * 0.34).round(),
                                     lfs,
                                     theme.text_dim,
@@ -5239,49 +5499,105 @@ impl App {
                                 }
                             }
 
-                            // `+` add-stem column (up to 20 stems).
+                            // `+` add-stem column: a drop target, not a button. The
+                            // whole column adds files dropped onto it.
                             let plus_r =
                                 Rect::new(matrix.x + matrix.w - plus_w, matrix.y, plus_w, matrix.h);
                             self.mixer_add_target = Some(plus_r);
-                            let _ = ui.button(1340, plus_r, "", ICON_ADD, ButtonVariant::Outline);
-
-                            // ---- Bottom seekbar + time readouts ----
-                            let bar_h = 6.0f32;
-                            let bar_r = Rect::new(inner.x, seek_y + 3.0, inner.w, bar_h);
+                            let add_active = ui.state.hovered_file.is_some();
+                            let add_border = if add_active {
+                                theme.highlight
+                            } else {
+                                theme.border1
+                            };
+                            let add_fill = if add_active {
+                                rgba(255, 255, 255, if theme.dark { 22 } else { 40 })
+                            } else {
+                                theme.base
+                            };
                             ui.scene.rounded_rect(
-                                bar_r.x,
-                                bar_r.y,
-                                bar_r.w,
-                                bar_h,
-                                bar_h * 0.5,
-                                theme.base,
-                                theme.border1,
+                                plus_r.x,
+                                plus_r.y,
+                                plus_r.w,
+                                plus_r.h,
+                                theme.radius2(),
+                                add_fill,
+                                add_border,
                                 1.0,
                             );
-                            let played = bar_r.w * self.mixer_pos_frac.clamp(0.0, 1.0);
-                            if played > 0.5 {
-                                ui.scene.rounded_rect(
-                                    bar_r.x,
-                                    bar_r.y,
-                                    played,
-                                    bar_h,
-                                    bar_h * 0.5,
-                                    rgb(180, 180, 180),
-                                    (0, 0, 0, 0),
-                                    0.0,
-                                );
-                            }
+                            let icon_sz = (rem * 1.5).round();
+                            ui.scene.icon_centered(
+                                ui.text_sys,
+                                ICON_ADD,
+                                plus_r.x + plus_r.w * 0.5,
+                                plus_r.y + plus_r.h * 0.5 - rem * 0.8,
+                                icon_sz,
+                                if add_active {
+                                    theme.highlight
+                                } else {
+                                    theme.text_dim
+                                },
+                            );
+                            draw_text_at(
+                                &mut ui,
+                                plus_r.x + plus_r.w * 0.5,
+                                plus_r.y + plus_r.h * 0.5 + rem * 0.5,
+                                "DROP",
+                                FontFace::SemiBold,
+                                theme.font_xsmall(),
+                                if add_active {
+                                    theme.highlight
+                                } else {
+                                    theme.text_dim
+                                },
+                            );
+                            draw_text_at(
+                                &mut ui,
+                                plus_r.x + plus_r.w * 0.5,
+                                plus_r.y + plus_r.h * 0.5 + rem * 1.5,
+                                "AUDIO",
+                                FontFace::Regular,
+                                theme.font_xsmall(),
+                                theme.text_muted,
+                            );
+
+                            // ---- Bottom seekbar + time readouts ----
+                            // Same flat track height/colors as the main player's
+                            // progress bar, with a taller hit area for touch.
+                            let scale = rem / 16.0;
+                            let bar_h = (5.0 * scale).round().max(4.0);
+                            let bar_r = Rect::new(
+                                inner.x,
+                                (seek_y + (seek_h - bar_h) * 0.5).round(),
+                                inner.w,
+                                bar_h,
+                            );
+                            let track_bar_bg = if theme.dark {
+                                rgb(68, 68, 68)
+                            } else {
+                                rgb(180, 180, 180)
+                            };
+                            let track_bar_fill = if theme.dark {
+                                rgb(180, 180, 180)
+                            } else {
+                                rgb(50, 50, 50)
+                            };
                             let sid = 1305u32;
-                            ui.state.register_focusable(sid);
-                            let hit = Rect::new(bar_r.x, bar_r.y - 5.0, bar_r.w, bar_h + 10.0);
-                            let shov = ui.state.can_hover(sid, hit);
-                            if shov && ui.state.mouse_pressed {
-                                ui.state.active_id = Some(sid);
-                            }
-                            if ui.state.active_id == Some(sid) && ui.state.mouse_down {
-                                self.mixer_pos_frac =
-                                    ((ui.state.cursor.0 - bar_r.x) / bar_r.w).clamp(0.0, 1.0);
-                            }
+                            let hit = Rect::new(
+                                inner.x,
+                                bar_r.y - 14.0 * scale,
+                                inner.w,
+                                14.0 * scale + bar_h + 20.0 * scale,
+                            );
+                            ui.flat_slider(
+                                sid,
+                                bar_r,
+                                hit,
+                                &mut self.mixer_pos_frac,
+                                0.0,
+                                1.0,
+                                [track_bar_bg, track_bar_fill],
+                            );
                             if ui.state.active_id == Some(sid) && ui.state.mouse_released {
                                 if let Some(engine) = &mut self.mixer_audio {
                                     engine.seek_secs(
@@ -5361,21 +5677,27 @@ impl App {
                         // Phase 3.5 — Settings (persistent user.json).
                         // ====================================================
                         "settings" => {
+                            let mut device_opts = vec!["System Default".to_string()];
+                            device_opts.extend(self.audio_devices.iter().cloned());
+                            let device_refs: Vec<&str> =
+                                device_opts.iter().map(String::as_str).collect();
+                            let mut device_changed = false;
+                            let mut hq_changed = false;
                             ui.nui_card(body, |ui| {
                                 let sel_dev = ui.input_group("Default Output Device");
-                                let sel_rate = ui.input_group("Default Sample Rate");
                                 let [c1, c2] = ui.take_cols(
                                     Length::rem(1.8),
                                     Length::rem(1.0),
                                     [Length::fill(), Length::fill()],
                                 );
-                                ui.checkbox(
+                                settings_tray_changed = ui.checkbox(
                                     752,
                                     c1,
                                     "Keep Running in System Tray",
                                     &mut self.sw_keep_tray,
                                 );
-                                ui.checkbox(753, c2, "HQ Oversampling", &mut self.sw_hq_mode);
+                                hq_changed =
+                                    ui.checkbox(753, c2, "HQ Oversampling", &mut self.sw_hq_mode);
                                 let [c3, c4] = ui.take_cols(
                                     Length::rem(1.8),
                                     Length::rem(1.0),
@@ -5427,10 +5749,16 @@ impl App {
                                     apply_r.w,
                                     theme.text_muted,
                                 );
-                                // Render selects last so open popups layer above siblings
-                                ui.select(760, sel_dev, DEVICES, &mut self.selected_device);
-                                ui.select(750, sel_rate, SAMPLE_RATES, &mut self.selected_rate);
+                                // Render selects last so open popups layer above siblings.
+                                device_changed = ui.select(
+                                    760,
+                                    sel_dev,
+                                    &device_refs,
+                                    &mut self.selected_device_idx,
+                                );
                             });
+                            settings_output_changed = device_changed;
+                            settings_hq_changed = hq_changed;
                         }
 
                         // ---- Help: two-column keyboard-shortcut table ----
@@ -5502,6 +5830,16 @@ impl App {
             (w, h, close_clicked, shot)
         };
 
+        if settings_output_changed {
+            self.restart_audio_output();
+        }
+        if settings_hq_changed {
+            self.sync_pipeline_and_params();
+        }
+        if settings_tray_changed {
+            self.sync_tray_icon();
+        }
+
         if let Some(required) = parameters_required_height {
             if let Some(mw) = self.secondary_windows.find_by_key_mut("parameters") {
                 let scale = mw.window.scale_factor() as f32;
@@ -5562,18 +5900,18 @@ impl App {
             }
         }
         if params_intents.open_soundfonts_folder {
-            let font = self
-                .soundfonts
-                .get(self.selected_soundfont)
-                .cloned()
-                .unwrap_or_else(midi::default_soundfont);
-            if let Some(folder) = font.parent() {
-                if let Err(e) = std::process::Command::new("explorer.exe")
-                    .arg(folder)
+            // Always the user-writable config folder: the bundled folder inside
+            // Program Files is read-only and offering it for font drops only
+            // produces failed copies.
+            let folder = crate::config::UserConfig::soundfonts_dir();
+            let opened = std::fs::create_dir_all(&folder).and_then(|_| {
+                std::process::Command::new("explorer.exe")
+                    .arg(&folder)
                     .spawn()
-                {
-                    eprintln!("[parameters] failed to open SoundFont folder: {e}");
-                }
+                    .map(|_| ())
+            });
+            if let Err(e) = opened {
+                eprintln!("[parameters] failed to open SoundFont folder: {e}");
             }
         }
 
@@ -5587,6 +5925,7 @@ impl App {
             if key == "mixer" {
                 self.close_mixer();
             }
+            self.restore_focus_after_hide(key);
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -5643,12 +5982,15 @@ impl ApplicationHandler for App {
         let main_backend = self.main_backend();
         let (window, mut renderer) =
             Renderer::new(event_loop, attrs, main_backend, self.theme_base());
+        nui::set_window_icon_from_executable(&window, 1);
+        nui::install_taskbar_group(&window);
         let sz = window.inner_size();
         self.size = (sz.width, sz.height);
         self.window = Some(window.clone());
         renderer.request_reveal();
         self.renderer = Some(renderer);
         self.render();
+        self.sync_tray_icon();
 
         // Phase 1.5: `--open-window <key>` pops the requested secondary window at
         // startup; a `--screenshot` alongside it captures THAT window, not the primary.
@@ -5677,7 +6019,7 @@ impl ApplicationHandler for App {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::Resized(sz) => {
                 self.size = (sz.width, sz.height);
                 if let Some(w) = &self.window {
@@ -5690,6 +6032,10 @@ impl ApplicationHandler for App {
                     self.size = (sz.width, sz.height);
                     w.request_redraw();
                 }
+            }
+            WindowEvent::Focused(true) => {
+                self.note_focus("main");
+                nui::restore_taskbar_group_if_needed();
             }
             WindowEvent::HoveredFile(path) => {
                 self.refresh_drag_cursor();
@@ -5824,7 +6170,7 @@ impl ApplicationHandler for App {
                             } else if focused_text {
                                 self.ui_state.key_cmds.push(KeyCmd::Escape);
                             } else {
-                                event_loop.exit();
+                                self.request_close(event_loop);
                                 return;
                             }
                         }
@@ -5837,15 +6183,23 @@ impl ApplicationHandler for App {
                         Key::Named(NamedKey::ArrowLeft) => {
                             if focused_text {
                                 self.ui_state.key_cmds.push(KeyCmd::Left);
-                            } else if let Some(a) = &self.audio {
-                                a.seek((a.position_secs() - 5.0).max(0.0));
+                            } else if self.modifiers.control_key() {
+                                if let Some(a) = &self.audio {
+                                    a.seek((a.position_secs() - 10.0).max(0.0));
+                                }
+                            } else if self.retreat_track(true) {
+                                self.animate = true;
                             }
                         }
                         Key::Named(NamedKey::ArrowRight) => {
                             if focused_text {
                                 self.ui_state.key_cmds.push(KeyCmd::Right);
-                            } else if let Some(a) = &self.audio {
-                                a.seek(a.position_secs() + 5.0);
+                            } else if self.modifiers.control_key() {
+                                if let Some(a) = &self.audio {
+                                    a.seek(a.position_secs() + 10.0);
+                                }
+                            } else if self.advance_track(true) {
+                                self.animate = true;
                             }
                         }
                         Key::Named(NamedKey::ArrowUp) if !focused_text => {
@@ -5907,8 +6261,13 @@ impl ApplicationHandler for App {
                                 FontEngine::Fontdue => FontEngine::Swash,
                             };
                         }
-                        Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("t") => {
+                        Key::Character(ch)
+                            if !focused_text
+                                && (ch.eq_ignore_ascii_case("x")
+                                    || ch.eq_ignore_ascii_case("t")) =>
+                        {
                             self.dark_mode = !self.dark_mode;
+                            self.secondary_windows.request_redraw_all();
                         }
                         Key::Character(ch)
                             if (!focused_text || self.modifiers.control_key())
@@ -5938,22 +6297,13 @@ impl ApplicationHandler for App {
                             self.apply_zoom();
                         }
                         Key::Character(ch)
-                            if !focused_text
-                                && matches!(
-                                    ch.as_str(),
-                                    "p" | "P" | "n" | "N" | "m" | "M" | "s" | "S" | "h" | "H"
-                                ) =>
+                            if !focused_text && window_toggle_for_key(ch).is_some() =>
                         {
                             // Queue the secondary-window toggle; executed right after this
                             // frame in the RedrawRequested arm where `event_loop` lives.
-                            let key = match ch.as_str() {
-                                "p" | "P" => "parameters",
-                                "n" | "N" => "monitoring",
-                                "m" | "M" => "mixer",
-                                "s" | "S" => "settings",
-                                _ => "help",
-                            };
-                            self.pending_window_toggles.push(key);
+                            if let Some(key) = window_toggle_for_key(ch) {
+                                self.pending_window_toggles.push(key);
+                            }
                         }
                         _ => {
                             if focused_text && !self.modifiers.control_key() {
@@ -5982,6 +6332,14 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match nui::take_tray_action() {
+            Some(nui::TrayAction::Show) => self.reveal_and_focus_main(),
+            Some(nui::TrayAction::Quit) => {
+                self.quitting = true;
+                self.quit_at = Some(Instant::now());
+            }
+            None => {}
+        }
         if let Some(q) = self.quit_at {
             if Instant::now() >= q {
                 if !self.quitting {
@@ -5993,6 +6351,7 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        self.poll_open_requests();
         self.poll_transport_and_scans();
         self.poll_mixer();
 
@@ -6059,6 +6418,12 @@ impl ApplicationHandler for App {
         self.config.chk_locked = self.chk_locked;
         self.config.sw_hq_mode = self.sw_hq_mode;
         self.config.sw_keep_tray = self.sw_keep_tray;
+        self.config.output_device = self
+            .selected_device_idx
+            .checked_sub(1)
+            .and_then(|idx| self.audio_devices.get(idx))
+            .cloned()
+            .unwrap_or_default();
         self.config.selected_soundfont = self.selected_soundfont;
         self.flush_pacing("exit");
         if let Err(e) = self.config.save() {
@@ -6211,6 +6576,36 @@ fn main() {
         )
     };
 
+    // Normal playback launches are single-instance. Harness flags (render,
+    // latency probe, screenshot, nopaint, silence/tone) stay independent so
+    // benchmarks can run alongside the player.
+    let exclusive_launch = render_in.is_none()
+        && !latency_probe
+        && app_screenshot.is_none()
+        && seconds.is_none()
+        && !nopaint
+        && !tone
+        && !silence
+        && open_window.is_none();
+    let mut open_requests: Option<Receiver<String>> = None;
+    if exclusive_launch {
+        match single_instance::claim() {
+            Ok(true) => {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                single_instance::start_server(sender);
+                open_requests = Some(receiver);
+            }
+            Ok(false) => {
+                let forwarded = file.as_deref().map(PathBuf::from);
+                if !single_instance::forward(forwarded.as_deref()) {
+                    eprintln!("[single-instance] running player did not accept the request");
+                }
+                return;
+            }
+            Err(error) => eprintln!("[single-instance] {error}; continuing without the gate"),
+        }
+    }
+
     // Offline render: same DSP path as live playback, no audio device, no
     // window. Runs faster than realtime and exits.
     if let Some(in_path) = render_in {
@@ -6336,6 +6731,7 @@ fn main() {
         std::process::exit(0);
     }
 
+    let cfg = UserConfig::load();
     let source = if tone {
         Source::Tone { hz: 440.0 }
     } else {
@@ -6344,7 +6740,7 @@ fn main() {
         Source::Silence
     };
 
-    let audio = match audio::start(source) {
+    let audio = match audio::start_with(source, cfg.output_device_name()) {
         Ok(a) => Some(a),
         Err(e) => {
             eprintln!("[poc] audio init failed: {e}");
@@ -6355,10 +6751,9 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let quit_at = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
-    // Phase 3.5 — restore the persisted configuration before building the app.
-    let cfg = UserConfig::load();
     println!("[poc] config: {}", UserConfig::path().display());
     let mut app = App::new(audio, animate, quit_at, backend, font_engine, cfg);
+    app.open_requests = open_requests;
     app.backend_locked = backend_locked;
     // Push the initial UI state into the engine (gain + the full parameter set).
     let initial_params = app.playback_params();

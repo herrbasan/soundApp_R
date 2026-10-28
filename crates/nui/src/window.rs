@@ -148,6 +148,427 @@ pub fn primary_mouse_button_down() -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
+mod taskbar_group {
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+        fn CallWindowProcW(prev: isize, hwnd: isize, msg: u32, w: usize, l: isize) -> isize;
+        fn DefWindowProcW(hwnd: isize, msg: u32, w: usize, l: isize) -> isize;
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+        fn IsWindow(hwnd: isize) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn LoadImageW(
+            instance: isize,
+            name: *const u16,
+            kind: u32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> isize;
+        fn GetModuleHandleW(name: *const u16) -> isize;
+        fn CreatePopupMenu() -> isize;
+        fn AppendMenuW(menu: isize, flags: u32, id: usize, item: *const u16) -> i32;
+        fn TrackPopupMenu(
+            menu: isize,
+            flags: u32,
+            x: i32,
+            y: i32,
+            reserved: i32,
+            hwnd: isize,
+            rect: *const c_void,
+        ) -> i32;
+        fn DestroyMenu(menu: isize) -> i32;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn PostMessageW(hwnd: isize, msg: u32, w: usize, l: isize) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn Shell_NotifyIconW(message: u32, data: *mut NotifyIconDataW) -> i32;
+    }
+
+    use std::ffi::OsStr;
+    use std::os::raw::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct NotifyIconDataW {
+        cb_size: u32,
+        hwnd: isize,
+        uid: u32,
+        flags: u32,
+        callback_message: u32,
+        icon: isize,
+        tip: [u16; 128],
+        state: u32,
+        state_mask: u32,
+        info: [u16; 256],
+        timeout_or_version: u32,
+        info_title: [u16; 64],
+        info_flags: u32,
+        guid_item: [u8; 16],
+        balloon_icon: isize,
+    }
+
+    const GWLP_WNDPROC: i32 = -4;
+    const WM_ACTIVATE: u32 = 0x0006;
+    const WM_SHOWWINDOW: u32 = 0x0018;
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_MINIMIZE: u32 = 0xF020;
+    const SC_RESTORE: u32 = 0xF120;
+    const SW_MINIMIZE: i32 = 6;
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    const WM_APP: u32 = 0x8000;
+    const WM_TRAY: u32 = WM_APP + 1;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const WM_RBUTTONUP: u32 = 0x0205;
+    const IMAGE_ICON: u32 = 1;
+    const LR_DEFAULTSIZE: u32 = 0x0000_0040;
+    const LR_SHARED: u32 = 0x0000_8000;
+    const NIM_ADD: u32 = 0;
+    const NIM_DELETE: u32 = 2;
+    const NIF_MESSAGE: u32 = 1;
+    const NIF_ICON: u32 = 2;
+    const NIF_TIP: u32 = 4;
+    const MF_STRING: u32 = 0;
+    const TPM_RETURNCMD: u32 = 0x0100;
+    const TPM_NONOTIFY: u32 = 0x0080;
+    const TPM_RIGHTBUTTON: u32 = 0x0002;
+    const TRAY_SHOW: u8 = 1;
+    const TRAY_QUIT: u8 = 2;
+
+    static WINDOWS: Mutex<Vec<(isize, isize)>> = Mutex::new(Vec::new());
+    static GROUP_MINIMIZED: AtomicBool = AtomicBool::new(false);
+    static TRAY_ADDED: AtomicBool = AtomicBool::new(false);
+    static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+    static TRAY_ACTION: AtomicU8 = AtomicU8::new(0);
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    fn set_tip(dst: &mut [u16; 128], tooltip: &str) {
+        for (slot, ch) in dst
+            .iter_mut()
+            .zip(OsStr::new(tooltip).encode_wide())
+        {
+            *slot = ch;
+        }
+    }
+
+    fn original_proc(hwnd: isize) -> Option<isize> {
+        let windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        windows
+            .iter()
+            .find(|(h, _)| *h == hwnd)
+            .map(|(_, proc)| *proc)
+    }
+
+    fn snapshot() -> Vec<isize> {
+        let windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        windows.iter().map(|(h, _)| *h).collect()
+    }
+
+    fn show_tray_menu(hwnd: isize) {
+        let menu = unsafe { CreatePopupMenu() };
+        if menu == 0 {
+            return;
+        }
+        let show = wide("Show SoundApp");
+        let quit = wide("Quit");
+        unsafe {
+            AppendMenuW(menu, MF_STRING, TRAY_SHOW as usize, show.as_ptr());
+            AppendMenuW(menu, MF_STRING, TRAY_QUIT as usize, quit.as_ptr());
+            let mut point = Point { x: 0, y: 0 };
+            GetCursorPos(&mut point);
+            SetForegroundWindow(hwnd);
+            let command = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            );
+            DestroyMenu(menu);
+            PostMessageW(hwnd, 0, 0, 0);
+            match command {
+                value if value == TRAY_SHOW as i32 => {
+                    TRAY_ACTION.store(TRAY_SHOW, Ordering::SeqCst)
+                }
+                value if value == TRAY_QUIT as i32 => {
+                    TRAY_ACTION.store(TRAY_QUIT, Ordering::SeqCst)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    unsafe extern "system" fn proc(hwnd: isize, msg: u32, w: usize, l: isize) -> isize {
+        let Some(prev) = original_proc(hwnd) else {
+            return DefWindowProcW(hwnd, msg, w, l);
+        };
+        let call_prev = || unsafe { CallWindowProcW(prev, hwnd, msg, w, l) };
+        if msg == WM_TRAY {
+            match l as u32 & 0xFFFF {
+                WM_LBUTTONUP => TRAY_ACTION.store(TRAY_SHOW, Ordering::SeqCst),
+                WM_RBUTTONUP => show_tray_menu(hwnd),
+                _ => {}
+            }
+            return 0;
+        }
+        let activated = msg == WM_ACTIVATE && (w as u32 & 0xFFFF) != 0;
+        let shown = msg == WM_SHOWWINDOW && w != 0;
+        if (activated || shown) && GROUP_MINIMIZED.swap(false, Ordering::SeqCst) {
+            let result = call_prev();
+            restore_others();
+            return result;
+        }
+        if msg == WM_SYSCOMMAND {
+            let cmd = w as u32 & 0xFFF0;
+            if cmd == SC_MINIMIZE {
+                let result = call_prev();
+                for other in snapshot() {
+                    if other != hwnd
+                        && IsWindow(other) != 0
+                        && IsWindowVisible(other) != 0
+                        && IsIconic(other) == 0
+                    {
+                        ShowWindow(other, SW_MINIMIZE);
+                    }
+                }
+                GROUP_MINIMIZED.store(true, Ordering::SeqCst);
+                return result;
+            }
+            if cmd == SC_RESTORE && GROUP_MINIMIZED.swap(false, Ordering::SeqCst) {
+                let result = call_prev();
+                restore_others();
+                return result;
+            }
+        }
+        call_prev()
+    }
+
+    fn restore_others() {
+        for hwnd in snapshot() {
+            unsafe {
+                if IsWindow(hwnd) != 0 && IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+        }
+    }
+
+    pub fn register(window: &Window) {
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = win32.hwnd.get() as isize;
+        {
+            let windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+            if windows.iter().any(|(h, _)| *h == hwnd) {
+                return;
+            }
+        }
+        let prev = unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as usize as isize)
+        };
+        if prev == 0 {
+            eprintln!("[nui] taskbar group: could not subclass window {hwnd}");
+            return;
+        }
+        let mut windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        windows.push((hwnd, prev));
+    }
+
+    pub fn restore_if_needed() {
+        if GROUP_MINIMIZED.swap(false, Ordering::SeqCst) {
+            restore_others();
+        }
+    }
+
+    pub fn tray_install(window: &Window, icon_resource: u16, tooltip: &str) {
+        if TRAY_ADDED.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = win32.hwnd.get() as isize;
+        let icon = unsafe {
+            let module = GetModuleHandleW(std::ptr::null());
+            LoadImageW(
+                module,
+                icon_resource as usize as *const u16,
+                IMAGE_ICON,
+                0,
+                0,
+                LR_DEFAULTSIZE | LR_SHARED,
+            )
+        };
+        if icon == 0 {
+            eprintln!("[nui] tray icon resource {icon_resource} unavailable");
+            return;
+        }
+        let mut data: NotifyIconDataW = unsafe { std::mem::zeroed() };
+        data.cb_size = std::mem::size_of::<NotifyIconDataW>() as u32;
+        data.hwnd = hwnd;
+        data.uid = 1;
+        data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        data.callback_message = WM_TRAY;
+        data.icon = icon;
+        set_tip(&mut data.tip, tooltip);
+        if unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) } != 0 {
+            TRAY_HWND.store(hwnd, Ordering::SeqCst);
+            TRAY_ADDED.store(true, Ordering::SeqCst);
+        } else {
+            eprintln!("[nui] Shell_NotifyIconW(NIM_ADD) failed");
+        }
+    }
+
+    pub fn tray_remove() {
+        if !TRAY_ADDED.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let hwnd = TRAY_HWND.swap(0, Ordering::SeqCst);
+        let mut data: NotifyIconDataW = unsafe { std::mem::zeroed() };
+        data.cb_size = std::mem::size_of::<NotifyIconDataW>() as u32;
+        data.hwnd = hwnd;
+        data.uid = 1;
+        unsafe {
+            Shell_NotifyIconW(NIM_DELETE, &mut data);
+        }
+    }
+
+    pub fn tray_take_action() -> u8 {
+        TRAY_ACTION.swap(0, Ordering::SeqCst)
+    }
+}
+
+/// Bring a window to the foreground without winit's ~800 ms synthetic Alt tap.
+pub fn focus_window_now(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetForegroundWindow() -> isize;
+            fn SetForegroundWindow(hwnd: isize) -> i32;
+            fn SetWindowPos(
+                hwnd: isize,
+                after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+        }
+        const HWND_TOP: isize = 0;
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_SHOWWINDOW: u32 = 0x0040;
+        if let Ok(wh) = window.window_handle() {
+            if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                let hwnd = h.hwnd.get() as isize;
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                    if GetForegroundWindow() != hwnd {
+                        SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    window.focus_window();
+}
+
+/// Make taskbar-button clicks minimize the whole application window group and
+/// let a restore click bring the previously visible windows back together.
+/// Call once per top-level window after creation.
+pub fn install_taskbar_group(window: &Window) {
+    #[cfg(target_os = "windows")]
+    taskbar_group::register(window);
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+}
+
+/// Restore sibling windows when the OS restored one of the group from the
+/// taskbar. Call from each window's `Focused(true)` event.
+pub fn restore_taskbar_group_if_needed() {
+    #[cfg(target_os = "windows")]
+    taskbar_group::restore_if_needed();
+}
+
+/// Tray action requested by the shell icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayAction {
+    Show,
+    Quit,
+}
+
+/// Install the shell tray icon on `window` (the app's main HWND), using an
+/// embedded icon resource and a tooltip.
+pub fn install_tray_icon(window: &Window, icon_resource: u16, tooltip: &str) {
+    #[cfg(target_os = "windows")]
+    taskbar_group::tray_install(window, icon_resource, tooltip);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, icon_resource, tooltip);
+    }
+}
+
+pub fn remove_tray_icon() {
+    #[cfg(target_os = "windows")]
+    taskbar_group::tray_remove();
+}
+
+/// Left-click/Show or Quit from the tray context menu.
+pub fn take_tray_action() -> Option<TrayAction> {
+    #[cfg(target_os = "windows")]
+    {
+        match taskbar_group::tray_take_action() {
+            1 => Some(TrayAction::Show),
+            2 => Some(TrayAction::Quit),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    None
+}
+
 /// Start an OS window drag while keeping `RedrawRequested` active at ~60 Hz during
 /// the Win32 modal move loop.
 pub fn drag_window_live(window: &Window) {
@@ -271,13 +692,74 @@ pub struct WindowManager {
     /// Theme window base color handed to every renderer: the class brush and
     /// first fill use it, so the pre-first-frame background matches the theme.
     base: crate::widgets::Color,
+    icon_resource: Option<u16>,
 }
+
+/// Apply the executable's embedded icon resource to a native window.
+#[cfg(target_os = "windows")]
+pub fn set_window_icon_from_executable(window: &Window, resource_id: u16) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    #[link(name = "user32")]
+    extern "system" {
+        fn LoadImageW(
+            instance: isize,
+            name: *const u16,
+            kind: u32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> isize;
+        fn SendMessageW(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isize;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> isize;
+    }
+    const IMAGE_ICON: u32 = 1;
+    const LR_DEFAULTSIZE: u32 = 0x0000_0040;
+    const LR_SHARED: u32 = 0x0000_8000;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    if let Ok(wh) = window.window_handle() {
+        if let RawWindowHandle::Win32(h) = wh.as_raw() {
+            let hwnd = h.hwnd.get() as isize;
+            unsafe {
+                let module = GetModuleHandleW(std::ptr::null());
+                for slot in [ICON_SMALL, ICON_BIG] {
+                    let icon = LoadImageW(
+                        module,
+                        resource_id as usize as *const u16,
+                        IMAGE_ICON,
+                        0,
+                        0,
+                        LR_DEFAULTSIZE | LR_SHARED,
+                    );
+                    if icon != 0 {
+                        SendMessageW(hwnd, WM_SETICON, slot, icon);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_window_icon_from_executable(_window: &Window, _resource_id: u16) {}
 
 impl WindowManager {
     pub fn new(base: crate::widgets::Color) -> Self {
         Self {
             windows: Vec::new(),
             base,
+            icon_resource: None,
+        }
+    }
+
+    pub fn set_icon_resource(&mut self, resource_id: u16) {
+        self.icon_resource = Some(resource_id);
+        for window in &self.windows {
+            set_window_icon_from_executable(&window.window, resource_id);
         }
     }
 
@@ -299,7 +781,8 @@ impl WindowManager {
             attrs = attrs
                 .with_undecorated_shadow(true)
                 .with_corner_preference(CornerPreference::Round)
-                .with_border_color(Some(Color::from_rgb(55, 55, 55)));
+                .with_border_color(Some(Color::from_rgb(55, 55, 55)))
+                .with_skip_taskbar(true);
         }
 
         attrs
@@ -319,6 +802,10 @@ impl WindowManager {
         }
         let attrs = Self::build_window_attrs(spec).with_visible(visible);
         let (window, mut renderer) = Renderer::new(event_loop, attrs, prefer, self.base);
+        install_taskbar_group(&window);
+        if let Some(id) = self.icon_resource {
+            set_window_icon_from_executable(&window, id);
+        }
         if visible {
             renderer.request_reveal();
         }

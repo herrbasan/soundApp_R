@@ -1,4 +1,5 @@
 /target
+/.deps
 /Material
 /_Material
 **/*.rs.bk

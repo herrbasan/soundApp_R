@@ -17,8 +17,7 @@ pub struct UserConfig {
     pub chk_locked: bool,
     pub sw_hq_mode: bool,
     pub sw_keep_tray: bool,
-    pub selected_device: usize,
-    pub selected_rate: usize,
+    pub output_device: String,
     pub selected_soundfont: usize,
 }
 
@@ -31,27 +30,43 @@ impl Default for UserConfig {
             show_controls: true,
             chk_locked: false,
             sw_hq_mode: true,
-            sw_keep_tray: true,
-            selected_device: 0,
-            selected_rate: 0,
+            sw_keep_tray: false,
+            output_device: String::new(),
             selected_soundfont: 0,
         }
     }
 }
 
 impl UserConfig {
-    /// `user.json` next to the running executable, else `target/user.json`.
+    /// Portable `user.json` beside the executable when that directory is
+    /// writable; otherwise `%APPDATA%\SoundAppR\user.json` for installed builds.
     pub fn path() -> PathBuf {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                return dir.join("user.json");
+                let portable = dir.join("user.json");
+                if portable.exists() || dir_writable(dir) {
+                    return portable;
+                }
             }
+        }
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("SoundAppR").join("user.json");
         }
         PathBuf::from("target").join("user.json")
     }
 
     pub fn soundfonts_dir() -> PathBuf {
         Self::path().with_file_name("soundfonts")
+    }
+
+    /// Selected output device, or `None` for the OS default device.
+    pub fn output_device_name(&self) -> Option<&str> {
+        (!self.output_device.is_empty()).then_some(self.output_device.as_str())
+    }
+
+    pub fn bundled_soundfonts_dir() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.join("soundfonts"))
     }
 
     /// Load the config, falling back to defaults when the file is missing or malformed.
@@ -77,7 +92,7 @@ impl UserConfig {
         format!(
             "{{\n  \"dark_mode\": {},\n  \"ui_zoom\": {:.4},\n  \"master_vol\": {:.4},\n  \
              \"show_controls\": {},\n  \"chk_locked\": {},\n  \"sw_hq_mode\": {},\n  \
-             \"sw_keep_tray\": {},\n  \"selected_device\": {},\n  \"selected_rate\": {},\n  \
+             \"sw_keep_tray\": {},\n  \"output_device\": \"{}\",\n  \
              \"selected_soundfont\": {}\n}}\n",
             self.dark_mode,
             self.ui_zoom,
@@ -86,8 +101,7 @@ impl UserConfig {
             self.chk_locked,
             self.sw_hq_mode,
             self.sw_keep_tray,
-            self.selected_device,
-            self.selected_rate,
+            self.output_device.replace('\\', "\\\\").replace('"', "\\\""),
             self.selected_soundfont,
         )
     }
@@ -117,11 +131,8 @@ impl UserConfig {
         if let Some(v) = json_bool(text, "sw_keep_tray") {
             cfg.sw_keep_tray = v;
         }
-        if let Some(v) = json_usize(text, "selected_device") {
-            cfg.selected_device = v;
-        }
-        if let Some(v) = json_usize(text, "selected_rate") {
-            cfg.selected_rate = v;
+        if let Some(v) = json_string(text, "output_device") {
+            cfg.output_device = v;
         }
         if let Some(v) = json_usize(text, "selected_soundfont") {
             cfg.selected_soundfont = v;
@@ -159,6 +170,39 @@ fn json_usize(text: &str, key: &str) -> Option<usize> {
     value_str(text, key)?.parse().ok()
 }
 
+fn json_string(text: &str, key: &str) -> Option<String> {
+    let raw = value_str(text, key)?;
+    let raw = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(raw.len());
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(out)
+}
+
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".soundapp-write-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,9 +216,8 @@ mod tests {
             show_controls: false,
             chk_locked: true,
             sw_hq_mode: false,
-            sw_keep_tray: false,
-            selected_device: 2,
-            selected_rate: 1,
+            sw_keep_tray: true,
+            output_device: "Speakers (USB Audio)".to_string(),
             selected_soundfont: 3,
         };
         let back = UserConfig::parse(&cfg.to_json());

@@ -20,6 +20,8 @@ Native Rust audio player & NUI component library. The workspace holds three crat
 - **`crates/soundapp` — Minimalist Player (`soundapp_r.exe`):**
   - Fast-opening FFmpeg decode + lock-free `rtrb` ring buffer + `cpal` WASAPI output, cosine fades, 8-tap Lanczos resampling, and Rubber Band pitch/tempo/formant processing.
   - **Independent multi-track Mixer (`M`):** a separate output graph and transport with up to 20 streaming stems, synchronized start/seek/loop, per-stem gain/equal-power pan/mute/solo, real VU meters, master gain, and recursive drop-to-add/replace. `Ctrl+Shift+D` opens live per-stem drift/buffer/underrun diagnostics. Opening Mixer pauses the main player; closing Mixer destroys its engine.
+  - **Single instance:** normal launches hand the requested file to the already-running player through a named pipe, bring that player forward and exit. Harness/screenshot runs remain independent.
+  - **Settings:** real output-device selection (reopens the output stream for player and Mixer at the device's default rate while preserving position), HQ oversampling, tray persistence with a Show/Quit tray icon, parameter lock and theme/transport options. Higher output rates are deliberately not offered: a 192 kHz shared-mode stream makes Windows resample continuously, even while paused.
   - Native MIDI and tracker parameters, including SoundFont selection, file-tempo display, tracker channel VU, and click/Shift-click channel solo.
   - Implicit sibling-folder playlist on single-file open, recursive folder drop, and a three-zone live-tracking drop overlay (*Add to current*, *Replace playlist*, *Open in Mixer*; `Ctrl` = non-recursive).
   - Embedded cover art decoded to `128×128` RGBA from the same FFmpeg metadata open, with a `-45°` format sash.
@@ -33,20 +35,33 @@ cargo build --release
 .\target\release\nui_demo.exe            # NUI component playground
 ```
 
-Portable user state lives beside the executable: `user.json`; MIDI SoundFonts (`.sf2`/`.sf3`) are loaded from the sibling `soundfonts\` folder.
+Portable user state lives beside the executable: `user.json`; MIDI SoundFonts (`.sf2`/`.sf3`) are loaded from the sibling `soundfonts\` folder. When that directory is not writable (a normal Program Files install), state moves to `%APPDATA%\SoundAppR\user.json`, SoundFonts are read from both `%APPDATA%\SoundAppR\soundfonts\` and the bundled `soundfonts\` folder, and **Parameters → Open Soundfonts Folder** opens the writable AppData folder.
+
+### Windows Release
+
+```powershell
+.\scripts\make-release.ps1 -Version 0.1.0
+# optional: -Publish creates the matching GitHub release with gh
+```
+
+The release command builds the player, assembles the portable distribution, compiles the Inno Setup installer, creates the portable ZIP, and writes `dist\SHA256SUMS.txt`. It requires Inno Setup 6 (`ISCC_PATH` may point at the compiler). The installer defaults to a per-machine Program Files installation (elevation requested); `/CURRENTUSER` installs per user under Local AppData instead, with associations in HKCU. Both modes register SoundApp in Explorer's **Open with** list and Windows **Default apps**; neither forcibly replaces existing defaults. Choose SoundApp as the default in Windows Settings to use the bundled per-format icons.
+
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml) on Windows and publishes the installer, portable ZIP, and checksums. CI downloads the pinned FFmpeg/SoundFont bundle from the `deps-v1` release via `scripts\prepare-ci-deps.ps1`.
 
 ### Player Hotkeys & Flags
 
-- **`Space`** play/pause · **`Left`/`Right`** seek · **`Up`/`Down`** volume
+- **`Space`** play/pause · **`Left`/`Right`** previous/next track · **`Ctrl+Left`/`Right`** seek −10 s / +10 s · **`Up`/`Down`** volume
 - **`C`**: Show/hide the transport bar (`480×278` ↔ `480×221`)
 - **Rendering:** player and static utility windows default to the CPU Softbuffer backend for instant startup; Monitoring and Mixer use the GPU OpenGL backend. `--backend cpu|gpu` forces every window for benchmarking.
 - **`F`**: Toggle Font Engine (`Swash Hinted+Gamma` <-> `Fontdue Legacy`)
-- **`T`**: Toggle Dark / Light Theme (dark by default)
-- **`P` / `N` / `M` / `S` / `H`**: Parameters / Monitoring / Mixer / Settings / Help windows
+- **`X`**: Toggle Dark / Light Theme (dark by default)
+- **`P` / `N` / `M` / `S` / `H`**: Parameters / Monitoring / Mixer / Settings / Help windows — global toggles from any SoundApp window, so pressing `S` while Settings is focused closes it
 - **`Ctrl+Shift+D`** in Mixer: toggle the `SYNC DEBUG` panel (drift, ring buffer, underruns, source time per stem; `COPY` snapshots it to the clipboard)
 - **`Ctrl + MouseWheel`** (or **`+`** / **`-`** / **`0`**, or drag a window edge/corner): Zoom UI scale
 - **`--screenshot <path.png> --seconds <n>`**: Save the exact GPU/CPU framebuffer to PNG
 - **`--open-window <key>`**: Open a secondary window for capture
+- **Taskbar:** clicking the app's taskbar button minimizes every visible SoundApp window; clicking again restores the group.
+- **Tray:** with *Keep Running in System Tray* enabled, `Esc` / close hide the player; the tray icon's left click or **Show** menu restores it, **Quit** exits.
 
 ### Test Media
 

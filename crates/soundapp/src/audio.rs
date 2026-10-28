@@ -385,7 +385,6 @@ pub struct Audio {
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
-    soundfont: Arc<Mutex<PathBuf>>,
     midi_native_bpm: Arc<AtomicU32>,
     tracker_channels: Arc<AtomicU64>,
     tracker_vu: Arc<Mutex<Vec<crate::tracker::ChannelVu>>>,
@@ -480,10 +479,6 @@ impl Audio {
     pub fn set_soundfont(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::SetSoundfont(path));
     }
-    /// The SoundFont the decoder thread has published as active.
-    pub fn soundfont(&self) -> PathBuf {
-        self.soundfont.lock().unwrap().clone()
-    }
     pub fn midi_native_bpm(&self) -> f32 {
         f32::from_bits(self.midi_native_bpm.load(Ordering::Relaxed))
     }
@@ -525,12 +520,58 @@ const STRETCH_CHUNK: usize = 2048;
 /// Input frames to keep buffered past the read head for the interpolators.
 const LOOKAHEAD: usize = 4;
 
-pub fn start(src: Source) -> Result<Audio, String> {
+pub fn output_device_names() -> Vec<String> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or("no default output device")?;
+    match host.output_devices() {
+        Ok(devices) => devices
+            .filter_map(|device| device.description().ok().map(|d| d.name().to_string()))
+            .collect(),
+        Err(e) => {
+            eprintln!("[audio] output device enumeration failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+fn output_device(name: Option<&str>) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        if let Ok(devices) = host.output_devices() {
+            for device in devices {
+                if device
+                    .description()
+                    .map(|d| d.name() == name)
+                    .unwrap_or(false)
+                {
+                    return Some(device);
+                }
+            }
+        }
+        eprintln!("[audio] configured output device '{name}' not found; using system default");
+    }
+    host.default_output_device()
+}
+
+/// Resolve a device + stream config on the device's default rate. The app does
+/// not expose higher output rates: a 192 kHz shared-mode stream makes Windows
+/// resample in software continuously, even while paused, which costs more CPU
+/// than the whole player.
+pub(crate) fn output_target(
+    device_name: Option<&str>,
+) -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
+    let device = output_device(device_name).ok_or("no output device")?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
+    Ok((device, config))
+}
+
+pub fn start(src: Source) -> Result<Audio, String> {
+    start_with(src, None)
+}
+
+/// Start the output stream on the requested device at its default rate. A
+/// missing device falls back to the system default (logged), never a dead app.
+pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, String> {
+    let (device, config) = output_target(device_name)?;
     let rate = config.sample_rate();
     let out_ch = config.channels() as usize;
     println!(
@@ -761,7 +802,6 @@ pub fn start(src: Source) -> Result<Audio, String> {
         meta: shared.meta.clone(),
         current: shared.current.clone(),
         dsp: shared.dsp.clone(),
-        soundfont: shared.soundfont.clone(),
         midi_native_bpm: shared.midi_native_bpm.clone(),
         tracker_channels: shared.tracker_channels.clone(),
         tracker_vu: shared.tracker_vu.clone(),

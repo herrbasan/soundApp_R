@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Prepare pinned build dependencies
+        shell: pwsh
+        run: ./scripts/prepare-ci-deps.ps1
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+          $installer = Join-Path $env:TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          $p = Start-Process -FilePath $installer -ArgumentList '/VERYSILENT','/CURRENTUSER','/NORESTART','/SUPPRESSMSGBOXES' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Inno Setup install failed: $($p.ExitCode)" }
+          $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "ISCC not found: $iscc" }
+          "ISCC_PATH=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            $line = Select-String -Path 'crates\soundapp\Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            $version = $line.Matches[0].Groups[1].Value
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build and package
+        shell: pwsh
+        run: ./scripts/make-release.ps1 -Version "$env:VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SoundAppR-${{ steps.version.outputs.version }}
+          path: |
+            dist/SoundAppR-${{ steps.version.outputs.version }}-setup.exe
+            dist/SoundAppR-${{ steps.version.outputs.version }}-portable.zip
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(
+            "dist/SoundAppR-$env:VERSION-setup.exe",
+            "dist/SoundAppR-$env:VERSION-portable.zip",
+            "dist/SHA256SUMS.txt"
+          )
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:GITHUB_REF_NAME @assets --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME @assets --title "SoundApp R $env:VERSION" --generate-notes --verify-tag
+          }
+          if ($LASTEXITCODE -ne 0) { throw "release publish failed: $LASTEXITCODE" }

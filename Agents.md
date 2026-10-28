@@ -38,7 +38,9 @@ soundApp_R/
   Agents.md               # This file (LLM architectural briefing)
   README.md               # User-facing documentation
   docs/                   # Feasibility, rendering options, native UI exploration, measured findings
-  scripts/                # PowerShell 5.1 benchmark harnesses (ASCII-only)
+  scripts/                # PowerShell 5.1 benchmark/release harnesses (ASCII-only)
+  installer/              # Inno Setup installer, icon assets mapping, association generator
+  .github/workflows/      # Tag-driven Windows release build
   crates/
     nui/                  # Reusable UI library crate (zero audio/app dependencies)
       assets/fonts/       # OpenSans-Regular, OpenSans-SemiBold, MaterialIcons-Regular
@@ -55,20 +57,27 @@ soundApp_R/
         layout.rs         # Declarative layout engine (Length, cols, rows, layout_grid, card, nui_card,
                           #   content-sized nui_card_auto, input_group, form_field)
         window.rs         # Multi-Window Manager (WindowManager, ManagedWindow, shared TextSystem atlas_gen sync,
-                          #   live OS-cursor/button probes for OLE file-drag overlays)
+                          #   live OS-cursor/button probes for OLE file-drag overlays, taskbar group
+                          #   minimize/restore, Shell tray icon with Show/Quit, fast OS focus)
     nui-demo/             # Standalone component playground -> nui_demo.exe (no audio/FFmpeg deps)
       src/main.rs         # 6-tab NUI playground (menu bar, collapsible sidebar, modal dialog,
                       # right-click context menu) + secondary UiState Inspector window (W)
                       # + dropzone preview (D) + live window drag/resize
     soundapp/             # SoundApp application crate -> soundapp_r.exe
-      build.rs            # Compiles FFmpeg bridge + vendored Rubber Band/libopenmpt; links FluidSynth
+      assets/icons/       # app.ico (embedded resource ID 1) + per-format association icons
+      assets/metronome/   # bundled click WAVs
+      build.rs            # Compiles FFmpeg bridge + vendored Rubber Band/libopenmpt; links FluidSynth,
+                          #   embeds app.ico, accepts SOUNDAPP_FFMPEG_* dependency overrides
                           #   and stages runtime DLLs
       src/
         main.rs           # Winit ApplicationHandler, GUI-subsystem binary (no console window;
                           #   terminal re-attach for harness output), field perf log, adaptive
                           #   native-only MIDI/tracker Parameters, Monitoring, Mixer, Settings & Help,
-                          #   three-zone file-drop overlay with live OS-cursor zone tracking;
-                          #   main/static windows CPU-rendered, Monitoring/Mixer GPU-rendered
+                          #   single-instance pipe hand-off, tray icon, three-zone file-drop overlay
+                          #   with live OS-cursor zone tracking; main/static windows CPU-rendered,
+                          #   Monitoring/Mixer GPU-rendered
+        single_instance.rs # Session-local mutex + named-pipe server; later launches forward a file
+                          #   path or focus request to the running player, then exit
         perf.rs           # Field-performance log (perf_log.txt next to user.json): session marker,
                           #   first-frame / audio-started / open-to-track-ready ms, 10 s frame-pacing
                           #   windows (frames + >66 ms stalls) — works with no console attached
@@ -105,7 +114,7 @@ soundApp_R/
    - `crates/nui` has **zero** audio or SoundApp dependencies (`winit`, `glow`, `glutin`, `softbuffer`, `swash`, `fontdue`, `tiny-skia`). Keep `nui` 100% general-purpose so it can be extracted into its own repository (`nui_rust`) at any time.
    - `crates/nui-demo` depends only on `nui` + `winit` — never on `soundapp`.
 2. **Dark Mode by Default (Accessibility):**
-   - Always default to `Theme::dark(rem)`. Light mode (`Theme::light(rem)`) is supported and toggleable (`T` key), but every preview, screenshot, and default launch must be dark mode.
+   - Always default to `Theme::dark(rem)`. Light mode (`Theme::light(rem)`) is supported and toggleable (`X` key), but every preview, screenshot, and default launch must be dark mode.
 3. **Dual-Backend Rendering (`nui/src/render.rs`):**
    - **GPU Backend (`BackendKind::Gpu`):** Single-draw-call (`glDrawArraysInstanced`) instanced renderer over `kind = 0..5` (rects, borders, soft shadows `kind = 3`, Swash/Fontdue glyphs `kind = 1/2`, AA capsule lines `kind = 4`, RGBA image quads `kind = 5`) with per-instance `clip_rect`.
    - **CPU Pixel Fallback (`BackendKind::Cpu`):** Direct `u32` (`0x00RRGGBB`) blitter over `softbuffer` with static-layer caching (`static_cache: Vec<u32>`) and integer LUT linear-light gamma blending.

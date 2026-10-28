@@ -21,7 +21,7 @@
 // Pre-include the decoder's own header (which pulls in the FFmpeg headers and,
 // transitively, <stdio.h>) *before* the macro below is defined, so no system
 // header ever declares `snprintf` under the shim's name.
-#include "D:/Work/_GIT/SoundApp/libs/ffmpeg-napi-interface/src/decoder.h"
+#include "../vendor/ffmpeg-decoder/decoder.h"
 
 static bool g_formant_preserve = false;
 
@@ -42,7 +42,7 @@ static int sa_snprintf(char* buf, size_t n, const char* fmt, ...) {
 }
 
 #define snprintf sa_snprintf
-#include "D:/Work/_GIT/SoundApp/libs/ffmpeg-napi-interface/src/decoder.cpp"
+#include "../vendor/ffmpeg-decoder/decoder.cpp"
 #undef snprintf
 
 // swscale.h ships without an `extern "C"` guard, unlike the av* headers pulled in

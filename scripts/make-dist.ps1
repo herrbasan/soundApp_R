@@ -18,7 +18,8 @@
 
 param(
     [switch]$NoZip,
-    [switch]$NoSmokeTest
+    [switch]$NoSmokeTest,
+    [string]$SoundFont = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +29,7 @@ Set-Location $root
 $dist = Join-Path $root 'dist\soundapp_r'
 $release = Join-Path $root 'target\release'
 $refTree = 'D:\Work\_GIT\SoundApp'
+$assetRoot = Join-Path $root 'crates\soundapp\assets'
 
 # --- 0. Release build (skipped when fresh, forced by missing exe) ------------
 $exe = Join-Path $release 'soundapp_r.exe'
@@ -43,6 +45,7 @@ New-Item -ItemType Directory -Path $dist | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dist 'soundfonts') | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dist 'metronome') | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dist 'licenses') | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $dist 'icons') | Out-Null
 
 # --- 2. Binary + runtime DLLs -------------------------------------------------
 $dlls = @(
@@ -57,20 +60,34 @@ foreach ($dll in $dlls) {
     Copy-Item $src $dist
 }
 
+# --- 2b. File-association and application icons -------------------------------
+$iconDir = Join-Path $assetRoot 'icons'
+Copy-Item (Join-Path $iconDir '*.ico') (Join-Path $dist 'icons')
+
 # --- 3. SoundFont (General MIDI; required for MIDI playback) ------------------
-$sf2 = Join-Path $refTree 'bin\soundfonts\default.sf2'
+$sf2 = if ($SoundFont) {
+    $SoundFont
+} elseif ($env:SOUNDAPP_SOUNDFONT) {
+    $env:SOUNDAPP_SOUNDFONT
+} elseif (Test-Path (Join-Path $assetRoot 'soundfonts\default.sf2')) {
+    Join-Path $assetRoot 'soundfonts\default.sf2'
+} else {
+    Join-Path $refTree 'bin\soundfonts\default.sf2'
+}
 if (-not (Test-Path $sf2)) {
-    throw "reference SoundFont missing: $sf2 - put any GM .sf2 into dist\soundapp_r\soundfonts\"
+    throw "SoundFont missing: $sf2 - pass -SoundFont, set SOUNDAPP_SOUNDFONT, or put a GM .sf2 into dist\soundapp_r\soundfonts\"
 }
 Copy-Item $sf2 (Join-Path $dist 'soundfonts\default.sf2')
 
 # --- 4. Metronome clicks (optional; app falls back to synthesized clicks) -----
 foreach ($name in 'metronome-high.wav', 'metronome-low.wav') {
-    $src = Join-Path $refTree "bin\metronome\$name"
+    $local = Join-Path $assetRoot "metronome\$name"
+    $dev = Join-Path $refTree "bin\metronome\$name"
+    $src = if (Test-Path $local) { $local } else { $dev }
     if (Test-Path $src) {
         Copy-Item $src (Join-Path $dist "metronome\$name")
     } else {
-        Write-Output "note: $src missing - metronome will use synthesized clicks"
+        Write-Output "note: $name missing - metronome will use synthesized clicks"
     }
 }
 
@@ -80,6 +97,7 @@ Copy-Item (Join-Path $root 'crates\soundapp\vendor\rubberband\COPYING') (Join-Pa
 Copy-Item (Join-Path $root 'crates\soundapp\vendor\rubberband\LICENSE-shim.md') $lic
 Copy-Item (Join-Path $root 'crates\soundapp\vendor\fluidsynth\LICENSE') (Join-Path $lic 'FluidSynth-LGPL-2.1.txt')
 Copy-Item (Join-Path $root 'crates\soundapp\vendor\libopenmpt\LICENSE') (Join-Path $lic 'libopenmpt-BSD-3-Clause.txt')
+Copy-Item (Join-Path $root 'crates\soundapp\vendor\ffmpeg-decoder\LICENSE') (Join-Path $lic 'FFmpeg-Decoder-MIT.txt')
 
 $notice = @"
 soundapp_r distribution - third-party notices
@@ -90,8 +108,13 @@ soundapp_r distribution - third-party notices
    Source: https://ffmpeg.org
  FluidSynth (libfluidsynth-3.dll, sndfile.dll)
    LGPL-2.1-or-later. Vendored: crates/soundapp/vendor/fluidsynth
+ GeneralUser GS SoundFont (soundfonts/default.sf2)
+   S. Christian Collins; permissive redistribution license.
+   Source: https://archive.org/download/free-soundfonts-sf2-2019-04/GeneralUser%20GS%20v1.471.sf2
  libopenmpt
    BSD-3-Clause, statically linked. Vendored: crates/soundapp/vendor/libopenmpt
+ ffmpeg-napi-interface decoder bridge
+   MIT. Vendored: crates/soundapp/vendor/ffmpeg-decoder
  Rubber Band Library
    GPL-2.0-or-later, statically linked (R3 engine). Vendored:
    crates/soundapp/vendor/rubberband. Distributed combined works must comply
@@ -124,24 +147,24 @@ if (-not $NoSmokeTest) {
     $out = Join-Path $env:TEMP 'dist-smoke-out.txt'
     $err = Join-Path $env:TEMP 'dist-smoke-err.txt'
     $p = Start-Process -FilePath (Join-Path $dist 'soundapp_r.exe') `
-        -ArgumentList '--seconds', '3', '--tone' `
+        -ArgumentList '--seconds', '3', '--silence' `
         -WorkingDirectory $dist `
         -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -Wait
     $stdout = Get-Content $out -Raw
-    if ($p.ExitCode -ne 0 -or $stdout -notmatch 'audio started') {
+    if ($p.ExitCode -ne 0 -or $stdout -notmatch 'output config' -or $stdout -notmatch 'first frame') {
         Write-Output $stdout
         Get-Content $err
         throw "dist smoke test failed (exit $($p.ExitCode))"
     }
-    Write-Output ($stdout.Trim() -split "`r?`n" | Where-Object { $_ -match 'first frame|audio started' })
-    Write-Output 'smoke test: dist runs standalone (audio started)'
+    Write-Output ($stdout.Trim() -split "`r?`n" | Where-Object { $_ -match 'output config|first frame' })
+    Write-Output 'smoke test: dist runs standalone (silent output, no audio)'
 }
 
 # --- 8. Archive ---------------------------------------------------------------
+# The smoke test (or a manual run) leaves runtime state in the staging
+# folder — the archive ships the app, not a used profile.
+Remove-Item (Join-Path $dist 'perf_log.txt'), (Join-Path $dist 'user.json') -Force -ErrorAction SilentlyContinue
 if (-not $NoZip) {
-    # The smoke test (or a manual run) leaves runtime state in the staging
-    # folder — the archive ships the app, not a used profile.
-    Remove-Item (Join-Path $dist 'perf_log.txt'), (Join-Path $dist 'user.json') -Force -ErrorAction SilentlyContinue
     $zip = Join-Path $root 'dist\soundapp_r.zip'
     if (Test-Path $zip) { Remove-Item $zip -Force }
     Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip
