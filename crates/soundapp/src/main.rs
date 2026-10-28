@@ -334,7 +334,11 @@ struct App {
     // Phase 3.1 — player transport state (loop / shuffle).
     pub loop_enabled: bool,
     pub shuffle_enabled: bool,
-
+    /// Fisher-Yates playback order while shuffle is on; entries index
+    /// `playlist`. Empty while shuffle is off.
+    shuffle_order: Vec<usize>,
+    /// Played-track history under shuffle (indices into `playlist`) for Prev.
+    shuffle_history: VecDeque<usize>,
     // Phase 2.1/2.2 — real playlist + FFmpeg metadata shown in the Left Card.
     /// Tracks discovered on disk — the implicit folder playlist.
     playlist: Vec<PathBuf>,
@@ -2586,6 +2590,8 @@ impl App {
             tracker_mutes: Vec::new(),
             loop_enabled: false,
             shuffle_enabled: false,
+            shuffle_order: Vec::new(),
+            shuffle_history: VecDeque::new(),
             playlist: Vec::new(),
             track_meta: None,
             scan_tx,
@@ -2966,11 +2972,83 @@ impl App {
         self.sync_pipeline_and_params();
     }
 
+    /// xorshift64* step — allocation-free PRNG for the playlist shuffle
+    /// (no `rand` dependency; seeded from the wall clock, never deterministic).
+    fn shuffle_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    /// Regenerate `shuffle_order`: Fisher-Yates over `0..playlist.len()`,
+    /// rotated so the current track comes first. Entries index `playlist`.
+    fn rebuild_shuffle_order(&mut self) {
+        let n = self.playlist.len();
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64 ^ (u64::from(std::process::id()) << 32))
+            .unwrap_or(0x9E3779B97F4A7C15)
+            | 1;
+        for _ in 0..4 {
+            Self::shuffle_next(&mut seed);
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let j = ((Self::shuffle_next(&mut seed) >> 11) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        let cur = self.selected_track.min(n.saturating_sub(1));
+        if let Some(pos) = order.iter().position(|&i| i == cur) {
+            order.rotate_left(pos);
+        }
+        self.shuffle_order = order;
+    }
+
+    /// Single funnel for every playlist mutation: regenerate the shuffle order
+    /// for the new playlist length and prune history entries that no longer
+    /// resolve. Keeps `shuffle_order`/`shuffle_history` indexes in sync.
+    fn sync_shuffle_state(&mut self) {
+        if !self.shuffle_enabled || self.playlist.is_empty() {
+            self.shuffle_order.clear();
+            self.shuffle_history.clear();
+            return;
+        }
+        self.shuffle_history.retain(|&i| i < self.playlist.len());
+        self.rebuild_shuffle_order();
+    }
+
     /// Load the next playlist entry (wrapping only when `wrap` is set).
-    /// Returns `true` when a track was loaded.
+    /// Walks `shuffle_order` while shuffle is on; `selected_track` stays an
+    /// index into `playlist` either way. Returns `true` when a track was loaded.
     fn advance_track(&mut self, wrap: bool) -> bool {
         if self.playlist.is_empty() {
             return false;
+        }
+        if !self.shuffle_order.is_empty() {
+            let cur = self.selected_track.min(self.playlist.len() - 1);
+            let pos = match self.shuffle_order.iter().position(|&i| i == cur) {
+                Some(pos) => pos,
+                // Desynced order (mutation bypassed the sync funnel): rebuild.
+                None => {
+                    self.rebuild_shuffle_order();
+                    0
+                }
+            };
+            let last = pos + 1 == self.shuffle_order.len();
+            if last && !wrap {
+                return false;
+            }
+            let idx = if last {
+                self.shuffle_order[0]
+            } else {
+                self.shuffle_order[pos + 1]
+            };
+            self.shuffle_history.push_back(cur);
+            self.load_playlist_index(idx);
+            return true;
         }
         let cur = self.selected_track.min(self.playlist.len() - 1);
         let idx = if cur + 1 < self.playlist.len() {
@@ -2985,9 +3063,32 @@ impl App {
     }
 
     /// Load the previous playlist entry (wrapping only when `wrap` is set).
+    /// Under shuffle this unwinds the play history first, then steps backwards
+    /// through `shuffle_order`.
     fn retreat_track(&mut self, wrap: bool) -> bool {
         if self.playlist.is_empty() {
             return false;
+        }
+        if !self.shuffle_order.is_empty() {
+            let cur = self.selected_track.min(self.playlist.len() - 1);
+            let idx = if let Some(prev) = self.shuffle_history.pop_back() {
+                prev
+            } else {
+                let pos = self
+                    .shuffle_order
+                    .iter()
+                    .position(|&i| i == cur)
+                    .unwrap_or(0);
+                if pos > 0 {
+                    self.shuffle_order[pos - 1]
+                } else if wrap {
+                    self.shuffle_order[self.shuffle_order.len() - 1]
+                } else {
+                    return false;
+                }
+            };
+            self.load_playlist_index(idx);
+            return true;
         }
         let cur = self.selected_track.min(self.playlist.len() - 1);
         let idx = if cur > 0 {
@@ -3022,6 +3123,7 @@ impl App {
         if is_supported_audio(&path) {
             if append && !self.playlist.is_empty() {
                 self.playlist.push(path);
+                self.sync_shuffle_state();
                 return;
             }
             self.on_new_track();
@@ -3034,6 +3136,7 @@ impl App {
             self.open_pending = Some((Instant::now(), path.display().to_string()));
             self.playlist = vec![path.clone()];
             self.selected_track = 0;
+            self.sync_shuffle_state();
             self.scan_gen = self.scan_gen.wrapping_add(1);
             let _ = self
                 .scan_tx
@@ -3127,6 +3230,7 @@ impl App {
                     if gen == self.scan_gen && !files.is_empty() {
                         self.playlist = files;
                         self.selected_track = idx;
+                        self.sync_shuffle_state();
                         redraw = true;
                     }
                 }
@@ -3136,10 +3240,12 @@ impl App {
                     }
                     if append && !self.playlist.is_empty() {
                         self.playlist.extend(files);
+                        self.sync_shuffle_state();
                         redraw = true;
                     } else if gen == self.scan_gen {
                         self.playlist = files;
                         self.selected_track = 0;
+                        self.sync_shuffle_state();
                         self.load_playlist_index(0);
                         redraw = true;
                     }
@@ -3917,6 +4023,13 @@ impl App {
         }
         if intents.shuffle_toggled {
             self.shuffle_enabled = !self.shuffle_enabled;
+            if self.shuffle_enabled {
+                self.shuffle_history.clear();
+                self.rebuild_shuffle_order();
+            } else {
+                self.shuffle_order.clear();
+                self.shuffle_history.clear();
+            }
         }
         if intents.toggle_controls {
             self.show_controls = !self.show_controls;
@@ -3936,17 +4049,11 @@ impl App {
                 self.animate = a.toggle_play();
             }
         }
-        if intents.prev || intents.next {
-            if !self.playlist.is_empty() {
-                let len = self.playlist.len();
-                let cur = self.selected_track.min(len - 1);
-                let idx = if intents.prev {
-                    (cur + len - 1) % len
-                } else {
-                    (cur + 1) % len
-                };
-                self.load_playlist_index(idx);
-            }
+        if intents.prev {
+            self.retreat_track(true);
+        }
+        if intents.next {
+            self.advance_track(true);
         }
         if let Some(secs) = intents.seek_to {
             if let Some(a) = &self.audio {
@@ -7133,6 +7240,103 @@ mod params_tests {
         app.params = modified();
         assert!(app.advance_track(false));
         assert_eq!(app.params, ParamState::default());
+    }
+
+    #[test]
+    fn shuffle_order_is_a_permutation_starting_at_the_current_track() {
+        let mut app = test_app();
+        app.playlist = (0..12)
+            .map(|i| PathBuf::from(format!("Z:/soundapp-test-shuf-{i}.mp3")))
+            .collect();
+        app.selected_track = 5;
+        app.shuffle_enabled = true;
+        app.rebuild_shuffle_order();
+        assert_eq!(app.shuffle_order.len(), 12);
+        let mut seen = app.shuffle_order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..12).collect::<Vec<usize>>());
+        assert_eq!(app.shuffle_order[0], 5);
+        // Regenerating for a shorter playlist stays a valid permutation and
+        // keeps the (still in-range) current track first.
+        app.playlist.truncate(4);
+        app.selected_track = 2;
+        app.sync_shuffle_state();
+        let mut seen = app.shuffle_order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..4).collect::<Vec<usize>>());
+        assert_eq!(app.shuffle_order[0], 2);
+    }
+
+    #[test]
+    fn shuffled_advance_visits_every_track_once_and_returns_to_start() {
+        let mut app = test_app();
+        let n = 9;
+        app.playlist = (0..n)
+            .map(|i| PathBuf::from(format!("Z:/soundapp-test-adv-{i}.mp3")))
+            .collect();
+        app.selected_track = 3;
+        app.shuffle_enabled = true;
+        app.rebuild_shuffle_order();
+        let start = app.selected_track;
+        assert_eq!(app.shuffle_order[0], start);
+        let mut visited = Vec::new();
+        for _ in 0..n {
+            assert!(app.advance_track(true));
+            visited.push(app.selected_track);
+        }
+        let mut seen = visited;
+        seen.sort_unstable();
+        assert_eq!(seen, (0..n).collect::<Vec<usize>>());
+        assert_eq!(app.selected_track, start);
+    }
+
+    #[test]
+    fn shuffled_retreat_unwinds_history_then_steps_back_through_the_order() {
+        let mut app = test_app();
+        app.playlist = (0..7)
+            .map(|i| PathBuf::from(format!("Z:/soundapp-test-ret-{i}.mp3")))
+            .collect();
+        app.selected_track = 0;
+        app.shuffle_enabled = true;
+        app.rebuild_shuffle_order();
+        let start = app.selected_track;
+        assert!(app.advance_track(true));
+        assert!(app.advance_track(true));
+        assert!(app.retreat_track(true));
+        assert!(app.retreat_track(true));
+        assert_eq!(app.selected_track, start);
+        // History exhausted → Prev steps backwards through the shuffle order.
+        assert!(app.retreat_track(true));
+        assert_ne!(app.selected_track, start);
+    }
+
+    #[test]
+    fn appending_while_shuffling_regenerates_a_valid_order() {
+        let mut app = test_app();
+        app.playlist = (0..5)
+            .map(|i| PathBuf::from(format!("Z:/soundapp-test-app-{i}.mp3")))
+            .collect();
+        app.selected_track = 2;
+        app.shuffle_enabled = true;
+        app.rebuild_shuffle_order();
+        // The open_path append funnel keeps order and history valid.
+        app.open_path(PathBuf::from("Z:/soundapp-test-app-extra.mp3"), true, false);
+        assert_eq!(app.playlist.len(), 6);
+        assert_eq!(app.shuffle_order.len(), 6);
+        assert_eq!(app.shuffle_order[0], 2);
+        assert!(app.shuffle_order.iter().all(|&i| i < 6));
+        // Stale history entries are pruned; in-range ones survive truncation.
+        app.shuffle_history.clear();
+        app.shuffle_history.push_back(1);
+        app.shuffle_history.push_back(4);
+        app.playlist.truncate(3);
+        app.sync_shuffle_state();
+        assert!(app.shuffle_history.iter().all(|&i| i < 3));
+        // Every shuffled step still resolves inside the live playlist.
+        for _ in 0..3 {
+            assert!(app.advance_track(true));
+            assert!(app.selected_track < app.playlist.len());
+        }
     }
 
     #[test]
