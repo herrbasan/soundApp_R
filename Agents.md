@@ -1,9 +1,21 @@
 # soundApp_R & NUI Rust — Agent Briefing
 
-> **START HERE:** Read **[`docs/handover_2026-10-24.md`](docs/handover_2026-10-24.md)** for the authoritative uncommitted working state and unverified items. Then read **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap.
+> **START HERE:** Read **[`docs/handover_2026-10-28.md`](docs/handover_2026-10-28.md)** for the current working state, the commit map, the open items (VU scaling spec, output sample-rate decision) and the window-toggle root-cause writeup. Then read **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap. `docs/handover_2026-10-24.md` remains valid for architecture and earlier findings.
 > **RESOLVED 2026-10-25 (ALPHATAP field box):** frameless-window DWM composition offset — content displaced down/right, metrics healthy. Root cause: winit's undecorated windows carry `WS_CAPTION|WS_THICKFRAME|…`, and this driver stack places the window surface at that style's frame origin while the client claims the whole window. Fixed by stripping the bits + suppressing non-client painting in `crates/nui/src/render.rs`. Measurements, verified matrix and the one open item (native drag/resize) in **[`docs/handover_alphatap-render-offset-2026-10-25.md`](docs/handover_alphatap-render-offset-2026-10-25.md)**.
 
-**Last handover:** 2026-10-24 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`; local HEAD `f72eca9` not yet pushed). NUI and SoundApp recovery checkpoints are committed. Native Parameters sizing is now content-driven and verified; remaining live-playback verification is listed in the handover.
+**Last handover:** 2026-10-28 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`, HEAD `c0f1843`, **pushed / in sync**).
+
+## Diagnostics you will need
+
+- **`event_log.txt`** (next to `user.json`, truncated per session): every key event with its global-pass
+  decision, window-toggle transitions, window close/hide paths, and **focus transitions polled from the
+  OS** (`nui::is_foreground`, so focus is recorded even when no winit event reaches the app). First stop
+  for any "shortcut does nothing / window opens twice / focus behaves oddly" report.
+- **`perf_log.txt`** (same folder): startup, open-to-track-ready, frame-pacing windows, `--render`/`--latency-probe` output.
+- **Never trust tracked modifier state** (`ModifiersChanged`) for global shortcuts: it goes stale whenever
+  focus leaves while a modifier is held (Alt+Tab / Win / AltGr), and a late event can re-poison it. Ask the
+  OS instead (`modifiers_physically_down` → `GetAsyncKeyState`). This bug cost a session — see
+  handover_2026-10-28 §1.
 
 ## Overview
 
@@ -16,8 +28,9 @@ The workspace has **three crates**: the reusable `nui` library, `nui-demo` (a st
 - **Original Electron SoundApp:** `D:\Work\_GIT\SoundApp`. Inspect this codebase to verify reference behavior before porting features or changing parity-sensitive logic. Full Help content is in `D:\Work\_GIT\SoundApp\html\help.html`.
 - **Original UI screenshots:** `docs/reference_ui/`. Compare Rust UI work against these captures; the set is still growing and is not yet a complete visual specification.
 - The lead agent orchestrates development: break work into bounded tasks, integrate changes, verify results directly, and check in frequently.
-- Use **`deepseek-flash-chat` for substantial grunt work** such as bulk inspection, repetitive transformations, test/harness execution, and screenshot comparison. Keep architecture, ambiguous decisions, integration, and final verification with the lead agent.
-- `deepseek-flash-chat` is **multimodal**. For visual debugging, give it the relevant Rust capture and original reference image and explicitly ask it to inspect both images.
+- **Implementation is done by the lead agent directly.** Subagent orchestration for implementation was tried on 2026-10-28 and abandoned at the owner's request — per-feature wall-clock (agent 9–16 min + lead verification + commit) did not beat direct work, and one agent stalled 67 min with zero turns (`herrbasan/LLM-Gateway#14`). Subagents are for parallel **read-only** analysis and web research, when explicitly requested.
+- When a subagent *is* used, the prompt must carry a current-state map (file:line, symbol names, exact gaps), a fixed design, and explicit verification gates — and must report discrepancies rather than improvise. `impl-drop-handoff-2` correctly reported that a premise in its brief was false instead of inventing a fix; that behaviour is the standard.
+- Research artefacts live in **`docs/research/`** (e.g. the VU/spectrum scaling spec with formulas and a numerical verification table).
 
 ## Key Documents in `docs/`
 
@@ -81,8 +94,13 @@ soundApp_R/
         perf.rs           # Field-performance log (perf_log.txt next to user.json): session marker,
                           #   first-frame / audio-started / open-to-track-ready ms, 10 s frame-pacing
                           #   windows (frames + >66 ms stalls) — works with no console attached
+        eventlog.rs       # Input/window flight recorder (event_log.txt, truncated per session, flushed
+                          #   per line): every key event + global-pass decision, window-toggle
+                          #   transitions, close/hide paths, and OS-polled focus transitions
         audio.rs          # FFmpeg/libopenmpt/FluidSynth source engines + raw source ring + cpal output
                           #   + audible-edge Tape/Rubber Band chain (FFmpeg only) + cosine fades/DSP tap
+                          #   + engine-power monitor thread (IAudioClient::Stop after fade drain; condvar
+                          #   idle parks; meters gated on engine_stopped)
                           #   + --render offline / --latency-probe harness (scripts/audiotest/)
         mixer.rs          # Independent 20-stem Mixer output graph: per-stem FFmpeg workers + 4 s rings,
                           #   synchronized prebuffer/transport/seek/loop, equal-power pan, mute/solo
@@ -94,14 +112,17 @@ soundApp_R/
         tracker.rs        # libopenmpt 0.8.9 tracked-module source engine
         dsp.rs            # Real-time 2048-pt Hann FFT (64 log bands), stabilized oscilloscope,
                           #   stereo goniometer & BS.1770-4 K-weighted LUFS
-        config.rs         # Persistent user.json configuration loader/writer
+        config.rs         # Persistent user.json configuration loader/writer (fields: dark_mode,
+                          #   ui_zoom, master_vol, show_controls, chk_locked, sw_hq_mode,
+                          #   sw_keep_tray, output_device, selected_soundfont, window_geometry,
+                          #   default_dir)
 ```
 
 ### The three binaries
 
 1. **`crates/nui`** — reusable library: `render.rs` with `kind = 0..5` (0 sharp rect, 1 Swash glyph, 2 Fontdue glyph, 3 SDF shadow, 4 AA capsule line, **5 RGBA image quad**), zero-flash reveal (`DWMWA_CLOAK (13)` + theme-colored `GCLP_HBRBACKGROUND` brush and first fill; windows are created **hidden** and only uncloaked after the first presented frame), Swash subpixel shaping, `layout_rotated_ccw45` for atlas-cached `-45°` text, widgets, layout, window manager.
 2. **`crates/nui-demo`** → **`nui_demo.exe`** — standalone 6-tab NUI Component Playground (*Controls & Inputs*, *Layout & Cards*, *Vectors & Canvas*, *Typography & Icons*, *Virtual List 10k*, *Menus & Overlays*), wrapped in a real app shell: undecorated app header (empty middle = live window drag zone), `.nui-menu-bar` (File / View / Components / Diagnostics), an animated collapsible `nui-sidebar` + `nui-link-list[mode="fold"]`, a right-click `nui-context-menu`, and a modal `nui-dialog` that now owns every demo control the header used to carry. Plus a secondary `UiState` Inspector window (`W`) and dropzone preview (`D`); the window is resizable via edge/corner hit-testing. Zero audio/FFmpeg dependencies. **This is the iteration surface for `crates/nui` design work.**
-3. **`crates/soundapp`** → **`soundapp_r.exe`** — minimalist, fast-opening, low-footprint FFmpeg audio player: `480×278` with controls, `480×221` without (`C`); proportional UI scaling via `+`/`-`/`0`, `Ctrl+Wheel`, or undecorated edge/corner drag. Windows GUI subsystem: double-clicked launches never open a console; launched from a terminal the binary re-attaches to it so harness output stays visible (redirected/piped stdout is untouched).
+3. **`crates/soundapp`** → **`soundapp_r.exe`** — minimalist, fast-opening, low-footprint FFmpeg audio player: `480×278` with controls, `480×221` without (`C`); proportional UI scaling via `+`/`-`/`0`, `Ctrl+Wheel`, or undecorated edge/corner drag. Windows GUI subsystem: double-clicked launches never open a console; launched from a terminal the binary re-attaches to it so harness output stays visible (redirected/piped stdout is untouched). Recent additions (2026-10-28): playlist shuffle with history-back Prev, Multi-Track drop taking over playback, Add-zone drop playing instantly, one global key pass (window toggles + theme + controls + `I` reveal work from any window), Parameters lock/reset on close, persisted window geometry & open state, configurable default start directory (OS Music fallback), 0.2 s cover crossfade, and an engine that actually stops while paused.
 
 ## Test Media & Remote
 

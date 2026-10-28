@@ -37,6 +37,15 @@ cargo build --release
 
 Portable user state lives beside the executable: `user.json`; MIDI SoundFonts (`.sf2`/`.sf3`) are loaded from the sibling `soundfonts\` folder. When that directory is not writable (a normal Program Files install), state moves to `%APPDATA%\SoundAppR\user.json`, SoundFonts are read from both `%APPDATA%\SoundAppR\soundfonts\` and the bundled `soundfonts\` folder, and **Parameters → Open Soundfonts Folder** opens the writable AppData folder.
 
+`user.json` also remembers the window layout (positions, sizes, which utility windows were open), the selected output device, and the **default start folder**. With no file argument, the player opens the first audio file in that folder (and its folder becomes the playlist); the folder defaults to the Windows **Music** folder when unset. Set it in **Settings → Default start folder** (*Use Current* takes the playing file's folder, *Reset* returns to the OS Music folder).
+
+Two diagnostic logs sit beside `user.json`, both truncated per session:
+
+- `perf_log.txt` — startup, open-to-track-ready timing and frame pacing.
+- `event_log.txt` — every key press with the decision it produced, window open/close/toggle transitions, and focus changes observed from the OS. Attach it to any report about shortcuts, windows or focus behaving oddly.
+
+**Closed windows are remembered unless you clear them:** utility windows visible at exit reopen on the next launch; the Mixer deliberately does not (its stems come from the current playlist, which starts empty).
+
 ### Windows Release
 
 ```powershell
@@ -51,6 +60,7 @@ Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/rele
 ### Player Hotkeys & Flags
 
 - **`Space`** play/pause · **`Left`/`Right`** previous/next track · **`Ctrl+Left`/`Right`** seek −10 s / +10 s · **`Up`/`Down`** volume
+- **`L`**: Toggle loop · **shuffle button** (header / transport bar): shuffle the current playlist — *Previous* walks back through what actually played
 - **`C`**: Show/hide the transport bar (`480×278` ↔ `480×221`)
 - **Rendering:** player and static utility windows default to the CPU Softbuffer backend for instant startup; Monitoring and Mixer use the GPU OpenGL backend. `--backend cpu|gpu` forces every window for benchmarking.
 - **`F`**: Toggle Font Engine (`Swash Hinted+Gamma` <-> `Fontdue Legacy`)
