@@ -298,6 +298,7 @@ struct App {
     // Phase 1.5 multi-window: secondary windows sharing `text_sys`, plus queued
     // show/hide toggles executed in `window_event` where `event_loop` is available.
     secondary_windows: WindowManager,
+    window_geom: std::collections::HashMap<String, SavedGeom>,
     pending_window_toggles: Vec<&'static str>,
     /// MRU focus ring (`"main"` or a secondary key). Hiding the focused window
     /// restores focus to the previous visible entry, so keyboard shortcuts never
@@ -556,6 +557,55 @@ fn reveal_in_explorer(path: &std::path::Path) {
 
 #[cfg(not(windows))]
 fn reveal_in_explorer(_path: &std::path::Path) {}
+
+/// Persisted window placement (logical units) parsed from
+/// `UserConfig::window_geometry`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SavedGeom {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    visible: bool,
+}
+
+/// Parse `key x y w h visible;key ...`. Unknown/garbage entries are skipped,
+/// so a hand-edited file degrades to default placement.
+fn parse_window_geometry(s: &str) -> std::collections::HashMap<String, SavedGeom> {
+    let mut map = std::collections::HashMap::new();
+    for entry in s.split(';') {
+        let mut it = entry.split_whitespace();
+        let (Some(key), Some(x), Some(y), Some(w), Some(h), Some(v)) = (
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+        ) else {
+            continue;
+        };
+        let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+            x.parse::<f32>(),
+            y.parse::<f32>(),
+            w.parse::<f32>(),
+            h.parse::<f32>(),
+        ) else {
+            continue;
+        };
+        map.insert(
+            key.to_string(),
+            SavedGeom {
+                x,
+                y,
+                w,
+                h,
+                visible: v == "1",
+            },
+        );
+    }
+    map
+}
 
 // ---------------------------------------------------------------------------
 // Small draw helpers shared by the Monitoring / Mixer windows
@@ -2591,6 +2641,7 @@ impl App {
         };
         let mut secondary_windows = WindowManager::new(theme_base);
         secondary_windows.set_icon_resource(1);
+        let window_geom = parse_window_geometry(&config.window_geometry);
         Self {
             start: Instant::now(),
             reported: false,
@@ -2623,6 +2674,7 @@ impl App {
             pace_slow: 0,
 
             secondary_windows: secondary_windows,
+            window_geom,
             pending_window_toggles: Vec::new(),
             focus_ring: VecDeque::from(["main"]),
             open_requests: None,
@@ -2675,7 +2727,73 @@ impl App {
     }
 
     /// Capture the current UI state as a persistable config and write `user.json`.
+    /// Saved placement for `key`, if this session's config carried one.
+    fn saved_geometry(&self, key: &str) -> Option<SavedGeom> {
+        self.window_geom.get(key).copied()
+    }
+
+    /// Snapshot every live window's placement (logical units) into the config:
+    /// `main` plus every secondary that exists this session. Windows never
+    /// opened keep their default placement next launch.
+    fn capture_window_geometry(&mut self) {
+        let mut out = String::new();
+        if let Some(w) = &self.window {
+            if let Ok(pos) = w.outer_position() {
+                let size = w.inner_size();
+                let s = w.scale_factor() as f32;
+                out.push_str(&format!(
+                    "main {} {} {} {} 1;",
+                    (pos.x as f32 / s).round() as i32,
+                    (pos.y as f32 / s).round() as i32,
+                    (size.width as f32 / s).round() as i32,
+                    (size.height as f32 / s).round() as i32,
+                ));
+            }
+        }
+        for mw in &self.secondary_windows.windows {
+            let Ok(pos) = mw.window.outer_position() else {
+                continue;
+            };
+            let size = mw.window.inner_size();
+            let s = mw.window.scale_factor() as f32;
+            out.push_str(&format!(
+                "{} {} {} {} {} {};",
+                mw.key,
+                (pos.x as f32 / s).round() as i32,
+                (pos.y as f32 / s).round() as i32,
+                (size.width as f32 / s).round() as i32,
+                (size.height as f32 / s).round() as i32,
+                if mw.visible { 1 } else { 0 },
+            ));
+        }
+        self.config.window_geometry = out.trim_end_matches(';').to_string();
+    }
+
+    /// True when the saved rect lands on a connected monitor (logical-space
+    /// comparison per monitor scale) — a window saved on an unplugged display
+    /// must not come back somewhere unreachable.
+    fn saved_rect_reachable(event_loop: &ActiveEventLoop, g: SavedGeom) -> bool {
+        let mut any = false;
+        for m in event_loop.available_monitors() {
+            any = true;
+            let s = m.scale_factor() as f32;
+            let pos = m.position();
+            let size = m.size();
+            let (mx, my, mw, mh) = (
+                pos.x as f32 / s,
+                pos.y as f32 / s,
+                size.width as f32 / s,
+                size.height as f32 / s,
+            );
+            if g.x < mx + mw && g.x + g.w > mx && g.y < my + mh && g.y + g.h > my {
+                return true;
+            }
+        }
+        !any
+    }
+
     fn save_config(&mut self) {
+        self.capture_window_geometry();
         self.config.dark_mode = self.dark_mode;
         self.config.ui_zoom = self.ui_zoom;
         self.config.master_vol = self.master_vol;
@@ -2888,7 +3006,12 @@ impl App {
     }
 
     fn adjusted_window_spec(&self, spec: &WindowSpec) -> WindowSpec {
-        spec.clone()
+        let mut spec = spec.clone();
+        if let Some(g) = self.saved_geometry(spec.key) {
+            spec.width = g.w as f64;
+            spec.height = g.h as f64;
+        }
+        spec
     }
 
     /// The current UI parameter state as an engine `PlaybackParams`.
@@ -4472,9 +4595,24 @@ impl App {
             // `show()` requests reveal + redraw itself, so no synchronous paint here.
             let backend = self.secondary_backend(key);
             let was_visible = self.secondary_windows.is_visible(key);
+            let existed = self.secondary_windows.windows.iter().any(|w| w.key == key);
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
                 .toggle(event_loop, &spec, backend);
+            // First creation this session: place at the saved position (when
+            // it reaches a connected monitor). Later toggles never reposition
+            // — the user's drags this session win.
+            if !existed && self.secondary_windows.is_visible(key) {
+                if let Some(g) = self.saved_geometry(key) {
+                    if Self::saved_rect_reachable(event_loop, g) {
+                        if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
+                            w.window.set_outer_position(
+                                winit::dpi::LogicalPosition::new(g.x as f64, g.y as f64),
+                            );
+                        }
+                    }
+                }
+            }
             if key == "parameters" {
                 if was_visible {
                     // Toggled off: the same close rule as the other paths.
@@ -6229,6 +6367,17 @@ impl ApplicationHandler for App {
             .with_resizable(true)
             .with_decorations(false);
 
+        // Restore last-saved placement when it lands on a connected monitor;
+        // the saved SIZE wins over the zoom-derived default (zoom changes
+        // resize explicitly later, via apply_zoom).
+        if let Some(g) = self.saved_geometry("main") {
+            if Self::saved_rect_reachable(event_loop, g) {
+                attrs = attrs
+                    .with_position(winit::dpi::LogicalPosition::new(g.x as f64, g.y as f64))
+                    .with_inner_size(winit::dpi::LogicalSize::new(g.w as f64, g.h as f64));
+            }
+        }
+
         #[cfg(target_os = "windows")]
         {
             use winit::platform::windows::{Color, CornerPreference, WindowAttributesExtWindows};
@@ -6265,6 +6414,19 @@ impl ApplicationHandler for App {
                     w.screenshot_once = Some(path);
                 }
             }
+        }
+
+        // Reopen the secondaries that were visible at exit (position and size
+        // come through the first-creation path in process_window_toggles).
+        // The mixer is NOT auto-reopened: it owns a live engine whose stems
+        // come from this session's playlist, which starts empty.
+        if self.open_window_spec.is_none() {
+            for key in ["parameters", "monitoring", "settings", "help"] {
+                if self.saved_geometry(key).is_some_and(|g| g.visible) {
+                    self.pending_window_toggles.push(key);
+                }
+            }
+            self.process_window_toggles(event_loop);
         }
     }
 
@@ -6659,6 +6821,7 @@ impl ApplicationHandler for App {
 
     /// Phase 3.5 — auto-save the configuration on a clean exit.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.capture_window_geometry();
         self.config.dark_mode = self.dark_mode;
         self.config.ui_zoom = self.ui_zoom;
         self.config.master_vol = self.master_vol;
@@ -7368,6 +7531,26 @@ mod params_tests {
         let before = app.params;
         app.load_playlist_index(0);
         assert_eq!(app.params, before);
+    }
+
+    #[test]
+    fn window_geometry_parses_and_skips_garbage() {
+        let map = parse_window_geometry(
+            "main 120 80 756 438 1;parameters 200 140 510 800 0;bogus 1 2 3",
+        );
+        assert_eq!(
+            map.get("main"),
+            Some(&SavedGeom {
+                x: 120.0,
+                y: 80.0,
+                w: 756.0,
+                h: 438.0,
+                visible: true
+            })
+        );
+        assert_eq!(map.get("parameters").map(|g| g.visible), Some(false));
+        assert!(!map.contains_key("bogus"));
+        assert!(parse_window_geometry("").is_empty());
     }
 
     #[test]

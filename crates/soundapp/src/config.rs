@@ -19,6 +19,9 @@ pub struct UserConfig {
     pub sw_keep_tray: bool,
     pub output_device: String,
     pub selected_soundfont: usize,
+    /// Persisted window placement, `key x y w h visible;...` (logical units).
+    /// Spaces only, never commas — the mini-JSON reader ends values at commas.
+    pub window_geometry: String,
 }
 
 impl Default for UserConfig {
@@ -33,6 +36,7 @@ impl Default for UserConfig {
             sw_keep_tray: false,
             output_device: String::new(),
             selected_soundfont: 0,
+            window_geometry: String::new(),
         }
     }
 }
@@ -93,7 +97,7 @@ impl UserConfig {
             "{{\n  \"dark_mode\": {},\n  \"ui_zoom\": {:.4},\n  \"master_vol\": {:.4},\n  \
              \"show_controls\": {},\n  \"chk_locked\": {},\n  \"sw_hq_mode\": {},\n  \
              \"sw_keep_tray\": {},\n  \"output_device\": \"{}\",\n  \
-             \"selected_soundfont\": {}\n}}\n",
+             \"selected_soundfont\": {},\n  \"window_geometry\": \"{}\"\n}}\n",
             self.dark_mode,
             self.ui_zoom,
             self.master_vol,
@@ -103,6 +107,7 @@ impl UserConfig {
             self.sw_keep_tray,
             self.output_device.replace('\\', "\\\\").replace('"', "\\\""),
             self.selected_soundfont,
+            self.window_geometry.replace('\\', "\\\\").replace('"', "\\\""),
         )
     }
 
@@ -136,6 +141,9 @@ impl UserConfig {
         }
         if let Some(v) = json_usize(text, "selected_soundfont") {
             cfg.selected_soundfont = v;
+        }
+        if let Some(v) = json_string(text, "window_geometry") {
+            cfg.window_geometry = v;
         }
         cfg
     }
@@ -219,6 +227,7 @@ mod tests {
             sw_keep_tray: true,
             output_device: "Speakers (USB Audio)".to_string(),
             selected_soundfont: 3,
+            window_geometry: "main 120 80 756 438 1;parameters 200 140 510 800 0".to_string(),
         };
         let back = UserConfig::parse(&cfg.to_json());
         assert_eq!(back, cfg);
