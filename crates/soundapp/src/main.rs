@@ -633,7 +633,7 @@ fn first_audio_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 /// bridge caps embedded art at 128).
 const COVER_TILE_SIDE: u32 = 128;
 /// Duration of one cover crossfade.
-const COVER_FADE_SECS: f32 = 0.5;
+const COVER_FADE_SECS: f32 = 0.3;
 
 /// One cover transition: the outgoing view (`None` = default tile) fading
 /// into the incoming view over [`COVER_FADE_SECS`].
@@ -4723,6 +4723,12 @@ impl App {
         event_loop: &ActiveEventLoop,
         event: &winit::event::KeyEvent,
     ) -> bool {
+        // Auto-repeat fires Pressed ~30x/s while the key is held; without this
+        // guard a slightly long press toggles the window two or three times
+        // (the "opens twice / sometimes doesn't open" unreliability).
+        if event.repeat {
+            return false;
+        }
         let Key::Character(ch) = &event.logical_key else {
             return false;
         };
@@ -6896,7 +6902,7 @@ impl ApplicationHandler for App {
                                 a.set_volume(self.master_vol);
                             }
                         }
-                        Key::Named(NamedKey::Space) if !focused_text => {
+                        Key::Named(NamedKey::Space) if !focused_text && !event.repeat => {
                             if let Some(a) = &self.audio {
                                 self.animate = a.toggle_play();
                             }
@@ -6960,7 +6966,9 @@ impl ApplicationHandler for App {
                         {
                             self.set_zoom(1.0);
                         }
-                        Key::Character(ch) if !focused_text && ch.eq_ignore_ascii_case("l") => {
+                        Key::Character(ch)
+                            if !focused_text && !event.repeat && ch.eq_ignore_ascii_case("l") =>
+                        {
                             self.loop_enabled = !self.loop_enabled;
                             if let Some(a) = &self.audio {
                                 a.set_loop(self.loop_enabled);
