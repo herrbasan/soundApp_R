@@ -432,16 +432,7 @@ impl MixerAudio {
     }
 
     fn all_ready(&self) -> bool {
-        let mut any = false;
-        for slot in &self.shared.slots {
-            if slot.enabled.load(Ordering::Acquire) {
-                any = true;
-                if !slot.ready.load(Ordering::Acquire) {
-                    return false;
-                }
-            }
-        }
-        any
+        all_slots_ready(&self.shared.slots)
     }
 
     pub fn meter(&self, index: usize) -> f32 {
@@ -797,6 +788,23 @@ fn longest_duration_frames(durations: &[u64]) -> u64 {
     durations.iter().copied().max().unwrap_or(0)
 }
 
+/// Readiness gate for `play_pending`: every enabled stem must be prebuffered.
+/// A stem whose load failed is disabled by its worker (the `StemCmd::Load`
+/// error path stores `enabled = false`), so it drops out of this check instead
+/// of stalling playback on a `ready` flag that will never arrive.
+fn all_slots_ready(slots: &[SlotShared]) -> bool {
+    let mut any = false;
+    for slot in slots {
+        if slot.enabled.load(Ordering::Acquire) {
+            any = true;
+            if !slot.ready.load(Ordering::Acquire) {
+                return false;
+            }
+        }
+    }
+    any
+}
+
 fn end_action(position: f64, duration: f64, looping: bool) -> Option<bool> {
     if duration > 0.0 && position >= duration {
         Some(looping)
@@ -851,6 +859,27 @@ mod tests {
     fn longest_stem_defines_transport_duration() {
         assert_eq!(longest_duration_frames(&[]), 0);
         assert_eq!(longest_duration_frames(&[100, 500, 250]), 500);
+    }
+
+    #[test]
+    fn failed_stem_does_not_block_readiness() {
+        // A stem whose load failed is disabled by its worker (enabled = false,
+        // ready never set) — readiness must skip it, not wait forever.
+        let sh = test_shared();
+        sh.slots[0].enabled.store(true, Ordering::Relaxed);
+        sh.slots[0].ready.store(true, Ordering::Relaxed);
+        sh.slots[1].enabled.store(false, Ordering::Relaxed);
+        assert!(all_slots_ready(&sh.slots));
+        // A live but still-prebuffering stem blocks as before.
+        sh.slots[2].enabled.store(true, Ordering::Relaxed);
+        assert!(!all_slots_ready(&sh.slots));
+        sh.slots[2].ready.store(true, Ordering::Relaxed);
+        assert!(all_slots_ready(&sh.slots));
+        // Every stem failed → nothing enabled → nothing counts as ready.
+        for slot in &sh.slots {
+            slot.enabled.store(false, Ordering::Relaxed);
+        }
+        assert!(!all_slots_ready(&sh.slots));
     }
 
     #[test]

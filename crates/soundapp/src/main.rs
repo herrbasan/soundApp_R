@@ -1129,6 +1129,13 @@ fn is_supported_audio(p: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Add-zone drop decision: while the player holds a track (`current_file`
+/// present), a dropped file joins the playlist AND starts immediately;
+/// with nothing loaded the plain append path stays.
+fn add_drop_plays_now(current_file: Option<&std::path::Path>) -> bool {
+    current_file.is_some()
+}
+
 /// The implicit playlist of a single file: every supported audio file in its
 /// directory (flat `read_dir` order), plus the index of `file` in that list.
 fn playlist_from_single_file(file: &std::path::Path) -> (Vec<PathBuf>, usize) {
@@ -2737,6 +2744,12 @@ impl App {
             self.open_mixer_with_paths(files);
             return;
         }
+        // Multi-Track takes over playback: the main player must not keep
+        // sounding while the new stems load (the fresh-engine branch above
+        // pauses inside open_mixer_with_paths).
+        if let Some(main) = &self.audio {
+            main.pause();
+        }
         if let Some(slot) = replace_slot {
             let path = files[0].clone();
             if let Some(stem) = self.mixer_stems.iter_mut().find(|stem| stem.slot == slot) {
@@ -3152,6 +3165,24 @@ impl App {
                 },
             ));
         }
+    }
+
+    /// Add-zone drop: append-plus-immediate-playback when a track is loaded,
+    /// today's append-only behavior otherwise. Folder drops and unsupported
+    /// files always take the normal open_path scan route.
+    fn open_path_add_drop(&mut self, path: PathBuf, recursive_dirs: bool) {
+        let current = self.audio.as_ref().and_then(|a| a.current_file());
+        if !self.playlist.is_empty()
+            && is_supported_audio(&path)
+            && add_drop_plays_now(current.as_deref())
+        {
+            self.playlist.push(path);
+            self.sync_shuffle_state();
+            let new_idx = self.playlist.len() - 1;
+            self.load_playlist_index(new_idx);
+            return;
+        }
+        self.open_path(path, true, recursive_dirs);
     }
 
     /// Drain paths forwarded by later launches. An empty message is a plain
@@ -4075,9 +4106,16 @@ impl App {
             // Ctrl held → flat (non-recursive) folder collection.
             let recursive = !self.modifiers.control_key();
             match zone {
-                DropZone::Add => self.open_path(path, true, recursive),
+                DropZone::Add => self.open_path_add_drop(path, recursive),
                 DropZone::Replace => self.open_path(path, false, recursive),
                 DropZone::Mixer => {
+                    // Main playback stops the moment the files land: the scan
+                    // is async and open_mixer_with_paths (which pauses again,
+                    // idempotently) only fires once it completes — until then
+                    // both players would sound at once.
+                    if let Some(main) = &self.audio {
+                        main.pause();
+                    }
                     self.scan_gen = self.scan_gen.wrapping_add(1);
                     let _ = self
                         .scan_tx
@@ -7308,6 +7346,26 @@ mod params_tests {
         // History exhausted → Prev steps backwards through the shuffle order.
         assert!(app.retreat_track(true));
         assert_ne!(app.selected_track, start);
+    }
+
+    #[test]
+    fn add_drop_plays_now_only_when_a_track_is_loaded() {
+        assert!(add_drop_plays_now(Some(std::path::Path::new("Z:/song.mp3"))));
+        assert!(!add_drop_plays_now(None));
+    }
+
+    #[test]
+    fn add_zone_drop_without_a_loaded_track_keeps_append_only() {
+        let mut app = test_app();
+        app.playlist = vec![
+            PathBuf::from("Z:/soundapp-test-addzone-1.mp3"),
+            PathBuf::from("Z:/soundapp-test-addzone-2.mp3"),
+        ];
+        app.selected_track = 0;
+        // test_app has no engine → nothing is loaded → plain append, no jump.
+        app.open_path_add_drop(PathBuf::from("Z:/soundapp-test-addzone-3.mp3"), false);
+        assert_eq!(app.playlist.len(), 3);
+        assert_eq!(app.selected_track, 0);
     }
 
     #[test]
