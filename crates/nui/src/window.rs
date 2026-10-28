@@ -370,6 +370,10 @@ mod taskbar_group {
             unsafe {
                 if IsWindow(hwnd) != 0 && IsIconic(hwnd) != 0 {
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    crate::diag::diag(&format!(
+                        "nui taskbar-group RESTORE hwnd=0x{hwnd:x} (was iconic) -> mapped={}",
+                        IsWindowVisible(hwnd) != 0
+                    ));
                 }
             }
         }
@@ -468,6 +472,12 @@ mod taskbar_group {
 }
 
 /// Bring a window to the foreground without winit's ~800 ms synthetic Alt tap.
+///
+/// NOTE the `SWP_SHOWWINDOW`: this maps the window as a side effect. Calling it
+/// on a window that was just cloaked shows the HWND again while the cloak keeps
+/// it off-screen — the "it comes back on its own" signature. The diagnostics
+/// line records what was mapped before and after, and whether the OS actually
+/// granted foreground (it refuses unless the caller already owns it).
 pub fn focus_window_now(window: &Window) {
     #[cfg(target_os = "windows")]
     {
@@ -476,6 +486,7 @@ pub fn focus_window_now(window: &Window) {
         extern "system" {
             fn GetForegroundWindow() -> isize;
             fn SetForegroundWindow(hwnd: isize) -> i32;
+            fn IsWindowVisible(hwnd: isize) -> i32;
             fn SetWindowPos(
                 hwnd: isize,
                 after: isize,
@@ -495,6 +506,8 @@ pub fn focus_window_now(window: &Window) {
             if let RawWindowHandle::Win32(h) = wh.as_raw() {
                 let hwnd = h.hwnd.get() as isize;
                 unsafe {
+                    let fg_before = GetForegroundWindow();
+                    let vis_before = IsWindowVisible(hwnd) != 0;
                     SetWindowPos(
                         hwnd,
                         HWND_TOP,
@@ -507,6 +520,12 @@ pub fn focus_window_now(window: &Window) {
                     if GetForegroundWindow() != hwnd {
                         SetForegroundWindow(hwnd);
                     }
+                    crate::diag::diag(&format!(
+                        "nui focus_now hwnd=0x{hwnd:x} mapped={vis_before}->{} fg=0x{fg_before:x}->0x{:x} granted={}",
+                        IsWindowVisible(hwnd) != 0,
+                        GetForegroundWindow(),
+                        GetForegroundWindow() == hwnd
+                    ));
                 }
             }
         }
@@ -706,6 +725,8 @@ pub struct ManagedWindow {
     pub ui_state: UiState,
     pub size: (u32, u32),
     pub visible: bool,
+    /// Reveal retries already spent while waiting for the first frame.
+    pub reveal_retries: u32,
     /// One-shot screenshot path: taken (and cleared) by the next `RedrawRequested`
     /// render of this window, e.g. `--open-window monitoring --screenshot out.png`.
     pub screenshot_once: Option<String>,
@@ -717,6 +738,51 @@ pub struct WindowManager {
     /// first fill use it, so the pre-first-frame background matches the theme.
     base: crate::widgets::Color,
     icon_resource: Option<u16>,
+}
+
+/// One window's logical state next to the OS's own answers. The two disagree
+/// exactly when a toggle looks like it "did nothing" or "came back".
+#[derive(Clone, Debug)]
+pub struct WindowProbe {
+    pub key: &'static str,
+    /// What the app believes (`ManagedWindow::visible`).
+    pub logical_visible: bool,
+    /// Show requested, first present not yet delivered.
+    pub pending_reveal: bool,
+    pub reveal_ms: Option<f64>,
+    /// Frames actually presented since creation.
+    pub frames: u64,
+    /// `IsWindowVisible` — mapped per the OS.
+    pub os_visible: bool,
+    /// `DWMWA_CLOAK` — composed off-screen.
+    pub cloaked: bool,
+    pub size: (u32, u32),
+    pub minimized: bool,
+}
+
+impl WindowProbe {
+    /// `true` when what the user sees cannot match what the app reports:
+    /// logically shown but the OS keeps it cloaked/hidden, or the reverse.
+    pub fn diverged(&self) -> bool {
+        self.logical_visible != (self.os_visible && !self.cloaked)
+    }
+
+    /// Compact one-line form for the event log.
+    pub fn summary(&self) -> String {
+        let pend = match self.reveal_ms {
+            Some(ms) => format!("{ms:.0}ms"),
+            None => "-".to_string(),
+        };
+        format!(
+            "{}[log={} os={} cloak={} pend={} f={}]",
+            self.key,
+            u8::from(self.logical_visible),
+            u8::from(self.os_visible),
+            u8::from(self.cloaked),
+            pend,
+            self.frames
+        )
+    }
 }
 
 /// Apply the executable's embedded icon resource to a native window.
@@ -826,6 +892,16 @@ impl WindowManager {
         }
         let attrs = Self::build_window_attrs(spec).with_visible(visible);
         let (window, mut renderer) = Renderer::new(event_loop, attrs, prefer, self.base);
+        renderer.set_label(spec.key);
+        let sz = window.inner_size();
+        crate::diag::diag(&format!(
+            "nui[{}] CREATE backend={:?} requested_visible={visible} size={}x{} pending_reveal={}",
+            spec.key,
+            renderer.active,
+            sz.width,
+            sz.height,
+            renderer.probe().pending_reveal
+        ));
         install_taskbar_group(&window);
         if let Some(id) = self.icon_resource {
             set_window_icon_from_executable(&window, id);
@@ -833,7 +909,6 @@ impl WindowManager {
         if visible {
             renderer.request_reveal();
         }
-        let sz = window.inner_size();
         self.windows.push(ManagedWindow {
             key: spec.key,
             title: spec.title.to_string(),
@@ -843,6 +918,7 @@ impl WindowManager {
             ui_state: UiState::new(),
             size: (sz.width, sz.height),
             visible,
+            reveal_retries: 0,
             screenshot_once: None,
         });
         self.windows.len() - 1
@@ -852,8 +928,17 @@ impl WindowManager {
     /// `set_visible(true)` happens at the end of its first `render()` — after the
     /// frame is swapped — so the window never flashes white.
     pub fn show(&mut self, event_loop: &ActiveEventLoop, spec: &WindowSpec, prefer: BackendKind) {
+        let existed = self.windows.iter().any(|w| w.key == spec.key);
         let idx = self.ensure_window(event_loop, spec, prefer, true);
         let w = &mut self.windows[idx];
+        crate::diag::diag(&format!(
+            "nui[{}] SHOW existed={existed} logical_was={} os_visible={} cloaked={} frames={}",
+            spec.key,
+            w.visible,
+            w.renderer.os_visible(),
+            w.renderer.os_cloaked(),
+            w.renderer.probe().frames
+        ));
         w.visible = true;
         w.renderer.request_reveal();
         w.window.request_redraw();
@@ -889,6 +974,73 @@ impl WindowManager {
             .find(|w| w.key == key)
             .map(|w| w.visible)
             .unwrap_or(false)
+    }
+
+    /// Full state of one window — the host's watchdog input. `None` when the
+    /// window has never been created this session.
+    pub fn probe(&self, key: &str) -> Option<WindowProbe> {
+        self.windows.iter().find(|w| w.key == key).map(|w| {
+            let probe = w.renderer.probe();
+            WindowProbe {
+                key: w.key,
+                logical_visible: w.visible,
+                pending_reveal: probe.pending_reveal,
+                reveal_ms: probe.reveal_ms,
+                frames: probe.frames,
+                os_visible: probe.os_visible,
+                cloaked: probe.cloaked,
+                size: w.size,
+                minimized: w.window.is_minimized().unwrap_or(false),
+            }
+        })
+    }
+
+    /// Every created window's state, in creation order.
+    pub fn probes(&self) -> Vec<WindowProbe> {
+        self.windows
+            .iter()
+            .map(|w| {
+                let probe = w.renderer.probe();
+                WindowProbe {
+                    key: w.key,
+                    logical_visible: w.visible,
+                    pending_reveal: probe.pending_reveal,
+                    reveal_ms: probe.reveal_ms,
+                    frames: probe.frames,
+                    os_visible: probe.os_visible,
+                    cloaked: probe.cloaked,
+                    size: w.size,
+                    minimized: w.window.is_minimized().unwrap_or(false),
+                }
+            })
+            .collect()
+    }
+
+    /// Re-nudge reveals that have waited longer than `threshold_ms` for their
+    /// first frame, up to `MAX_REVEAL_RETRIES`. Returns
+    /// `(key, waited_ms, attempt)` for every retry so the host can log them —
+    /// a silent recovery would hide the fact that the first request was lost.
+    pub fn retry_pending_reveals(
+        &mut self,
+        threshold_ms: f64,
+    ) -> Vec<(&'static str, f64, u32)> {
+        const MAX_REVEAL_RETRIES: u32 = 12;
+        let mut out = Vec::new();
+        for w in &mut self.windows {
+            let probe = w.renderer.probe();
+            if !probe.pending_reveal {
+                w.reveal_retries = 0;
+                continue;
+            }
+            let waited = probe.reveal_ms.unwrap_or(0.0);
+            if waited < threshold_ms || w.reveal_retries >= MAX_REVEAL_RETRIES {
+                continue;
+            }
+            w.reveal_retries += 1;
+            w.renderer.nudge_redraw();
+            out.push((w.key, waited, w.reveal_retries));
+        }
+        out
     }
 
     pub fn find_by_id_mut(&mut self, id: WindowId) -> Option<&mut ManagedWindow> {

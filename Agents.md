@@ -7,10 +7,16 @@
 
 ## Diagnostics you will need
 
-- **`event_log.txt`** (next to `user.json`, truncated per session): every key event with its global-pass
-  decision, window-toggle transitions, window close/hide paths, and **focus transitions polled from the
-  OS** (`nui::is_foreground`, so focus is recorded even when no winit event reaches the app). First stop
-  for any "shortcut does nothing / window opens twice / focus behaves oddly" report.
+- **`event_log.txt`** (next to `user.json`, truncated per session, flushed per line, `[ms #seq]` on every
+  line): every key event with its target window, the **OS foreground at that instant** and physical
+  modifiers; the global-pass decision and its reason; every queued toggle with its **source**
+  (`global-key`/`toolbar`/`dropzone`/`startup`) and the app's logical state next to the OS's own answers
+  (`IsWindowVisible`, `DWMWA_CLOAKED`, frames presented); focus transitions polled from the OS; and the
+  derived alarms **`DUP-PRESS`** (two presses per physical key), **`BOUNCE`** (same window toggled twice
+  in <200 ms), **`STALL`** (a show that never got its frame) and **`reveal RETRY`**. `--trace` adds every
+  presented frame. First stop for any "shortcut does nothing / window opens twice / focus behaves oddly"
+  report — see **[`docs/window-toggle-diagnostics.md`](docs/window-toggle-diagnostics.md)** for the line
+  catalogue, the reading recipes and the reproduced lost-paint root cause.
 - **`perf_log.txt`** (same folder): startup, open-to-track-ready, frame-pacing windows, `--render`/`--latency-probe` output.
 - **Never trust tracked modifier state** (`ModifiersChanged`) for global shortcuts: it goes stale whenever
   focus leaves while a modifier is held (Alt+Tab / Win / AltGr), and a late event can re-poison it. Ask the
@@ -38,6 +44,7 @@ The workspace has **three crates**: the reusable `nui` library, `nui-demo` (a st
 |---|---|
 | **[`docs/handover_2026-10-24.md`](docs/handover_2026-10-24.md)** | **Current working state** — implemented engines, accepted behavior, verification checkpoints, and final unverified latency change |
 | **[`docs/development_plan.md`](docs/development_plan.md)** | Master roadmap & history — benchmarks, solved traps, Phase 1–3 checklist |
+| [`docs/window-toggle-diagnostics.md`](docs/window-toggle-diagnostics.md) | `event_log.txt` line catalogue, reading recipes, and the reproduced lost-first-paint root cause behind "the window never shows" |
 | [`docs/FINDINGS.md`](docs/FINDINGS.md) | Initial M1–M4 POC benchmark numbers and 6 core findings |
 | [`docs/rust-rewrite-assessment.md`](docs/rust-rewrite-assessment.md) | Full feature inventory of Electron SoundApp and Rust crate mapping |
 | [`docs/rust-native-ui-exploration.md`](docs/rust-native-ui-exploration.md) | Bare-metal UI tier analysis and widget inventory |

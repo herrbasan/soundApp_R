@@ -6,6 +6,7 @@
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Instant;
 
 use glow::HasContext;
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
@@ -642,6 +643,29 @@ pub struct Renderer {
     /// Set by `request_reveal`; the next completed present maps the window and
     /// focuses it, so the native surface is never shown unpainted (white flash).
     pending_reveal: bool,
+    /// When `pending_reveal` was last set — a reveal that never completes is
+    /// a window the host believes is up and the user never sees.
+    reveal_at: Option<Instant>,
+    /// Frames actually presented (swap_buffers / present returned). Divergence
+    /// between "asked to redraw" and this counter is the invisible-window case.
+    frames: u64,
+    /// Host label (`"main"`, `"mixer"`, …) used only to prefix diagnostics.
+    label: String,
+}
+
+/// Everything needed to tell a healthy window from a state divergence without
+/// guessing: the host's logical flag next to the OS's own answers.
+#[derive(Clone, Debug)]
+pub struct RendererProbe {
+    pub pending_reveal: bool,
+    /// Milliseconds since the reveal was requested; `None` when none is pending.
+    pub reveal_ms: Option<f64>,
+    pub frames: u64,
+    /// `\(WS_VISIBLE\)` — the OS's idea of mapped, independent of DWM cloak.
+    pub os_visible: bool,
+    /// `DWMWA_CLOAK` — composed off-screen. A cloaked-but-visible window is the
+    /// "it toggled on and nothing appeared" signature.
+    pub cloaked: bool,
 }
 
 /// Real Win32 client rect in physical pixels. winit's `inner_size` trusts its
@@ -703,6 +727,9 @@ impl Renderer {
                         cpu: None,
                         window: win,
                         pending_reveal: true,
+                        reveal_at: Some(Instant::now()),
+                        frames: 0,
+                        label: String::new(),
                     },
                 );
             }
@@ -726,6 +753,9 @@ impl Renderer {
                 cpu: Some(cpu),
                 window: win,
                 pending_reveal: true,
+                reveal_at: Some(Instant::now()),
+                frames: 0,
+                label: String::new(),
             },
         )
     }
@@ -772,7 +802,7 @@ impl Renderer {
     }
 
     #[cfg(target_os = "windows")]
-    fn focus_window_fast(win: &Window) {
+    fn focus_window_fast(win: &Window) -> String {
         use raw_window_handle::RawWindowHandle;
         #[link(name = "user32")]
         extern "system" {
@@ -797,6 +827,7 @@ impl Renderer {
             if let RawWindowHandle::Win32(h) = wh.as_raw() {
                 let hwnd = h.hwnd.get() as isize;
                 unsafe {
+                    let before = GetForegroundWindow();
                     SetWindowPos(
                         hwnd,
                         HWND_TOP,
@@ -806,20 +837,27 @@ impl Renderer {
                         0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     );
-                    if GetForegroundWindow() != hwnd {
+                    if before != hwnd {
                         // winit's focus_window sends a synthetic Alt tap to steal
                         // foreground rights; that blocks ~800 ms on this system.
                         // A plain SetForegroundWindow is instant for a
                         // user-launched process and is sufficient here.
-                        SetForegroundWindow(hwnd);
+                        let ok = SetForegroundWindow(hwnd);
+                        return format!(
+                            "setfg={ok} already={} before=0x{before:x} after=0x{:x}",
+                            before == hwnd,
+                            GetForegroundWindow()
+                        );
                     }
+                    return "already-foreground".to_string();
                 }
             }
         }
+        "no-hwnd".to_string()
     }
 
     #[cfg(target_os = "windows")]
-    fn set_win32_cloak(win: &Window, cloak: bool) {
+    fn set_win32_cloak(win: &Window, cloak: bool) -> i32 {
         use raw_window_handle::RawWindowHandle;
         #[link(name = "dwmapi")]
         extern "system" {
@@ -834,16 +872,17 @@ impl Renderer {
         if let Ok(wh) = win.window_handle() {
             if let RawWindowHandle::Win32(h) = wh.as_raw() {
                 let val: u32 = if cloak { 1 } else { 0 };
-                unsafe {
-                    let _ = DwmSetWindowAttribute(
+                return unsafe {
+                    DwmSetWindowAttribute(
                         h.hwnd.get(),
                         DWMWA_CLOAK,
                         &val as *const u32,
                         std::mem::size_of::<u32>() as u32,
-                    );
-                }
+                    )
+                };
             }
         }
+        -1
     }
 
     /// Stop Windows from painting a non-client frame on this window.
@@ -986,16 +1025,67 @@ impl Renderer {
 
     /// Request that the window be revealed and focused once the next frame is presented.
     pub fn request_reveal(&mut self) {
+        crate::diag::diag(&format!(
+            "nui[{}] reveal REQUEST pending_was={} os_visible={} cloaked={} frames={}",
+            self.label,
+            self.pending_reveal,
+            self.os_visible(),
+            self.os_cloaked(),
+            self.frames
+        ));
         self.pending_reveal = true;
+        self.reveal_at = Some(Instant::now());
         #[cfg(target_os = "windows")]
-        Self::set_win32_cloak(&self.window, true);
+        {
+            let set_hr = Self::set_win32_cloak(&self.window, true);
+            let (cloaked, get_hr) = self.cloak_state();
+            crate::diag::diag(&format!(
+                "nui[{}]   cloak set hr=0x{:08x} -> readback={cloaked} (hr=0x{:08x}) os_visible={}",
+                self.label,
+                set_hr as u32,
+                get_hr as u32,
+                self.os_visible()
+            ));
+        }
         self.window.set_visible(true);
         #[cfg(target_os = "windows")]
         {
+            let (cloaked, hr) = self.cloak_state();
+            crate::diag::diag(&format!(
+                "nui[{}]   set_visible(true) -> cloak={cloaked} (hr=0x{:08x}) os_visible={}",
+                self.label,
+                hr as u32,
+                self.os_visible()
+            ));
             // `set_visible` restores winit's frame bits. Strip them while the
             // window is still cloaked: doing this during reveal makes
             // `SWP_FRAMECHANGED` block for over a second on some drivers.
             Self::strip_frame_styles(&self.window);
+            let (cloaked, hr) = self.cloak_state();
+            crate::diag::diag(&format!(
+                "nui[{}]   strip_frame_styles -> cloak={cloaked} (hr=0x{:08x}) os_visible={}",
+                self.label,
+                hr as u32,
+                self.os_visible()
+            ));
+        }
+        // Mark the client area dirty before asking for the redraw. A window
+        // that was cloaked+hidden and is mapped again has an EMPTY update
+        // region, so `request_redraw` (RDW_INTERNALPAINT) can produce no
+        // WM_PAINT at all — the reveal then waits for a frame that never
+        // comes and the window stays cloaked while `visible` is true. Measured
+        // on the 2nd show of an existing window, ~1 press in 2.
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "user32")]
+            extern "system" {
+                fn InvalidateRect(hwnd: isize, rect: *const [i32; 4], erase: i32) -> i32;
+            }
+            if let Some(hwnd) = self.hwnd() {
+                unsafe {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
         }
         self.window.request_redraw();
     }
@@ -1003,16 +1093,46 @@ impl Renderer {
     /// Cloak and hide the window so re-showing it later via `request_reveal()`
     /// still receives `WM_PAINT` (`RedrawRequested`) without flashing.
     pub fn cloak_and_hide(&mut self) {
+        crate::diag::diag(&format!(
+            "nui[{}] cloak+HIDE pending_was={} os_visible={} cloaked={} frames={}",
+            self.label,
+            self.pending_reveal,
+            self.os_visible(),
+            self.os_cloaked(),
+            self.frames
+        ));
         self.pending_reveal = false;
+        self.reveal_at = None;
         #[cfg(target_os = "windows")]
         Self::set_win32_cloak(&self.window, true);
         self.window.set_visible(false);
+    }
+
+    /// Re-issue the paint request for a reveal that has produced no frame.
+    /// `set_visible` is deferred to winit's thread executor, so a redraw asked
+    /// for immediately after a re-show can land while the HWND is still hidden
+    /// — Windows discards the internal paint and the reveal waits forever.
+    pub fn nudge_redraw(&self) {
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "user32")]
+            extern "system" {
+                fn InvalidateRect(hwnd: isize, rect: *const [i32; 4], erase: i32) -> i32;
+            }
+            if let Some(hwnd) = self.hwnd() {
+                unsafe {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+        }
+        self.window.request_redraw();
     }
 
     /// Uncloak + map + focus the window after the first completed present.
     fn reveal_if_pending(&mut self) {
         if self.pending_reveal {
             self.pending_reveal = false;
+            let waited = self.reveal_at.take().map(|t| t.elapsed().as_secs_f64() * 1000.0);
             self.window.set_visible(true);
             #[cfg(target_os = "windows")]
             {
@@ -1022,10 +1142,110 @@ impl Renderer {
                 Self::set_win32_cloak(&self.window, false);
             }
             #[cfg(target_os = "windows")]
-            Self::focus_window_fast(&self.window);
+            let focus = Self::focus_window_fast(&self.window);
             #[cfg(not(target_os = "windows"))]
-            self.window.focus_window();
+            let focus = {
+                self.window.focus_window();
+                "unknown".to_string()
+            };
+            crate::diag::diag(&format!(
+                "nui[{}] reveal DONE wait={:.0}ms frames={} os_visible={} cloaked={} focus={focus}",
+                self.label,
+                waited.unwrap_or(-1.0),
+                self.frames,
+                self.os_visible(),
+                self.os_cloaked(),
+            ));
         }
+    }
+
+    /// Host label used only to prefix diagnostics (`"main"`, `"mixer"`, …).
+    pub fn set_label(&mut self, label: &str) {
+        self.label = label.to_string();
+    }
+
+    /// Logical + OS state of this window, for host watchdogs.
+    pub fn probe(&self) -> RendererProbe {
+        RendererProbe {
+            pending_reveal: self.pending_reveal,
+            reveal_ms: self
+                .reveal_at
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0),
+            frames: self.frames,
+            os_visible: self.os_visible(),
+            cloaked: self.os_cloaked(),
+        }
+    }
+
+    /// `WS_VISIBLE` per the OS: mapping state, unaffected by DWM cloak.
+    pub fn os_visible(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "user32")]
+            extern "system" {
+                fn IsWindowVisible(hwnd: isize) -> i32;
+            }
+            if let Some(hwnd) = self.hwnd() {
+                return unsafe { IsWindowVisible(hwnd) != 0 };
+            }
+            false
+        }
+        #[cfg(not(target_os = "windows"))]
+        false
+    }
+
+    /// `DWMWA_CLOAK` — true while DWM keeps the window off-screen. The read is
+    /// reported with its own HRESULT: a failed query returning 0 would otherwise
+    /// read as "not cloaked" and quietly discredit the whole trace.
+    pub fn os_cloaked(&self) -> bool {
+        self.cloak_state().0
+    }
+
+    /// `(cloaked, hresult)` of the `DWMWA_CLOAKED` query (attribute 14 — the
+    /// readable one; `DWMWA_CLOAK` (13) is write-only and the query answers
+    /// E_INVALIDARG, which would otherwise be logged as "not cloaked").
+    pub fn cloak_state(&self) -> (bool, i32) {
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "dwmapi")]
+            extern "system" {
+                fn DwmGetWindowAttribute(
+                    hwnd: isize,
+                    attribute: u32,
+                    value: *mut std::ffi::c_void,
+                    size: u32,
+                ) -> i32;
+            }
+            const DWMWA_CLOAKED: u32 = 14;
+            if let Some(hwnd) = self.hwnd() {
+                let mut val: u32 = 0;
+                let hr = unsafe {
+                    DwmGetWindowAttribute(
+                        hwnd,
+                        DWMWA_CLOAKED,
+                        &mut val as *mut u32 as *mut std::ffi::c_void,
+                        4,
+                    )
+                };
+                return (hr == 0 && val != 0, hr);
+            }
+            (false, -1)
+        }
+        #[cfg(not(target_os = "windows"))]
+        (false, 0)
+    }
+
+    fn hwnd(&self) -> Option<isize> {
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::RawWindowHandle;
+            if let Ok(wh) = self.window.window_handle() {
+                if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                    return Some(h.hwnd.get() as isize);
+                }
+            }
+        }
+        None
     }
 
     fn init_cpu(win: &Arc<Window>) -> CpuState {
@@ -1304,6 +1524,7 @@ impl Renderer {
                 }
             }
         }
+        self.frames += 1;
         self.reveal_if_pending();
     }
 
@@ -1322,6 +1543,7 @@ impl Renderer {
             BackendKind::Gpu => self.render_gpu(w, h, scene, text_sys, screenshot_path),
             BackendKind::Cpu => self.render_cpu(w, h, scene, text_sys, screenshot_path),
         }
+        self.frames += 1;
         self.reveal_if_pending();
     }
 

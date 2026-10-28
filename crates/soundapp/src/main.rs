@@ -310,7 +310,19 @@ struct App {
     cover_fade: Option<CoverFade>,
     /// Last logged foreground window (OS-observed, `None` = outside the app).
     focus_log: Option<String>,
-    pending_window_toggles: Vec<&'static str>,
+    pending_window_toggles: Vec<ToggleRequest>,
+    /// Divergence watchdog: last sampled (logical, os_visible, cloaked) per
+    /// window, sampled in `about_to_wait` — the app's belief next to the OS's.
+    diag_prev: Vec<(String, bool, bool, bool)>,
+    diag_at: Instant,
+    /// Reveal stalls / stuck divergences already reported, so a wedged window
+    /// writes one line per episode (and a slow repeat), not one per poll.
+    diag_stalls: Vec<DiagStall>,
+    /// Duplicate-delivery detector: last handled key press and last release.
+    last_press: Option<(String, Instant)>,
+    last_release: Option<Instant>,
+    /// Last toggle per window key: (key, when, now_visible).
+    last_toggle: Vec<(&'static str, Instant, bool)>,
     /// MRU focus ring (`"main"` or a secondary key). Hiding the focused window
     /// restores focus to the previous visible entry, so keyboard shortcuts never
     /// fall into a focus void.
@@ -523,6 +535,24 @@ fn window_toggle_for_key(ch: &str) -> Option<&'static str> {
     }
 }
 
+/// One queued secondary-window show/hide request, tagged with the code path
+/// that asked for it. A window that toggles twice for one key press is
+/// undebuggable without knowing both callers.
+#[derive(Clone, Copy, Debug)]
+struct ToggleRequest {
+    key: &'static str,
+    source: &'static str,
+}
+
+/// A window state that has stayed wrong long enough to be worth a line.
+struct DiagStall {
+    key: String,
+    kind: &'static str,
+    since: Instant,
+    last: Instant,
+    count: u32,
+}
+
 /// A key that works regardless of which SoundApp window is focused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GlobalAction {
@@ -723,27 +753,239 @@ struct SavedGeom {
     visible: bool,
 }
 
+/// Physical modifier state with detail (ctrl, alt, win, shift) — the log needs
+/// to say *which* modifier was down, not just that one was.
+#[cfg(windows)]
+fn physical_mods() -> (bool, bool, bool, bool) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    const VK_SHIFT: i32 = 0x10;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12;
+    const VK_LWIN: i32 = 0x5B;
+    const VK_RWIN: i32 = 0x5C;
+    unsafe {
+        (
+            GetAsyncKeyState(VK_CONTROL) < 0,
+            GetAsyncKeyState(VK_MENU) < 0,
+            GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0,
+            GetAsyncKeyState(VK_SHIFT) < 0,
+        )
+    }
+}
+
+#[cfg(not(windows))]
+fn physical_mods() -> (bool, bool, bool, bool) {
+    (false, false, false, false)
+}
+
+fn mods_str() -> String {
+    let (c, a, w, s) = physical_mods();
+    let mut out = String::new();
+    if c {
+        out.push_str("ctrl+");
+    }
+    if a {
+        out.push_str("alt+");
+    }
+    if w {
+        out.push_str("win+");
+    }
+    if s {
+        out.push_str("shift+");
+    }
+    if out.is_empty() {
+        out.push('-');
+    } else {
+        out.pop();
+    }
+    out
+}
+
+/// The key as a short readable token (`'m'`, `Escape`, `Space`, …).
+fn key_token(key: &Key) -> String {
+    match key {
+        Key::Character(c) => format!("'{c}'"),
+        Key::Named(n) => format!("{n:?}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `-` for `None`, otherwise whole milliseconds.
+fn fmt_dt(ms: Option<f64>) -> String {
+    match ms {
+        Some(v) => format!("{v:.0}ms"),
+        None => "-".to_string(),
+    }
+}
+
+/// OS foreground resolved to one of this app's window keys.
+fn os_focus(app: &App) -> Option<&'static str> {
+    if let Some(w) = &app.window {
+        if nui::is_foreground(w) {
+            return Some("main");
+        }
+    }
+    app.secondary_windows
+        .windows
+        .iter()
+        .find(|mw| mw.visible && nui::is_foreground(&mw.window))
+        .map(|mw| mw.key)
+}
+
+/// One-line state of every app window: logical flag, OS mapping, DWM cloak and
+/// presented-frame count. This is what makes a "nothing happened" press
+/// decidable instead of speculative. Windows that were never created this
+/// session say so — "is the window even there" is the first question a toggle
+/// bug raises.
+fn windows_state(app: &App) -> String {
+    const KEYS: &[&str] = &["parameters", "monitoring", "mixer", "settings", "help"];
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(r) = app.renderer.as_ref() {
+        let p = r.probe();
+        parts.push(format!(
+            "main[pend={} f={} os={} cloak={}]",
+            match p.reveal_ms {
+                Some(ms) => format!("{ms:.0}ms"),
+                None => "-".to_string(),
+            },
+            p.frames,
+            u8::from(p.os_visible),
+            u8::from(p.cloaked)
+        ));
+    } else {
+        parts.push("main[no-renderer]".to_string());
+    }
+    for key in KEYS {
+        match app.secondary_windows.probe(key) {
+            Some(p) => parts.push(p.summary()),
+            None => parts.push(format!("{key}[absent]")),
+        }
+    }
+    parts.join(" ")
+}
+
+/// Log the tracked window state when it diverges from the previous sample, and
+/// keep a stuck reveal / stuck divergence visible with a bounded repeat.
+fn diag_watch(app: &mut App) {
+    let now = Instant::now();
+    if now.duration_since(app.diag_at) < Duration::from_millis(100) {
+        return;
+    }
+    app.diag_at = now;
+    let probes = app.secondary_windows.probes();
+
+    for p in &probes {
+        let cur = (p.logical_visible, p.os_visible, p.cloaked);
+        let prev = app
+            .diag_prev
+            .iter()
+            .find(|(k, ..)| k == p.key)
+            .map(|t| (t.1, t.2, t.3));
+        match prev {
+            None => {
+                app.diag_prev.push((p.key.to_string(), cur.0, cur.1, cur.2));
+                eventlog::note(&format!("watch {} (first sample)", p.summary()));
+            }
+            Some(prev) if prev != cur => {
+                eventlog::note(&format!(
+                    "watch {} -> {} divergence={}",
+                    p.summary(),
+                    format!(
+                        "log={} os={} cloak={}",
+                        u8::from(cur.0),
+                        u8::from(cur.1),
+                        u8::from(cur.2)
+                    ),
+                    u8::from(p.diverged())
+                ));
+                if let Some(slot) = app.diag_prev.iter_mut().find(|(k, ..)| k == p.key) {
+                    *slot = (p.key.to_string(), cur.0, cur.1, cur.2);
+                }
+            }
+            Some(_) => {}
+        }
+
+        // A reveal that never gets a frame, or a state that stays diverged, is
+        // the whole bug — report each episode once, then once per second.
+        let kind = if p.pending_reveal && p.reveal_ms.unwrap_or(0.0) > 400.0 {
+            Some("reveal-stall")
+        } else if p.diverged() && p.reveal_ms.map_or(true, |ms| ms > 200.0) {
+            // A show that is still in flight is not yet a divergence.
+            Some("diverged")
+        } else {
+            None
+        };
+        match kind {
+            Some(kind) => {
+                let i = match app.diag_stalls.iter().position(|s| s.key == p.key) {
+                    Some(i) => {
+                        let s = &mut app.diag_stalls[i];
+                        if s.kind != kind {
+                            s.kind = kind;
+                            s.since = now;
+                            s.last = now;
+                            s.count = 0;
+                        }
+                        i
+                    }
+                    None => {
+                        app.diag_stalls.push(DiagStall {
+                            key: p.key.to_string(),
+                            kind,
+                            since: now,
+                            last: now,
+                            count: 0,
+                        });
+                        app.diag_stalls.len() - 1
+                    }
+                };
+                let s = &mut app.diag_stalls[i];
+                let due = s.count == 0 || now.duration_since(s.last) >= Duration::from_secs(1);
+                let held = now.duration_since(s.since).as_secs_f64() * 1000.0;
+                let count = s.count;
+                if due {
+                    let state = windows_state(app);
+                    let fg = os_focus(app).unwrap_or("outside");
+                    let summary = p.summary();
+                    eventlog::note(&format!(
+                        "STALL {kind} {summary} held={held:.0}ms fg={fg} :: {state}",
+                    ));
+                    if let Some(s) = app.diag_stalls.get_mut(i) {
+                        s.last = now;
+                        s.count = count + 1;
+                    }
+                }
+            }
+            None => {
+                if let Some(i) = app.diag_stalls.iter().position(|s| s.key == p.key) {
+                    let s = app.diag_stalls.remove(i);
+                    eventlog::note(&format!(
+                        "STALL {} cleared after {:.0}ms ({} lines)",
+                        s.key,
+                        now.duration_since(s.since).as_secs_f64() * 1000.0,
+                        s.count
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// Log which SoundApp window owns OS keyboard focus, on every change. Polled
 /// from the OS rather than inferred from events: focus can move without any
 /// event reaching us, and a missing trace of that is exactly what makes focus
 /// bugs unreproducible.
 fn log_focus_change(app: &mut App) {
-    let mut current: Option<&'static str> = None;
-    if let Some(w) = &app.window {
-        if nui::is_foreground(w) {
-            current = Some("main");
-        }
-    }
-    if current.is_none() {
-        for mw in &app.secondary_windows.windows {
-            if mw.visible && nui::is_foreground(&mw.window) {
-                current = Some(mw.key);
-                break;
-            }
-        }
-    }
+    let current = os_focus(app);
     if current != app.focus_log.as_deref() {
-        eventlog::note(&format!("focus -> {}", current.unwrap_or("outside")));
+        eventlog::note(&format!(
+            "focus -> {} :: {}",
+            current.unwrap_or("outside"),
+            windows_state(app)
+        ));
         app.focus_log = current.map(str::to_string);
     }
 }
@@ -2860,6 +3102,12 @@ impl App {
             cover_fade: None,
             focus_log: Some("<unset>".to_string()),
             pending_window_toggles: Vec::new(),
+            diag_prev: Vec::new(),
+            diag_at: Instant::now(),
+            diag_stalls: Vec::new(),
+            last_press: None,
+            last_release: None,
+            last_toggle: Vec::new(),
             focus_ring: VecDeque::from(["main"]),
             open_requests: None,
             open_window_spec: None,
@@ -3611,6 +3859,7 @@ impl App {
     }
 
     fn reveal_and_focus_main(&mut self) {
+        eventlog::note(&format!("reveal+focus main :: {}", windows_state(self)));
         if let Some(renderer) = &mut self.renderer {
             renderer.request_reveal();
         } else if let Some(window) = &self.window {
@@ -3636,6 +3885,11 @@ impl App {
 
     /// Hide the player to the tray when the option is enabled; otherwise close.
     fn hide_to_tray(&mut self) {
+        eventlog::note(&format!(
+            "hide-to-tray fg={} :: {}",
+            os_focus(self).unwrap_or("outside"),
+            windows_state(self)
+        ));
         if let Some(renderer) = &mut self.renderer {
             renderer.cloak_and_hide();
         }
@@ -3643,6 +3897,7 @@ impl App {
     }
 
     fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        eventlog::note(&format!("request-close keep_tray={}", self.sw_keep_tray));
         if self.sw_keep_tray {
             self.hide_to_tray();
         } else {
@@ -3683,7 +3938,7 @@ impl App {
                 }
                 ScanOutcome::MixerStems(files) => {
                     let opening = self.secondary_windows.is_visible("mixer")
-                        || self.pending_window_toggles.contains(&"mixer");
+                        || self.pending_window_toggles.iter().any(|r| r.key == "mixer");
                     if opening && !files.is_empty() {
                         self.open_mixer_with_paths(files);
                         redraw = true;
@@ -4494,13 +4749,22 @@ impl App {
             self.apply_zoom();
         }
         if intents.toggle_settings {
-            self.pending_window_toggles.push("settings");
+            self.pending_window_toggles.push(ToggleRequest {
+                key: "settings",
+                source: "toolbar",
+            });
         }
         if intents.toggle_monitoring {
-            self.pending_window_toggles.push("monitoring");
+            self.pending_window_toggles.push(ToggleRequest {
+                key: "monitoring",
+                source: "toolbar",
+            });
         }
         if intents.toggle_parameters {
-            self.pending_window_toggles.push("parameters");
+            self.pending_window_toggles.push(ToggleRequest {
+                key: "parameters",
+                source: "toolbar",
+            });
         }
         if intents.toggle_play {
             if let Some(a) = &self.audio {
@@ -4548,7 +4812,10 @@ impl App {
                         .scan_tx
                         .send((self.scan_gen, ScanJob::MixerPath { path, recursive }));
                     if !self.secondary_windows.is_visible("mixer") {
-                        self.pending_window_toggles.push("mixer");
+                        self.pending_window_toggles.push(ToggleRequest {
+                            key: "mixer",
+                            source: "dropzone",
+                        });
                     }
                 }
             }
@@ -4742,6 +5009,7 @@ impl App {
             .unwrap_or("main");
         if target == "main" {
             if let Some(window) = &self.window {
+                eventlog::note(&format!("restore-focus after={hidden} -> main"));
                 nui::focus_window_now(window);
             }
         } else if let Some(managed) = self
@@ -4750,6 +5018,7 @@ impl App {
             .iter()
             .find(|window| window.key == target)
         {
+            eventlog::note(&format!("restore-focus after={hidden} -> {target}"));
             nui::focus_window_now(&managed.window);
         }
     }
@@ -4785,6 +5054,7 @@ impl App {
         // guard a slightly long press toggles the window two or three times
         // (the "opens twice / sometimes doesn't open" unreliability).
         if event.repeat {
+            eventlog::trace("global pass skipped: repeat");
             return false;
         }
         let Key::Character(ch) = &event.logical_key else {
@@ -4793,16 +5063,29 @@ impl App {
         // Physical modifier check (OS truth) - the tracked self.modifiers is
         // not trustworthy across focus changes.
         if modifiers_physically_down() || self.any_text_input_focused() {
-            eventlog::note(&format!("global '{ch}' SUPPRESSED (modifier down or text focus)"));
+            eventlog::note(&format!(
+                "global '{ch}' SUPPRESSED mods={} text_focus={} :: tracked={:?}",
+                mods_str(),
+                self.any_text_input_focused(),
+                self.modifiers
+            ));
             return false;
         }
         let action = global_action_for(ch);
-        if let Some(a) = action {
-            eventlog::note(&format!("global '{ch}' -> {a:?}"));
+        match &action {
+            Some(a) => eventlog::note(&format!(
+                "global '{ch}' -> {a:?} fg={} :: {}",
+                os_focus(self).unwrap_or("outside"),
+                windows_state(self)
+            )),
+            None => eventlog::trace(&format!("global '{ch}' -> no action")),
         }
         match action {
             Some(GlobalAction::ToggleWindow(key)) => {
-                self.pending_window_toggles.push(key);
+                self.pending_window_toggles.push(ToggleRequest {
+                    key,
+                    source: "global-key",
+                });
                 self.process_window_toggles(event_loop);
             }
             Some(GlobalAction::ToggleTheme) => {
@@ -4856,13 +5139,36 @@ impl App {
             return;
         }
         let pending = std::mem::take(&mut self.pending_window_toggles);
-        for key in pending {
+        for req in pending {
+            let ToggleRequest { key, source } = req;
             let was_visible = self.secondary_windows.is_visible(key);
+            let before = self.secondary_windows.probe(key);
+            let now = Instant::now();
+            let since = self
+                .last_toggle
+                .iter()
+                .find(|(k, ..)| *k == key)
+                .map(|(_, at, _)| now.duration_since(*at).as_secs_f64() * 1000.0);
             eventlog::note(&format!(
-                "toggle '{key}' visible={was_visible} -> {}",
-                !was_visible
+                "toggle {key} src={source} logical={was_visible} -> {} fg={} d_prev={} before={}",
+                !was_visible,
+                os_focus(self).unwrap_or("outside"),
+                fmt_dt(since),
+                before
+                    .as_ref()
+                    .map(|p| p.summary())
+                    .unwrap_or_else(|| "<not created>".to_string())
             ));
+            // A toggle within a fifth of a second of the previous one for the
+            // same window is a bounce, not a user decision — the field symptom
+            // ("hides, then instantly comes back") reads exactly like this.
+            if let Some(ms) = since {
+                if ms < 200.0 {
+                    eventlog::note(&format!("BOUNCE {key} toggled twice in {ms:.0}ms"));
+                }
+            }
             let Some(spec) = window_spec_by_key(key) else {
+                eventlog::note(&format!("toggle {key} IGNORED (no window spec)"));
                 continue;
             };
             // `show()` requests reveal + redraw itself, so no synchronous paint here.
@@ -4871,6 +5177,17 @@ impl App {
             let spec = self.adjusted_window_spec(spec);
             self.secondary_windows
                 .toggle(event_loop, &spec, backend);
+            let after = self.secondary_windows.probe(key);
+            eventlog::note(&format!(
+                "toggle {key} applied logical_now={} after={}",
+                self.secondary_windows.is_visible(key),
+                after
+                    .as_ref()
+                    .map(|p| p.summary())
+                    .unwrap_or_else(|| "<missing>".to_string())
+            ));
+            self.last_toggle.retain(|(k, ..)| *k != key);
+            self.last_toggle.push((key, now, !was_visible));
             // First creation this session: place at the saved position (when
             // it reaches a connected monitor). Later toggles never reposition
             // — the user's drags this session win.
@@ -4882,6 +5199,15 @@ impl App {
                                 winit::dpi::LogicalPosition::new(g.x as f64, g.y as f64),
                             );
                         }
+                        eventlog::note(&format!(
+                            "toggle {key} placed at saved ({:.0},{:.0})",
+                            g.x, g.y
+                        ));
+                    } else {
+                        eventlog::note(&format!(
+                            "toggle {key} saved position ({:.0},{:.0}) unreachable - default placement",
+                            g.x, g.y
+                        ));
                     }
                 }
             }
@@ -4935,7 +5261,11 @@ impl App {
 
         match event {
             WindowEvent::CloseRequested => {
-                eventlog::note(&format!("close-requested {key}"));
+                eventlog::note(&format!(
+                    "close-requested {key} fg={} :: {}",
+                    os_focus(self).unwrap_or("outside"),
+                    windows_state(self)
+                ));
                 self.secondary_windows.hide(key);
                 if key == "parameters" {
                     self.parameters_window_height = None;
@@ -4958,8 +5288,8 @@ impl App {
             WindowEvent::Focused(true) => {
                 self.note_focus(key);
                 self.modifiers = ModifiersState::empty();
+                eventlog::note(&format!("focus {key} true :: {}", windows_state(self)));
                 nui::restore_taskbar_group_if_needed();
-                eventlog::note(&format!("focus {key} true"));
             }
             // Modifiers can go stale when focus leaves while a modifier is
             // held (Alt+Tab, Win-key, AltGr): the key-up never reaches us, so
@@ -4968,7 +5298,10 @@ impl App {
             // of every focus transition.
             WindowEvent::Focused(false) => {
                 self.modifiers = ModifiersState::empty();
-                eventlog::note(&format!("focus {key} false"));
+                eventlog::note(&format!("focus {key} false :: {}", windows_state(self)));
+            }
+            WindowEvent::Occluded(occluded) => {
+                eventlog::note(&format!("occluded {key} {occluded}"));
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
@@ -5153,7 +5486,11 @@ impl App {
                                 w.window.request_redraw();
                             }
                         } else {
-                            eventlog::note(&format!("escape-hide {key}"));
+                            eventlog::note(&format!(
+                                "escape-hide {key} fg={} :: {}",
+                                os_focus(self).unwrap_or("outside"),
+                                windows_state(self)
+                            ));
                             self.secondary_windows.hide(key);
                             if key == "parameters" {
                                 self.parameters_window_height = None;
@@ -5184,6 +5521,25 @@ impl App {
         let Some(spec) = window_spec_by_key(key) else {
             return;
         };
+        // A frame arriving for a window the app believes is hidden is a stale
+        // WM_PAINT or a reveal that already resolved — either way it is the
+        // ordering evidence the toggle bugs need.
+        if eventlog::trace_on() {
+            let p = self.secondary_windows.probe(key);
+            let now = eventlog::ms();
+            eventlog::note(&format!(
+                "frame {key} t={now:.0}ms :: {}",
+                p.as_ref()
+                    .map(|p| p.summary())
+                    .unwrap_or_else(|| "<missing>".to_string())
+            ));
+        } else if let Some(p) = self.secondary_windows.probe(key) {
+            if !p.logical_visible || p.pending_reveal {
+                eventlog::note(&format!("frame {key} while {} :: {}", 
+                    if p.logical_visible { "reveal-pending" } else { "HIDDEN" },
+                    p.summary()));
+            }
+        }
 
         // Phase 3.2 — intents queued by the Parameters window, applied after the
         // scene-build borrow ends (immediate engine forwarding).
@@ -6676,7 +7032,11 @@ impl App {
         if close_clicked {
             // The Mixer owns a real engine and is destroyed on close; the other
             // secondary windows only hide their rendering surfaces.
-            eventlog::note(&format!("header-close {key}"));
+            eventlog::note(&format!(
+                "header-close {key} fg={} :: {}",
+                os_focus(self).unwrap_or("outside"),
+                windows_state(self)
+            ));
             self.secondary_windows.hide(key);
             if key == "parameters" {
                 self.parameters_window_height = None;
@@ -6753,6 +7113,7 @@ impl ApplicationHandler for App {
         let main_backend = self.main_backend();
         let (window, mut renderer) =
             Renderer::new(event_loop, attrs, main_backend, self.theme_base());
+        renderer.set_label("main");
         nui::set_window_icon_from_executable(&window, 1);
         nui::install_taskbar_group(&window);
         let sz = window.inner_size();
@@ -6786,7 +7147,10 @@ impl ApplicationHandler for App {
         if self.open_window_spec.is_none() {
             for key in ["parameters", "monitoring", "settings", "help"] {
                 if self.saved_geometry(key).is_some_and(|g| g.visible) {
-                    self.pending_window_toggles.push(key);
+                    self.pending_window_toggles.push(ToggleRequest {
+                        key,
+                        source: "startup",
+                    });
                 }
             }
             self.process_window_toggles(event_loop);
@@ -6799,17 +7163,52 @@ impl ApplicationHandler for App {
         // `self.modifiers` current before the key arrives, whichever branch
         // owns the window.)
         if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+            let target = if self.window.as_ref().map(|w| w.id()) == Some(id) {
+                "main"
+            } else {
+                self.secondary_windows
+                    .windows
+                    .iter()
+                    .find(|w| w.window.id() == id)
+                    .map(|w| w.key)
+                    .unwrap_or("<unknown>")
+            };
+            let now = Instant::now();
+            let token = key_token(&key.logical_key);
+            let since_press = self
+                .last_press
+                .as_ref()
+                .map(|(_, at)| now.duration_since(*at).as_secs_f64() * 1000.0);
+            let since_release = self
+                .last_release
+                .map(|at| now.duration_since(at).as_secs_f64() * 1000.0);
             eventlog::note(&format!(
-                "key {:?} {:?} repeat={} win={}",
-                key.logical_key,
+                "key {token} {:?} repeat={} win={target} osfg={} mods={} d_press={} d_rel={} :: {}",
                 key.state,
                 key.repeat,
-                if self.window.as_ref().map(|w| w.id()) == Some(id) {
-                    "main"
-                } else {
-                    "secondary"
-                },
+                os_focus(self).unwrap_or("outside"),
+                mods_str(),
+                fmt_dt(since_press),
+                fmt_dt(since_release),
+                windows_state(self)
             ));
+            // A second `Pressed` for the same key inside one physical press is
+            // the failure this log exists for: two toggles per key, so the
+            // window ends up hidden again, or "never" shows. Never suppressed —
+            // only recorded — so the trace shows the real delivery rate.
+            if key.state == ElementState::Pressed && !key.repeat {
+                if let Some((prev, at)) = &self.last_press {
+                    let dt = now.duration_since(*at).as_secs_f64() * 1000.0;
+                    if prev == &token && dt < 300.0 {
+                        eventlog::note(&format!(
+                            "DUP-PRESS {token} after {dt:.0}ms (no repeat flag) win={target}"
+                        ));
+                    }
+                }
+                self.last_press = Some((token, now));
+            } else if key.state == ElementState::Released {
+                self.last_release = Some(now);
+            }
             if key.state == ElementState::Pressed
                 && self.handle_global_shortcut(event_loop, key)
             {
@@ -6842,12 +7241,15 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(true) => {
                 self.note_focus("main");
                 self.modifiers = ModifiersState::empty();
+                eventlog::note(&format!("focus main true :: {}", windows_state(self)));
                 nui::restore_taskbar_group_if_needed();
-                eventlog::note("focus main true");
             }
             WindowEvent::Focused(false) => {
                 self.modifiers = ModifiersState::empty();
-                eventlog::note("focus main false");
+                eventlog::note(&format!("focus main false :: {}", windows_state(self)));
+            }
+            WindowEvent::Occluded(occluded) => {
+                eventlog::note(&format!("occluded main {occluded}"));
             }
             WindowEvent::HoveredFile(path) => {
                 self.refresh_drag_cursor();
@@ -7125,9 +7527,22 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         log_focus_change(self);
+        diag_watch(self);
+        // A reveal whose first frame never arrived (paint discarded while the
+        // HWND was still hidden) gets a bounded, LOGGED retry — recovery
+        // without hiding that the first request was lost.
+        for (key, waited, attempt) in self.secondary_windows.retry_pending_reveals(25.0) {
+            eventlog::note(&format!(
+                "reveal RETRY {key} waited={waited:.0}ms attempt={attempt}"
+            ));
+        }
         match nui::take_tray_action() {
-            Some(nui::TrayAction::Show) => self.reveal_and_focus_main(),
+            Some(nui::TrayAction::Show) => {
+                eventlog::note(&format!("tray Show :: {}", windows_state(self)));
+                self.reveal_and_focus_main();
+            }
             Some(nui::TrayAction::Quit) => {
+                eventlog::note("tray Quit");
                 self.quitting = true;
                 self.quit_at = Some(Instant::now());
             }
@@ -7163,13 +7578,26 @@ impl ApplicationHandler for App {
         // window so they finish and then the loop drops back to `Wait` / 0% CPU.
         let ui_anim = self.ui_state.is_animating() || self.secondary_windows.any_animating();
         let cover_anim = self.cover_fade.is_some();
+        // A show whose first frame has not landed yet must keep the loop awake:
+        // the reveal retry below runs in this function, and an idle `Wait`
+        // would only retry on some unrelated wake (~60 ms later).
+        let reveal_pending = self
+            .renderer
+            .as_ref()
+            .is_some_and(|r| r.probe().reveal_ms.is_some_and(|ms| ms < 2000.0))
+            || self
+                .secondary_windows
+                .probes()
+                .iter()
+                .any(|p| p.pending_reveal && p.reveal_ms.unwrap_or(0.0) < 2000.0);
         let animating = (playing && self.animate)
             || pending_meta
             || ui_anim
             || mixer_running
             || file_drag
             || sync_debug
-            || cover_anim;
+            || cover_anim
+            || reveal_pending;
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
@@ -7280,6 +7708,7 @@ fn main() {
     attach_parent_console();
     perf::init();
     eventlog::init();
+    nui::set_diag_sink(eventlog::note);
     let mut file: Option<String> = None;
     let mut tone = false;
     let mut silence = false;
@@ -7318,6 +7747,10 @@ fn main() {
             "--nopaint" => nopaint = true,
             "--open-window" => open_window = args.next(),
             "--sync-debug" => sync_debug = true,
+            // Per-frame / per-poll detail in event_log.txt (same as
+            // SOUNDAPP_TRACE=1); consumed here so it never becomes a file path.
+            "--trace" => {}
+            "--log-trace" => {}
             "--render" => render_in = args.next(),
             "--out" => render_out = args.next(),
             "--pitch" => render_pitch = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
