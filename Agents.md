@@ -13,8 +13,10 @@
   (`global-key`/`toolbar`/`dropzone`/`startup`) and the app's logical state next to the OS's own answers
   (`IsWindowVisible`, `DWMWA_CLOAKED`, frames presented); focus transitions polled from the OS; and the
   derived alarms **`DUP-PRESS`** (two presses per physical key), **`BOUNCE`** (same window toggled twice
-  in <200 ms), **`STALL`** (a show that never got its frame) and **`reveal RETRY`**. `--trace` adds every
-  presented frame. First stop for any "shortcut does nothing / window opens twice / focus behaves oddly"
+  in <200 ms), **`REPEAT-ECHO`** (a press refused because the physical key is still down — Windows
+  re-delivers key-down to the window that gains focus, and that delivery has no repeat flag; this
+  self-sustained a 300 Hz toggle storm in the field), **`STALL`** (a show that never got its frame) and
+  **`reveal RETRY`**. `--trace` adds every presented frame. First stop for any "shortcut does nothing / window opens twice / focus behaves oddly"
   report — see **[`docs/window-toggle-diagnostics.md`](docs/window-toggle-diagnostics.md)** for the line
   catalogue, the reading recipes and the reproduced lost-paint root cause.
 - **`perf_log.txt`** (same folder): startup, open-to-track-ready, frame-pacing windows, `--render`/`--latency-probe` output.

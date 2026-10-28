@@ -323,6 +323,14 @@ struct App {
     last_release: Option<Instant>,
     /// Last toggle per window key: (key, when, now_visible).
     last_toggle: Vec<(&'static str, Instant, bool)>,
+    /// Global keys whose PHYSICAL key was still down when the pass acted on
+    /// them. Windows re-delivers `WM_KEYDOWN` to whichever window gains focus
+    /// while a key is held, and that delivery carries no repeat flag — so
+    /// `event.repeat` cannot see it. Each re-delivery toggled a window, which
+    /// moved focus, which re-delivered the key: a self-sustaining 300 Hz
+    /// toggle storm (field trace 2026-10-28). Cleared the moment
+    /// `GetAsyncKeyState` reports the key up again.
+    physical_held: Vec<(char, i32)>,
     /// MRU focus ring (`"main"` or a secondary key). Hiding the focused window
     /// restores focus to the previous visible entry, so keyboard shortcuts never
     /// fall into a focus void.
@@ -779,6 +787,42 @@ fn physical_mods() -> (bool, bool, bool, bool) {
 #[cfg(not(windows))]
 fn physical_mods() -> (bool, bool, bool, bool) {
     (false, false, false, false)
+}
+
+/// Is `vk` physically down right now (OS truth, not tracked state)?
+#[cfg(windows)]
+fn physical_key_down(vk: i32) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    unsafe { GetAsyncKeyState(vk) < 0 }
+}
+
+#[cfg(not(windows))]
+fn physical_key_down(_vk: i32) -> bool {
+    false
+}
+
+/// Virtual-key code for a printable character the global pass cares about
+/// (letters map to their uppercase ASCII value on Win32).
+fn vk_for_char(ch: char) -> Option<i32> {
+    match ch.to_ascii_uppercase() {
+        c @ 'A'..='Z' => Some(c as i32),
+        c @ '0'..='9' => Some(c as i32),
+        ' ' => Some(0x20),
+        _ => None,
+    }
+}
+
+/// True when a press must be ignored because the same physical key is still
+/// held from the press we already acted on. Windows re-delivers `WM_KEYDOWN`
+/// to the newly focused window whenever focus moves with a key down, and that
+/// message has no repeat flag — so this is the only reliable repeat test once a
+/// shortcut itself moves focus. (`event.repeat` stays the first-line check.)
+fn is_repeat_echo(ch: char, physical_held: &[(char, i32)]) -> bool {
+    let ch = ch.to_ascii_lowercase();
+    physical_held.iter().any(|(held, _)| *held == ch)
 }
 
 fn mods_str() -> String {
@@ -3108,6 +3152,7 @@ impl App {
             last_press: None,
             last_release: None,
             last_toggle: Vec::new(),
+            physical_held: Vec::new(),
             focus_ring: VecDeque::from(["main"]),
             open_requests: None,
             open_window_spec: None,
@@ -5071,6 +5116,23 @@ impl App {
             ));
             return false;
         }
+        // A shortcut that moves focus makes Windows re-deliver this key-down to
+        // the window that just gained focus, without a repeat flag. Acting on
+        // that re-delivery toggles the window back and re-focuses, which
+        // re-delivers again — a storm that ends only when the key is released.
+        if let Some(chr) = ch.chars().next() {
+            if is_repeat_echo(chr, &self.physical_held) {
+                eventlog::note(&format!(
+                    "global '{ch}' REPEAT-ECHO suppressed (physical key still down, phys={})",
+                    if vk_for_char(chr).is_some_and(physical_key_down) {
+                        "down"
+                    } else {
+                        "up"
+                    }
+                ));
+                return false;
+            }
+        }
         let action = global_action_for(ch);
         match &action {
             Some(a) => eventlog::note(&format!(
@@ -5079,6 +5141,20 @@ impl App {
                 windows_state(self)
             )),
             None => eventlog::trace(&format!("global '{ch}' -> no action")),
+        }
+        if action.is_some() {
+            // Remember the physical key only while it is genuinely held;
+            // `about_to_wait` clears the entry as soon as it reads up.
+            if let Some(chr) = ch.chars().next() {
+                if let Some(vk) = vk_for_char(chr) {
+                    let lc = chr.to_ascii_lowercase();
+                    if physical_key_down(vk)
+                        && !self.physical_held.iter().any(|(held, _)| *held == lc)
+                    {
+                        self.physical_held.push((lc, vk));
+                    }
+                }
+            }
         }
         match action {
             Some(GlobalAction::ToggleWindow(key)) => {
@@ -7183,11 +7259,20 @@ impl ApplicationHandler for App {
                 .last_release
                 .map(|at| now.duration_since(at).as_secs_f64() * 1000.0);
             eventlog::note(&format!(
-                "key {token} {:?} repeat={} win={target} osfg={} mods={} d_press={} d_rel={} :: {}",
+                "key {token} {:?} repeat={} win={target} osfg={} mods={} phys={} d_press={} d_rel={} :: {}",
                 key.state,
                 key.repeat,
                 os_focus(self).unwrap_or("outside"),
                 mods_str(),
+                match &key.logical_key {
+                    Key::Character(c) => c
+                        .chars()
+                        .next()
+                        .and_then(vk_for_char)
+                        .map(|vk| if physical_key_down(vk) { "down" } else { "up" })
+                        .unwrap_or("?"),
+                    _ => "-",
+                },
                 fmt_dt(since_press),
                 fmt_dt(since_release),
                 windows_state(self)
@@ -7213,6 +7298,25 @@ impl ApplicationHandler for App {
                 && self.handle_global_shortcut(event_loop, key)
             {
                 return;
+            }
+            // A release re-arms the key immediately — but only when the OS
+            // confirms the key is UP. During the focus-change storm Windows
+            // also delivers a synthetic release to the window that just lost
+            // focus while the key is still physically down; that one must not
+            // re-arm anything.
+            if key.state == ElementState::Released {
+                if let Key::Character(c) = &key.logical_key {
+                    if let Some(chr) = c.chars().next() {
+                        let lc = chr.to_ascii_lowercase();
+                        if let Some(vk) = vk_for_char(chr) {
+                            if !physical_key_down(vk)
+                                && self.physical_held.iter().any(|(held, _)| *held == lc)
+                            {
+                                self.physical_held.retain(|(held, _)| *held != lc);
+                            }
+                        }
+                    }
+                }
             }
         }
         // Phase 1.5 routing: the primary window owns the process lifetime; every other
@@ -7528,6 +7632,16 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         log_focus_change(self);
         diag_watch(self);
+        // Re-arm global keys as soon as the OS says the key is physically up:
+        // a carried-over entry is exactly what suppresses the focus-change
+        // re-delivery of a key the user is still holding.
+        if !self.physical_held.is_empty() {
+            let before = self.physical_held.len();
+            self.physical_held.retain(|(_, vk)| physical_key_down(*vk));
+            if self.physical_held.len() != before {
+                eventlog::trace("physical key released - global keys re-armed");
+            }
+        }
         // A reveal whose first frame never arrived (paint discarded while the
         // HWND was still hidden) gets a bounded, LOGGED retry — recovery
         // without hiding that the first request was lost.
@@ -8451,6 +8565,28 @@ mod params_tests {
         assert_eq!(global_action_for("i"), Some(GlobalAction::RevealInExplorer));
         assert_eq!(global_action_for("q"), None);
         assert_eq!(global_action_for(""), None);
+    }
+
+    /// The field storm of 2026-10-28: toggling a window moves focus, Windows
+    /// re-delivers the held key to the new window with no repeat flag, and the
+    /// shortcut fires again. Only physical key state can stop the loop.
+    #[test]
+    fn held_key_repeat_echo_is_detected() {
+        let held = vec![('s', 0x53)];
+        assert!(is_repeat_echo('s', &held));
+        assert!(is_repeat_echo('S', &held));
+        assert!(!is_repeat_echo('p', &held));
+        assert!(!is_repeat_echo('s', &[]));
+    }
+
+    #[test]
+    fn virtual_keys_cover_the_shortcut_alphabet() {
+        assert_eq!(vk_for_char('s'), Some(0x53));
+        assert_eq!(vk_for_char('S'), Some(0x53));
+        assert_eq!(vk_for_char('x'), Some(0x58));
+        assert_eq!(vk_for_char('7'), Some(0x37));
+        assert_eq!(vk_for_char(' '), Some(0x20));
+        assert_eq!(vk_for_char('+'), None);
     }
 
     #[test]

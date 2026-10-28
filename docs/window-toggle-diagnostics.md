@@ -28,6 +28,7 @@ line, every line carrying `[ms  #seq]` (one monotonic sequence across all writer
 | `key 'm' Pressed repeat=false win=main osfg=monitoring mods=- d_press=63ms d_rel=718ms :: <all windows>` | every key event: target window, OS foreground **at that instant**, physical modifiers (asked of `GetAsyncKeyState`), gap since the last press/release, and the full window state |
 | `DUP-PRESS 'm' after 41ms (no repeat flag)` | a second non-repeat `Pressed` for the same key inside one physical press — two toggles per press. Recorded, never suppressed |
 | `global 'm' -> ToggleWindow("mixer") fg=…` / `global 'm' SUPPRESSED mods=ctrl text_focus=false` | the single global key pass and **why** it acted or refused |
+| `global 's' REPEAT-ECHO suppressed (physical key still down)` | a press refused because the same physical key is still held — the focus-change re-delivery, see §4 |
 | `toggle mixer src=global-key logical=false -> true fg=… d_prev=1540ms before=<win state>` | the queued request with **which path asked** (`global-key`, `toolbar`, `dropzone`, `startup`), plus the full state before |
 | `toggle mixer applied logical_now=true after=mixer[log=1 os=1 cloak=1 pend=7ms f=1]` | state immediately after the toggle ran |
 | `BOUNCE mixer toggled twice in 84ms` | same window toggled again within 200 ms — the "comes back" signature |
@@ -99,18 +100,53 @@ mapping flushes the queue with a dirty region), which is why it looked random.
 
 Verified: 3 × 6-show/6-hide probe rounds, `stalls=0`, at most one logged retry.
 
-## 4. Remaining suspect for "hides and instantly reappears"
+## 4. Root cause of both remaining symptoms: the focus-change key re-delivery
+
+**Found in a real field trace 2026-10-28** (26 s of continuous toggling from one
+key press). Windows re-delivers `WM_KEYDOWN` to the window that gains focus while
+a key is held, and **that delivery carries no repeat flag**, so `event.repeat`
+cannot see it. Every shortcut that shows a window moves focus to it — so the
+re-delivery fires the same shortcut again, hides the window, moves focus back, and
+fires again:
+
+```
+3950.56 key 's' Pressed  win=main     osfg=main      ← the user's one press
+3950.92 global 's' -> ToggleWindow("settings")
+3951.13 nui[settings] SHOW …                          ← focus moves to settings
+3957.34 key 's' Released win=main     osfg=settings   ← release still goes to main
+3957.41 key 's' Pressed  win=settings osfg=settings   ← RE-DELIVERED, repeat=false
+3957.44 DUP-PRESS 's' after 7ms (no repeat flag) win=settings
+3957.69 toggle settings logical=true -> false          ← hides again
+3957.74 BOUNCE settings toggled twice in 7ms
+3960.31 restore-focus after=settings -> main
+3960.71 key 's' Pressed  win=main     osfg=main       ← and back …
+3967.05 … repeats at ~3 presses/second for as long as the key is held
+```
+
+Symptom mapping: *"hides but instantly reappears"* = the re-delivery re-showing the
+window; *"several presses do nothing"* = the storm leaving the window hidden, and
+the same key re-delivering to whichever window it lands on. Holding any global key
+(theme `x` too) while this runs flaps that setting as well.
+
+**Fix:** the global pass now remembers which physical keys were *held* when it acted
+(`GetAsyncKeyState`, the same OS-truth doctrine as the modifier fix) and refuses a
+press for a key still down, logging `REPEAT-ECHO suppressed`. The entry clears as
+soon as the OS reports the key up — on the next loop turn *or* on a release event,
+but only when the OS confirms the key is up, because the storm also produces a
+synthetic *release* to the window that just lost focus. The user-visible behaviour
+is unchanged: one press, one toggle; holding the key toggles once, not thirty
+times a second.
+
+## 5. Remaining suspect, not yet observed in a trace
 
 `nui::focus_window_now` and `Renderer::focus_window_fast` both call
-`SetWindowPos(… SWP_SHOWWINDOW)`. `SWP_SHOWWINDOW` **maps** the target. Any focus
-call on a window that was just cloaked therefore re-shows the HWND while the cloak
-keeps it off-screen; a later uncloak then presents it with stale content. The call
-sites are `restore_focus_after_hide` (which picks only a *visible* target, so this
-should not happen) and `reveal_and_focus_main` (main only). Not yet observed in a
-trace — the `nui focus_now … mapped=…->…` line exists to catch it, together with
-`BOUNCE` and the `DUP-PRESS` record.
+`SetWindowPos(… SWP_SHOWWINDOW)`. `SWP_SHOWWINDOW` **maps** the target, so any focus
+call on a window that was just cloaked re-shows the HWND while the cloak keeps it
+off-screen. Call sites are `restore_focus_after_hide` (picks only a *visible*
+target) and `reveal_and_focus_main` (main only), so this is a latent hazard rather
+than a live bug. The `nui focus_now … mapped=…->…` line exists to catch it.
 
-## 5. Reproducing deterministically
+## 6. Reproducing deterministically
 
 `scripts/toggle-probe.ps1` launches the release build with `--silence --static`,
 finds the `SoundApp` HWND, and posts real `WM_KEYDOWN`/`WM_KEYUP` to it (no focus
