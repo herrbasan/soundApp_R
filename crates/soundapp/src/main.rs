@@ -301,6 +301,12 @@ struct App {
     window_geom: std::collections::HashMap<String, SavedGeom>,
     /// Startup directory for the implicit playlist (empty = OS Music folder).
     default_dir: String,
+    /// Cover pixels currently resting in the scene's image slot (`None` = the
+    /// procedural default tile is showing). Updated per frame during a fade so
+    /// a track change mid-transition starts from what is on screen.
+    cover_resting: Option<(u32, u32, Vec<u8>)>,
+    /// Active cover crossfade, if any.
+    cover_fade: Option<CoverFade>,
     pending_window_toggles: Vec<&'static str>,
     /// MRU focus ring (`"main"` or a secondary key). Hiding the focused window
     /// restores focus to the previous visible entry, so keyboard shortcuts never
@@ -621,6 +627,57 @@ fn first_audio_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         .collect();
     files.sort();
     files.into_iter().next()
+}
+
+/// Cover images and the default tile are square RGBA of this side (the decode
+/// bridge caps embedded art at 128).
+const COVER_TILE_SIDE: u32 = 128;
+/// Duration of one cover crossfade.
+const COVER_FADE_SECS: f32 = 0.5;
+
+/// One cover transition: the outgoing view (`None` = default tile) fading
+/// into the incoming view over [`COVER_FADE_SECS`].
+struct CoverFade {
+    old: Option<(u32, u32, Vec<u8>)>,
+    new: Option<(u32, u32, Vec<u8>)>,
+    started: Instant,
+}
+
+/// Solid default-tile RGBA buffer (the has-track fallback blue).
+fn cover_tile_rgba() -> Vec<u8> {
+    let px = (COVER_TILE_SIDE as usize) * (COVER_TILE_SIDE as usize);
+    let mut v = Vec::with_capacity(px * 4);
+    for _ in 0..px {
+        v.extend_from_slice(&[34, 150, 195, 255]);
+    }
+    v
+}
+
+/// Straight-alpha crossfade of two 128x128 RGBA views; a `None` side blends
+/// the solid default-tile color. Mismatched sizes degrade to the tile (the
+/// decode bridge caps covers at 128, so this is a guard, not an expectation).
+fn blend_covers(
+    old: Option<&(u32, u32, Vec<u8>)>,
+    new: Option<&(u32, u32, Vec<u8>)>,
+    t: f32,
+) -> Vec<u8> {
+    let side = COVER_TILE_SIDE as usize;
+    let len = side * side * 4;
+    let tile = cover_tile_rgba();
+    let a: &[u8] = match old {
+        Some((w, h, d)) if *w as usize == side && *h as usize == side && d.len() == len => d,
+        _ => &tile,
+    };
+    let b: &[u8] = match new {
+        Some((w, h, d)) if *w as usize == side && *h as usize == side && d.len() == len => d,
+        _ => &tile,
+    };
+    let t = t.clamp(0.0, 1.0);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        out.push((a[i] as f32 * (1.0 - t) + b[i] as f32 * t).round() as u8);
+    }
+    out
 }
 
 /// Persisted window placement (logical units) parsed from
@@ -2742,6 +2799,8 @@ impl App {
             secondary_windows: secondary_windows,
             window_geom,
             default_dir,
+            cover_resting: None,
+            cover_fade: None,
             pending_window_toggles: Vec::new(),
             focus_ring: VecDeque::from(["main"]),
             open_requests: None,
@@ -3353,6 +3412,49 @@ impl App {
         true
     }
 
+    /// Begin a cover crossfade from the currently displayed view to
+    /// `incoming` (`None` = the default tile). Default→default is nothing
+    /// visual and hard-clears instead.
+    fn begin_cover_fade(&mut self, incoming: Option<(u32, u32, Vec<u8>)>) {
+        if self.cover_resting.is_none() && incoming.is_none() {
+            self.cover_fade = None;
+            self.scene.clear_image();
+            return;
+        }
+        self.cover_fade = Some(CoverFade {
+            old: self.cover_resting.clone(),
+            new: incoming,
+            started: Instant::now(),
+        });
+    }
+
+    /// Advance the cover crossfade one frame: composite old→new at the elapsed
+    /// fraction into the scene's single image slot. The composited frame also
+    /// becomes `cover_resting`, so a track change mid-fade starts the next
+    /// transition from what is actually on screen.
+    fn step_cover_fade(&mut self) {
+        let Some(f) = self.cover_fade.as_ref() else { return };
+        let t = f.started.elapsed().as_secs_f32() / COVER_FADE_SECS;
+        if t >= 1.0 {
+            let done = self.cover_fade.take().unwrap();
+            match done.new {
+                Some((w, h, rgba)) => {
+                    self.scene.set_image(w, h, rgba.clone());
+                    self.cover_resting = Some((w, h, rgba));
+                }
+                None => {
+                    self.scene.clear_image();
+                    self.cover_resting = None;
+                }
+            }
+            return;
+        }
+        let buf = blend_covers(f.old.as_ref(), f.new.as_ref(), t);
+        self.scene
+            .set_image(COVER_TILE_SIDE, COVER_TILE_SIDE, buf.clone());
+        self.cover_resting = Some((COVER_TILE_SIDE, COVER_TILE_SIDE, buf));
+    }
+
     /// Load `playlist[idx]` into the engine.
     fn load_playlist_index(&mut self, idx: usize) {
         let Some(path) = self.playlist.get(idx).cloned() else {
@@ -3362,7 +3464,8 @@ impl App {
         self.on_new_track();
         self.scrub_frac = 0.0;
         self.track_meta = None;
-        self.scene.clear_image();
+        // The old cover STAYS on screen: the metadata-sync block in
+        // build_scene owns the transition once the new track's meta lands.
         self.open_pending = Some((Instant::now(), path.display().to_string()));
         if let Some(a) = &self.audio {
             a.load_file(path);
@@ -3380,7 +3483,8 @@ impl App {
             self.on_new_track();
             self.scrub_frac = 0.0;
             self.track_meta = None;
-            self.scene.clear_image();
+            // Old cover stays visible; build_scene's metadata sync fades it
+            // into whatever the new track brings.
             if let Some(a) = &self.audio {
                 a.load_file(path.clone());
             }
@@ -3605,22 +3709,25 @@ impl App {
         let pw = w as f32;
         let ph = h as f32;
 
-        // Pull the real metadata published by the decoder thread and sync cover art
-        // whenever the track metadata changes (including clearing when absent).
+        // Pull the real metadata published by the decoder thread. Cover art
+        // changes crossfade over COVER_FADE_SECS (previous view stays on
+        // screen underneath); a `None` meta while a load is still pending is
+        // the decoder's transient reset, not a final "no art" state.
+        self.step_cover_fade();
         let meta = self.audio.as_ref().and_then(|a| a.metadata());
         if meta != self.track_meta {
-            if let Some((cw, ch, rgba)) = meta.as_ref().and_then(|m| m.cover_rgba.clone()) {
-                self.scene.set_image(cw, ch, rgba);
-            } else {
-                self.scene.clear_image();
-            }
-            let arrived = meta.is_some();
-            self.track_meta = meta;
-            if arrived {
-                if let Some((t0, file)) = self.open_pending.take() {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    println!("[poc] track ready at {ms:.1} ms ({file})");
-                    perf::note(&format!("track_ready_ms={ms:.1} file={file}"));
+            let transient_reset = meta.is_none() && self.open_pending.is_some();
+            if !transient_reset {
+                let incoming = meta.as_ref().and_then(|m| m.cover_rgba.clone());
+                self.begin_cover_fade(incoming);
+                let arrived = meta.is_some();
+                self.track_meta = meta;
+                if arrived {
+                    if let Some((t0, file)) = self.open_pending.take() {
+                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        println!("[poc] track ready at {ms:.1} ms ({file})");
+                        perf::note(&format!("track_ready_ms={ms:.1} file={file}"));
+                    }
                 }
             }
         }
@@ -3916,14 +4023,37 @@ impl App {
                 cover_s,
             );
             let has_track = file.is_some();
-            let has_cover = self
-                .track_meta
-                .as_ref()
-                .map(|m| m.cover_rgba.is_some())
-                .unwrap_or(false);
+            // The scene's image slot is live during a fade even when the
+            // incoming view is the default tile (the fade composites it).
+            let showing_image = self.cover_fade.is_some() || self.cover_resting.is_some();
             ui.scene.push_clip(cover.x, cover.y, cover.w, cover.h);
-            if has_cover {
+            if showing_image {
                 ui.scene.image_quad(cover.x, cover.y, cover.w, cover.h);
+                // While a fade involves the default view on one side, the
+                // volume glyph rides on top with that side's weight so it
+                // fades with the tile instead of popping when the procedural
+                // fallback takes over at the end.
+                if let Some(f) = &self.cover_fade {
+                    let ft =
+                        (f.started.elapsed().as_secs_f32() / COVER_FADE_SECS).clamp(0.0, 1.0);
+                    let w = if f.new.is_none() {
+                        ft
+                    } else if f.old.is_none() {
+                        1.0 - ft
+                    } else {
+                        0.0
+                    };
+                    if w > 0.005 && has_track {
+                        ui.scene.icon_centered(
+                            ui.text_sys,
+                            ICON_VOLUME,
+                            (cover.x + cover.w * 0.5).round(),
+                            (cover.y + cover.h * 0.5).round(),
+                            (58.0 * scale).round(),
+                            rgba(0, 0, 0, (140.0 * w) as u8),
+                        );
+                    }
+                }
             } else {
                 ui.scene.rect(
                     cover.x,
@@ -6900,8 +7030,14 @@ impl ApplicationHandler for App {
         // Widget transitions (hover fades, popups, dialogs) drive their own 60 fps
         // window so they finish and then the loop drops back to `Wait` / 0% CPU.
         let ui_anim = self.ui_state.is_animating() || self.secondary_windows.any_animating();
-        let animating =
-            (playing && self.animate) || pending_meta || ui_anim || mixer_running || file_drag || sync_debug;
+        let cover_anim = self.cover_fade.is_some();
+        let animating = (playing && self.animate)
+            || pending_meta
+            || ui_anim
+            || mixer_running
+            || file_drag
+            || sync_debug
+            || cover_anim;
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
@@ -6909,7 +7045,7 @@ impl ApplicationHandler for App {
             // progress bar and MM:SS text; full-rate only while a DSP window is up.
             let dsp_open = self.secondary_windows.is_visible("monitoring")
                 || self.secondary_windows.is_visible("mixer");
-            let frame_ms = if pending_meta || dsp_open || ui_anim || file_drag || sync_debug {
+            let frame_ms = if pending_meta || dsp_open || ui_anim || file_drag || sync_debug || cover_anim {
                 self.frame_ms
             } else {
                 66
@@ -7665,6 +7801,52 @@ mod params_tests {
         let before = app.params;
         app.load_playlist_index(0);
         assert_eq!(app.params, before);
+    }
+
+    #[test]
+    fn cover_blend_interpolates_and_defaults_to_tile() {
+        let side = COVER_TILE_SIDE as usize;
+        let solid = |r: u8, g: u8, b: u8| {
+            let mut v = Vec::with_capacity(side * side * 4);
+            for _ in 0..side * side {
+                v.extend_from_slice(&[r, g, b, 255]);
+            }
+            (COVER_TILE_SIDE, COVER_TILE_SIDE, v)
+        };
+        let red = solid(255, 0, 0);
+        let blue = solid(0, 0, 255);
+        assert_eq!(&blend_covers(Some(&red), Some(&blue), 0.0)[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&blend_covers(Some(&red), Some(&blue), 1.0)[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&blend_covers(Some(&red), Some(&blue), 0.5)[0..4], &[128, 0, 128, 255]);
+        // A None side blends against the solid default-tile color.
+        assert_eq!(&blend_covers(None, Some(&red), 0.0)[0..4], &[34, 150, 195, 255]);
+        assert_eq!(&blend_covers(Some(&red), None, 1.0)[0..4], &[34, 150, 195, 255]);
+    }
+
+    #[test]
+    fn cover_fade_completes_to_the_incoming_view() {
+        let mut app = test_app();
+        let side = COVER_TILE_SIDE;
+        let cover = (side, side, vec![7u8; (side as usize) * (side as usize) * 4]);
+        app.begin_cover_fade(Some(cover.clone()));
+        assert!(app.cover_fade.is_some());
+        // Backdate the start so the next step completes the transition.
+        if let Some(f) = &mut app.cover_fade {
+            f.started = Instant::now() - Duration::from_secs(1);
+        }
+        app.step_cover_fade();
+        assert!(app.cover_fade.is_none());
+        let (_, _, px) = app.cover_resting.clone().expect("resting cover");
+        assert_eq!(px, cover.2);
+
+        // Fading back to the default tile clears the slot at completion.
+        app.begin_cover_fade(None);
+        if let Some(f) = &mut app.cover_fade {
+            f.started = Instant::now() - Duration::from_secs(1);
+        }
+        app.step_cover_fade();
+        assert!(app.cover_fade.is_none());
+        assert!(app.cover_resting.is_none());
     }
 
     #[test]
