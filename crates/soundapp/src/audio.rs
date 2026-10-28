@@ -4388,6 +4388,14 @@ mod tests {
     ///      speed is set, so no note is ever processed. Row 0 must set speed
     ///      (`F06`), exactly as real modules do.
     fn gen_steady_tone_mod() -> PathBuf {
+        // Parallel tests share this fixture; generating it once per process
+        // (OnceLock blocks racing callers) prevents one test from opening
+        // the file mid-rewrite by another (libopenmpt error 357, flaky).
+        static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ONCE.get_or_init(write_steady_tone_mod_fixture).clone()
+    }
+
+    fn write_steady_tone_mod_fixture() -> PathBuf {
         let path = gen_media_dir().join("gen_steady_tone.mod");
         let mut b: Vec<u8> = Vec::with_capacity(1084 + 1024 + 8192);
         let mut title = [b' '; 20];
@@ -4428,6 +4436,13 @@ mod tests {
     }
 
     fn gen_steady_tone_midi() -> PathBuf {
+        // Same once-per-process rule as the MOD fixture: a test could
+        // otherwise open the file while another truncates and rewrites it.
+        static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ONCE.get_or_init(write_steady_tone_midi_fixture).clone()
+    }
+
+    fn write_steady_tone_midi_fixture() -> PathBuf {
         fn vlq(v: u32) -> Vec<u8> {
             let mut out = vec![(v & 0x7f) as u8];
             let mut rest = v >> 7;
