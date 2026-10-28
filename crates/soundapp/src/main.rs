@@ -6381,6 +6381,30 @@ impl App {
                                 ) {
                                     self.default_dir.clear();
                                 }
+                                // Live output facts: the stream opens at the
+                                // device's OS default format (rate + channels).
+                                let [irow] = ui.take_cols(
+                                    Length::rem(1.8),
+                                    Length::rem(1.0),
+                                    [Length::fill()],
+                                );
+                                let out_info = match self.audio.as_ref() {
+                                    Some(a) => {
+                                        format!("Output stream: {} Hz, {} ch", a.rate, a.channels)
+                                    }
+                                    None => "Output stream: not started".to_string(),
+                                };
+                                let fs3 = theme.font_xsmall();
+                                ui.text_clipped(
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    &out_info,
+                                    irow.x.round(),
+                                    (irow.y + (irow.h - fs3) * 0.5).round(),
+                                    fs3,
+                                    irow.w,
+                                    theme.text_muted,
+                                );
                                 let [apply_r] = ui.take_form_row(true, [Length::fill()]);
                                 if ui.button(
                                     756,
