@@ -299,6 +299,8 @@ struct App {
     // show/hide toggles executed in `window_event` where `event_loop` is available.
     secondary_windows: WindowManager,
     window_geom: std::collections::HashMap<String, SavedGeom>,
+    /// Startup directory for the implicit playlist (empty = OS Music folder).
+    default_dir: String,
     pending_window_toggles: Vec<&'static str>,
     /// MRU focus ring (`"main"` or a secondary key). Hiding the focused window
     /// restores focus to the previous visible entry, so keyboard shortcuts never
@@ -557,6 +559,69 @@ fn reveal_in_explorer(path: &std::path::Path) {
 
 #[cfg(not(windows))]
 fn reveal_in_explorer(_path: &std::path::Path) {}
+
+/// The OS "Music" known folder (FOLDERID_Music) — hand FFI in the
+/// single_instance.rs pattern, no new dependencies.
+#[cfg(windows)]
+fn known_music_dir() -> Option<std::path::PathBuf> {
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            rfid: *const Guid,
+            flags: u32,
+            token: *mut std::ffi::c_void,
+            ppsz: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(pv: *mut std::ffi::c_void);
+    }
+    // FOLDERID_Music {4BD8D571-6D19-48D3-BE97-03385F96FC70}
+    let music = Guid {
+        data1: 0x4BD8D571,
+        data2: 0x6D19,
+        data3: 0x48D3,
+        data4: [0xBE, 0x97, 0x03, 0x38, 0x5F, 0x96, 0xFC, 0x70],
+    };
+    let mut ppsz: *mut u16 = std::ptr::null_mut();
+    if unsafe { SHGetKnownFolderPath(&music, 0, std::ptr::null_mut(), &mut ppsz) } != 0 {
+        return None;
+    }
+    unsafe {
+        let len = (0..).take_while(|&i| *ppsz.add(i) != 0).count();
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(ppsz, len));
+        CoTaskMemFree(ppsz as *mut std::ffi::c_void);
+        (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+    }
+}
+
+#[cfg(not(windows))]
+fn known_music_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// First supported audio file directly inside `dir` (name-sorted). The startup
+/// track for the default-directory feature: its implicit sibling-folder
+/// playlist then behaves exactly like any dropped file (flat, not recursive —
+/// recursive folder scans stay available via an explicit folder drop).
+fn first_audio_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_supported_audio(p))
+        .collect();
+    files.sort();
+    files.into_iter().next()
+}
 
 /// Persisted window placement (logical units) parsed from
 /// `UserConfig::window_geometry`.
@@ -2642,6 +2707,7 @@ impl App {
         let mut secondary_windows = WindowManager::new(theme_base);
         secondary_windows.set_icon_resource(1);
         let window_geom = parse_window_geometry(&config.window_geometry);
+        let default_dir = config.default_dir.clone();
         Self {
             start: Instant::now(),
             reported: false,
@@ -2675,6 +2741,7 @@ impl App {
 
             secondary_windows: secondary_windows,
             window_geom,
+            default_dir,
             pending_window_toggles: Vec::new(),
             focus_ring: VecDeque::from(["main"]),
             open_requests: None,
@@ -2794,6 +2861,7 @@ impl App {
 
     fn save_config(&mut self) {
         self.capture_window_geometry();
+        self.config.default_dir = self.default_dir.clone();
         self.config.dark_mode = self.dark_mode;
         self.config.ui_zoom = self.ui_zoom;
         self.config.master_vol = self.master_vol;
@@ -6124,6 +6192,59 @@ impl App {
                                 ) {
                                     self.apply_zoom_req = true;
                                 }
+                                // Default start folder: the first audio file
+                                // (sorted) inside it opens at startup and its
+                                // sibling folder becomes the implicit playlist.
+                                let [dcol, bcol1, bcol2] = ui.take_cols(
+                                    Length::rem(1.8),
+                                    Length::rem(1.0),
+                                    [Length::fill(), Length::rem(8.2), Length::rem(5.4)],
+                                );
+                                let dir_label = if self.default_dir.is_empty() {
+                                    "Default start folder: (OS Music folder)".to_string()
+                                } else {
+                                    format!("Default start folder: {}", self.default_dir)
+                                };
+                                let fs2 = theme.font_xsmall();
+                                ui.text_clipped(
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    &dir_label,
+                                    dcol.x.round(),
+                                    (dcol.y + (dcol.h - fs2) * 0.5).round(),
+                                    fs2,
+                                    dcol.w,
+                                    theme.text_muted,
+                                );
+                                if ui.button(
+                                    758,
+                                    bcol1,
+                                    "Use Current",
+                                    ICON_ADD,
+                                    ButtonVariant::Outline,
+                                ) {
+                                    let cur = self
+                                        .audio
+                                        .as_ref()
+                                        .and_then(|a| a.current_file())
+                                        .or_else(|| {
+                                            self.playlist.get(self.selected_track).cloned()
+                                        });
+                                    if let Some(dir) =
+                                        cur.and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                                    {
+                                        self.default_dir = dir.display().to_string();
+                                    }
+                                }
+                                if ui.button(
+                                    759,
+                                    bcol2,
+                                    "Reset",
+                                    ICON_RESTART,
+                                    ButtonVariant::Outline,
+                                ) {
+                                    self.default_dir.clear();
+                                }
                                 let [apply_r] = ui.take_form_row(true, [Length::fill()]);
                                 if ui.button(
                                     756,
@@ -6822,6 +6943,7 @@ impl ApplicationHandler for App {
     /// Phase 3.5 — auto-save the configuration on a clean exit.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.capture_window_geometry();
+        self.config.default_dir = self.default_dir.clone();
         self.config.dark_mode = self.dark_mode;
         self.config.ui_zoom = self.ui_zoom;
         self.config.master_vol = self.master_vol;
@@ -6977,14 +7099,28 @@ fn main() {
     } else {
         DEFAULT_START
     };
+    let cfg = UserConfig::load();
     let startup_path: Option<PathBuf> = if tone || silence {
         None
     } else {
-        Some(
-            file.as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(default_start)),
-        )
+        Some(match file.as_ref().map(PathBuf::from) {
+            Some(f) => f,
+            None => {
+                // Default directory: the configured folder when set, else the
+                // OS Music known folder. Its first audio file (sorted) becomes
+                // the startup track; the implicit sibling-folder playlist then
+                // behaves exactly like any dropped file. The dev reference
+                // tracks remain the last-resort fallback.
+                let dir = if cfg.default_dir.is_empty() {
+                    known_music_dir()
+                } else {
+                    Some(PathBuf::from(&cfg.default_dir))
+                };
+                dir.as_deref()
+                    .and_then(first_audio_in_dir)
+                    .unwrap_or_else(|| PathBuf::from(default_start))
+            }
+        })
     };
 
     // Normal playback launches are single-instance. Harness flags (render,
@@ -7142,9 +7278,7 @@ fn main() {
         std::process::exit(0);
     }
 
-    let cfg = UserConfig::load();
-    let source = if tone {
-        Source::Tone { hz: 440.0 }
+    let source = if tone {        Source::Tone { hz: 440.0 }
     } else {
         // The startup playlist (file or folder) is loaded by `open_path` below;
         // the engine starts on silence so nothing is decoded twice.
