@@ -84,11 +84,19 @@ foreach ($file in $files) {
 if ($Publish) {
     $tag = if ($Version.StartsWith('v')) { $Version } else { "v$Version" }
     $assets = $files | ForEach-Object { $_ }
+    # `gh release view` reports a missing release on STDERR, and PowerShell 5.1
+    # turns a native command's stderr into an ErrorRecord — fatal under the
+    # script's EAP=Stop, which killed the publish step on the first release of
+    # every new version. Probe with cmdlet-style error handling instead.
+    $ErrorActionPreference = 'Continue'
     & gh release view $tag *> $null
-    if ($LASTEXITCODE -eq 0) {
+    $exists = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = 'Stop'
+    if ($exists) {
         & gh release upload $tag @assets --clobber
     } else {
         & gh release create $tag @assets --title "SoundApp R $Version" --generate-notes
     }
     if ($LASTEXITCODE -ne 0) { throw "gh release publish failed (exit $LASTEXITCODE)" }
+    Write-Output "published release $tag"
 }
