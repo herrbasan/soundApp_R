@@ -871,8 +871,14 @@ impl WindowManager {
             attrs = attrs
                 .with_undecorated_shadow(true)
                 .with_corner_preference(CornerPreference::Round)
-                .with_border_color(Some(Color::from_rgb(55, 55, 55)))
-                .with_skip_taskbar(true);
+                .with_border_color(Some(Color::from_rgb(55, 55, 55)));
+            // NOTE: no `with_skip_taskbar(true)` here. That flag sets
+            // WS_EX_TOOLWINDOW, which removes the window from the taskbar *and*
+            // from Alt+Tab — utility windows become unreachable from the OS when
+            // the app's own controls are the only way back. Managed windows are
+            // ordinary top-level windows; the shell groups them under the app's
+            // taskbar button.
+            attrs = attrs.with_skip_taskbar(false);
         }
 
         attrs
