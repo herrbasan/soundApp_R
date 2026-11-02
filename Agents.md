@@ -158,6 +158,7 @@ soundApp_R/
    - Material Icons are centered using `TextSystem::layout_icon_centered` (true rasterized pixel bounding box `w, h`), never estimated font baselines.
 5. **Visual Verification via `--screenshot`:**
    - Run `.\target\release\soundapp_r.exe --screenshot .\target\preview.png --seconds 1` to capture the exact GPU framebuffer via `glReadPixels` and inspect with `view_image`. Use `--open-window <key>` to capture a secondary window, and add `--screenshot-delay <ms>` when the content arrives asynchronously (waveform overview, meters) — without it the capture is the window's *first* frame.
+   - Drag-and-drop cannot be scripted (winit takes drags over OLE): `--drop-probe <mixer|add|replace> "<path;path>"` replays one drop through the real handler and prints the resulting stem list.
    - The release exe is GUI-subsystem: PowerShell captures via pipes (`$out = & exe` returns immediately for GUI children — use `Start-Process -RedirectStandardOutput` or `scripts/measure.ps1`). Field timings land in `perf_log.txt` next to `user.json` regardless.
 6. **Zero Idle CPU & Bounded Repaint Loop:**
    - Event-driven (`ControlFlow::Wait`) when static (`0.0%` CPU).

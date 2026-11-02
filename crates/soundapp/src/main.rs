@@ -460,6 +460,11 @@ struct App {
     /// Set true when the Settings "Show transport controls" checkbox fires; the
     /// resize is applied after the render borrow ends.
     apply_zoom_req: bool,
+    /// `--drop-probe` injection, applied once on the first idle pass (the drop
+    /// path cannot be scripted: winit drops arrive through OLE).
+    drop_probe: Option<(Vec<PathBuf>, DropZone)>,
+    /// Print the resulting mixer stem list after a probe drop.
+    drop_probe_report: bool,
     /// Transient status text shown in the Settings footer after a save.
     config_status: String,
 }
@@ -1906,6 +1911,9 @@ enum ScanJob {
     MixerDrop {
         paths: Vec<PathBuf>,
         replace_slot: Option<usize>,
+        /// A drop-zone drop *is* the mixer's content: it replaces the stem set
+        /// instead of appending (a drop on the mixer window appends).
+        reset: bool,
         recursive: bool,
     },
 }
@@ -1922,6 +1930,7 @@ enum ScanOutcome {
     MixerDrop {
         files: Vec<PathBuf>,
         replace_slot: Option<usize>,
+        reset: bool,
     },
 }
 
@@ -3196,10 +3205,12 @@ impl App {
                         ScanJob::MixerDrop {
                             paths,
                             replace_slot,
+                            reset,
                             recursive,
                         } => ScanOutcome::MixerDrop {
                             files: mixer_stem_files(paths, recursive),
                             replace_slot,
+                            reset,
                         },
                     };
                     let _ = res_tx.send((gen, out));
@@ -3315,6 +3326,8 @@ impl App {
             config,
             save_config_req: false,
             apply_zoom_req: false,
+            drop_probe: None,
+            drop_probe_report: false,
             config_status: String::new(),
         }
     }
@@ -3495,7 +3508,7 @@ impl App {
         self.open_mixer_with_paths(paths);
     }
 
-    fn apply_mixer_drop(&mut self, files: Vec<PathBuf>, replace_slot: Option<usize>) {
+    fn apply_mixer_drop(&mut self, files: Vec<PathBuf>, replace_slot: Option<usize>, reset: bool) {
         // A drop-zone drop queues the window toggle before the scan completes,
         // so "pending toggle" counts as open here.
         let open = self.secondary_windows.is_visible("mixer")
@@ -3503,8 +3516,11 @@ impl App {
         if files.is_empty() || !open {
             return;
         }
-        if self.mixer_audio.is_none() {
+        // A drop-zone drop owns the mixer's content; without its own engine
+        // there is nothing to append to either.
+        if reset || self.mixer_audio.is_none() {
             self.open_mixer_with_paths(files);
+            self.report_drop_probe();
             return;
         }
         // Multi-Track takes over playback: the main player must not keep
@@ -3556,6 +3572,29 @@ impl App {
             .map(|engine| engine.is_playing())
             .unwrap_or(false);
         self.sync_mixer_controls();
+        self.report_drop_probe();
+    }
+
+    /// `--drop-probe` output: the stem list the drop actually produced.
+    fn report_drop_probe(&self) {
+        if !self.drop_probe_report {
+            return;
+        }
+        let names: Vec<String> = self
+            .mixer_stems
+            .iter()
+            .filter_map(|stem| stem.path.as_ref())
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+            .collect();
+        println!(
+            "[drop-probe] mixer stems={} [{}]",
+            names.len(),
+            names.join(", ")
+        );
     }
 
     fn close_mixer(&mut self) {
@@ -3998,6 +4037,52 @@ impl App {
         self.open_path(path, true, recursive_dirs);
     }
 
+    /// One drop, whatever produced it (the drag-and-drop overlay or the
+    /// `--drop-probe` harness): route the paths by zone. Kept separate so the
+    /// drop semantics can be exercised without a real OLE drag.
+    fn apply_drop(&mut self, paths: Vec<PathBuf>, zone: DropZone) {
+        perf::note(&format!(
+            "drop zone={zone:?} cursor=({:.0},{:.0}) files={} first={}",
+            self.ui_state.cursor.0,
+            self.ui_state.cursor.1,
+            paths.len(),
+            paths
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ));
+        // Ctrl held → flat (non-recursive) folder collection.
+        let recursive = !self.modifiers.control_key();
+        match zone {
+            DropZone::Add => self.apply_add_drop(paths, recursive),
+            DropZone::Replace => self.apply_replace_drop(paths, recursive),
+            DropZone::Mixer => {
+                // Main playback stops the moment the files land: the scan is
+                // async and open_mixer_with_paths (which pauses again,
+                // idempotently) only fires once it completes — until then both
+                // players would sound at once.
+                if let Some(main) = &self.audio {
+                    main.pause();
+                }
+                if !self.secondary_windows.is_visible("mixer") {
+                    self.pending_window_toggles.push(ToggleRequest {
+                        key: "mixer",
+                        source: "dropzone",
+                    });
+                }
+                let _ = self.scan_tx.send((
+                    self.scan_gen,
+                    ScanJob::MixerDrop {
+                        paths,
+                        replace_slot: None,
+                        reset: true,
+                        recursive,
+                    },
+                ));
+            }
+        }
+    }
+
     /// Add-zone drop of several files at once: append them all and start the
     /// first one. Folders / unsupported items keep the per-path route.
     fn apply_add_drop(&mut self, paths: Vec<PathBuf>, recursive_dirs: bool) {
@@ -4216,8 +4301,9 @@ impl App {
                 ScanOutcome::MixerDrop {
                     files,
                     replace_slot,
+                    reset,
                 } => {
-                    self.apply_mixer_drop(files, replace_slot);
+                    self.apply_mixer_drop(files, replace_slot, reset);
                     redraw = true;
                 }
             }
@@ -5057,45 +5143,7 @@ impl App {
             }
         }
         if let Some((paths, zone)) = pending_drop {
-            perf::note(&format!(
-                "drop zone={zone:?} cursor=({:.0},{:.0}) files={} first={}",
-                self.ui_state.cursor.0,
-                self.ui_state.cursor.1,
-                paths.len(),
-                paths
-                    .first()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            ));
-            // Ctrl held → flat (non-recursive) folder collection.
-            let recursive = !self.modifiers.control_key();
-            match zone {
-                DropZone::Add => self.apply_add_drop(paths, recursive),
-                DropZone::Replace => self.apply_replace_drop(paths, recursive),
-                DropZone::Mixer => {
-                    // Main playback stops the moment the files land: the scan
-                    // is async and open_mixer_with_paths (which pauses again,
-                    // idempotently) only fires once it completes — until then
-                    // both players would sound at once.
-                    if let Some(main) = &self.audio {
-                        main.pause();
-                    }
-                    if !self.secondary_windows.is_visible("mixer") {
-                        self.pending_window_toggles.push(ToggleRequest {
-                            key: "mixer",
-                            source: "dropzone",
-                        });
-                    }
-                    let _ = self.scan_tx.send((
-                        self.scan_gen,
-                        ScanJob::MixerDrop {
-                            paths,
-                            replace_slot: None,
-                            recursive,
-                        },
-                    ));
-                }
-            }
+            self.apply_drop(paths, zone);
         }
         if intents.close {
             if self.sw_keep_tray {
@@ -5530,7 +5578,10 @@ impl App {
             if key == "mixer" {
                 if was_visible {
                     self.close_mixer();
-                } else if self.mixer_audio.is_none() {
+                } else if self.mixer_audio.is_none() && source != "dropzone" {
+                    // A drop-zone drop supplies the stems itself; seeding from
+                    // the playlist here replaced them (field report: "drop
+                    // opens the playlist the main player has queued").
                     self.open_mixer_from_playlist();
                 }
             }
@@ -5743,6 +5794,7 @@ impl App {
                         ScanJob::MixerDrop {
                             paths: vec![path],
                             replace_slot,
+                            reset: false,
                             recursive: !self.modifiers.control_key(),
                         },
                     ));
@@ -8109,6 +8161,10 @@ impl ApplicationHandler for App {
         self.poll_transport_and_scans();
         self.poll_waveform();
         self.poll_mixer();
+        // `--drop-probe`: replay one drop through the real handler.
+        if let Some((paths, zone)) = self.drop_probe.take() {
+            self.apply_drop(paths, zone);
+        }
 
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
         let mixer_running = self.secondary_windows.is_visible("mixer")
@@ -8269,6 +8325,7 @@ fn main() {
     let mut font_engine = FontEngine::Swash;
     let mut app_screenshot: Option<String> = None;
     let mut screenshot_delay: Option<Duration> = None;
+    let mut drop_probe: Option<(Vec<PathBuf>, DropZone)> = None;
     let mut open_window: Option<String> = None;
     let mut sync_debug = false;
     // Offline render / latency harness (phase A instruments).
@@ -8337,6 +8394,23 @@ fn main() {
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()),
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).unwrap_or(60.0),
             "--screenshot" => app_screenshot = args.next(),
+            // `--drop-probe <mixer|add|replace> <path[;path…]>` replays one drop
+            // through the real handler — drag-and-drop comes in over OLE and
+            // cannot be scripted, and this path has regressed twice.
+            "--drop-probe" => {
+                let zone = match args.next().as_deref() {
+                    Some("add") => DropZone::Add,
+                    Some("replace") => DropZone::Replace,
+                    _ => DropZone::Mixer,
+                };
+                let list = args.next().unwrap_or_default();
+                let paths: Vec<PathBuf> = list
+                    .split(';')
+                    .filter(|item| !item.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
+                drop_probe = Some((paths, zone));
+            }
             // Defer a secondary-window capture: content that arrives
             // asynchronously (waveform overview, meters) needs real frames.
             "--screenshot-delay" => {
@@ -8577,6 +8651,10 @@ fn main() {
     app.nopaint = nopaint;
     app.screenshot_path = app_screenshot;
     app.screenshot_delay = screenshot_delay;
+    if drop_probe.is_some() {
+        app.drop_probe_report = true;
+    }
+    app.drop_probe = drop_probe;
     // Phase 1.5: pop a secondary window at startup. With `--screenshot` alongside it,
     // the capture is taken from THAT window (handled in `resumed`).
     app.open_window_spec = open_window.as_deref().and_then(window_spec_by_key);
