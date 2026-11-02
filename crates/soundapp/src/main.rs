@@ -1299,6 +1299,17 @@ fn draw_midi_overview(
     }
 }
 
+/// Baseline for a fader's gain readout: above its line, flipped below when that
+/// would run past the top of the fader (gain at the top of its range).
+fn fader_label_baseline(line_y: f32, fader_top: f32, font: f32) -> f32 {
+    let above = line_y - 5.0;
+    if above - font < fader_top + 1.0 {
+        line_y + font + 3.0
+    } else {
+        above
+    }
+}
+
 /// The Mute / Solo toggle cell used by the multitrack mixer strips.
 fn mixer_toggle_cell(
     ui: &mut Ui,
@@ -6959,13 +6970,17 @@ impl App {
                                     1.5,
                                     rgb(230, 230, 230),
                                 );
+                                // The gain readout flips below its line when the
+                                // fader nears the top, where "above" would be
+                                // clipped by the strip edge.
+                                let vfs = theme.font_xsmall();
                                 draw_text_at(
                                     &mut ui,
                                     fader_r.x + fader_r.w * 0.5,
-                                    line_y - 5.0,
+                                    fader_label_baseline(line_y, fader_r.y, vfs),
                                     &format!("{:.2}", gain),
                                     FontFace::SemiBold,
-                                    theme.font_xsmall(),
+                                    vfs,
                                     rgb(245, 245, 245),
                                 );
                                 ui.draw_focus_ring(fid, fader_r, theme.radius1());
@@ -8751,6 +8766,22 @@ mod playlist_tests {
         assert_eq!(list, vec![file]);
         assert_eq!(idx, 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fader_readout_flips_below_near_the_top() {
+        let top = 100.0f32;
+        let font = 13.0f32;
+        // Mid range: the label stays above its line.
+        assert!(fader_label_baseline(top + 150.0, top, font) < top + 150.0);
+        // Full gain — the line sits on the fader's top edge and "above" would be
+        // clipped, so the readout moves below the line.
+        let b = fader_label_baseline(top, top, font);
+        assert!(b > top + font, "baseline {b} should sit below the line");
+        // Near the top it is still clipped…
+        assert!(fader_label_baseline(top + 15.0, top, font) > top + 15.0);
+        // …and comfortably below the top it is not.
+        assert!(fader_label_baseline(top + 40.0, top, font) < top + 40.0);
     }
 
     #[test]
