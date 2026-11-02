@@ -249,6 +249,10 @@ int FFmpegDecoder::decodeNextFrame() {
                 av_frame_unref(filteredFrame);
                 
                 if (out_samples < 0) return -1;
+                // A downsampling resampler can emit nothing for the first few
+                // frames (prime delay). Returning 0 here made `read()` treat it
+                // as EOF and drop the whole file's audio.
+                if (out_samples == 0) continue;
                 
                 samplesInBuffer = out_samples * OUTPUT_CHANNELS;
                 bufferReadPos = 0;
@@ -286,6 +290,9 @@ int FFmpegDecoder::decodeNextFrame() {
             av_frame_unref(frame);
             
             if (out_samples < 0) return -1;
+            // Resampler prime delay (see the filtered branch above): no output
+            // yet is not end-of-file.
+            if (out_samples == 0) continue;
 
             samplesInBuffer = out_samples * OUTPUT_CHANNELS;
             bufferReadPos = 0;

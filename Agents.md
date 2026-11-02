@@ -1,9 +1,9 @@
 # soundApp_R & NUI Rust — Agent Briefing
 
-> **START HERE:** Read **[`docs/handover_2026-10-28.md`](docs/handover_2026-10-28.md)** for the current working state, the commit map, the open items (VU scaling spec, output sample-rate decision) and the window-toggle root-cause writeup. Then read **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap. `docs/handover_2026-10-24.md` remains valid for architecture and earlier findings.
+> **START HERE:** Read **[`docs/handover_2026-11-02.md`](docs/handover_2026-11-02.md)** for the current working state — Multi-Track drop fixes, HQ-default change, the dBFS stem VU and the Monitoring OVERVIEW row (plus the resampler EOF bug it uncovered). Then **[`docs/handover_2026-10-28.md`](docs/handover_2026-10-28.md)** for the window-toggle root cause, the event log and the output-sample-rate findings, and **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap. `docs/handover_2026-10-24.md` remains valid for architecture and earlier findings.
 > **RESOLVED 2026-10-25 (ALPHATAP field box):** frameless-window DWM composition offset — content displaced down/right, metrics healthy. Root cause: winit's undecorated windows carry `WS_CAPTION|WS_THICKFRAME|…`, and this driver stack places the window surface at that style's frame origin while the client claims the whole window. Fixed by stripping the bits + suppressing non-client painting in `crates/nui/src/render.rs`. Measurements, verified matrix and the one open item (native drag/resize) in **[`docs/handover_alphatap-render-offset-2026-10-25.md`](docs/handover_alphatap-render-offset-2026-10-25.md)**.
 
-**Last handover:** 2026-10-28 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`, HEAD `c0f1843`, **pushed / in sync**).
+**Last handover:** 2026-11-02 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`).
 
 ## Diagnostics you will need
 
@@ -118,7 +118,10 @@ soundApp_R/
         ffmpeg_bridge.cpp # C ABI bridge over SoundApp's FFmpegDecoder (decode, seek, metadata + embedded
                           #   cover art decode to 128x128 RGBA, rubberband/atempo filter graph)
         midi.rs           # FluidSynth 2.6.1 SoundFont synth + SMF parser/tempo map/sequencer
+                          #   (+ note-on collection → Monitoring channel timeline)
         tracker.rs        # libopenmpt 0.8.9 tracked-module source engine
+        waveform.rs       # Monitoring OVERVIEW: own-thread FFmpeg peak scan (16 kHz, 1600 buckets,
+                          #   progressive, generation-cancelled) + MIDI channel lanes from midi.rs
         dsp.rs            # Real-time 2048-pt Hann FFT (64 log bands), stabilized oscilloscope,
                           #   stereo goniometer & BS.1770-4 K-weighted LUFS
         config.rs         # Persistent user.json configuration loader/writer (fields: dark_mode,
@@ -154,7 +157,7 @@ soundApp_R/
    - Never clear the glyph atlas mid-frame; `TextSystem::prepare_frame()` flushes at frame start if capacity is low.
    - Material Icons are centered using `TextSystem::layout_icon_centered` (true rasterized pixel bounding box `w, h`), never estimated font baselines.
 5. **Visual Verification via `--screenshot`:**
-   - Run `.\target\release\soundapp_r.exe --screenshot .\target\preview.png --seconds 1` to capture the exact GPU framebuffer via `glReadPixels` and inspect with `view_image`. Use `--open-window <key>` to capture a secondary window.
+   - Run `.\target\release\soundapp_r.exe --screenshot .\target\preview.png --seconds 1` to capture the exact GPU framebuffer via `glReadPixels` and inspect with `view_image`. Use `--open-window <key>` to capture a secondary window, and add `--screenshot-delay <ms>` when the content arrives asynchronously (waveform overview, meters) — without it the capture is the window's *first* frame.
    - The release exe is GUI-subsystem: PowerShell captures via pipes (`$out = & exe` returns immediately for GUI children — use `Start-Process -RedirectStandardOutput` or `scripts/measure.ps1`). Field timings land in `perf_log.txt` next to `user.json` regardless.
 6. **Zero Idle CPU & Bounded Repaint Loop:**
    - Event-driven (`ControlFlow::Wait`) when static (`0.0%` CPU).

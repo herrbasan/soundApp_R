@@ -342,6 +342,13 @@ pub struct TimeSig {
     pub denominator: u32,
 }
 
+/// A note-on event (`90 n v`, velocity > 0) at its absolute file tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteOn {
+    pub tick: u32,
+    pub channel: u8,
+}
+
 /// Parsed SMF facts. `duration_secs` is under the **native** tempo map.
 #[derive(Clone, Debug)]
 pub struct SmfInfo {
@@ -352,7 +359,45 @@ pub struct SmfInfo {
     /// Tempo changes (`FF 51`): (tick, microseconds per quarter note).
     pub tempos: Vec<(u32, u32)>,
     pub time_signatures: Vec<TimeSig>,
+    /// Every note-on across all tracks, sorted by tick — powers the Monitoring
+    /// window's channel-activity timeline (no second parse of the file).
+    pub note_ons: Vec<NoteOn>,
     pub duration_secs: f64,
+}
+
+/// One MIDI channel's activity segments in milliseconds (start, end).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MidiLane {
+    pub channel: u8,
+    pub segments: Vec<(f32, f32)>,
+}
+
+/// Channel-activity timeline, mirroring the reference app's analyzer: note-ons
+/// grouped per channel, a gap longer than `gap_ms` starts a new segment.
+/// Returns the active channels (ascending) and the file duration in seconds.
+pub fn channel_activity(bytes: &[u8], gap_ms: f32) -> Option<(Vec<MidiLane>, f64)> {
+    let info = parse_smf(bytes).ok()?;
+    let map = TempoMap::native(info.ppq, info.tempos.clone());
+    let mut notes: Vec<(f32, u8)> = info
+        .note_ons
+        .iter()
+        .map(|n| ((map.tick_to_secs(n.tick as f64) * 1000.0) as f32, n.channel))
+        .collect();
+    notes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut lanes = Vec::new();
+    for channel in 0..16u8 {
+        let mut segments: Vec<(f32, f32)> = Vec::new();
+        for &(ms, _) in notes.iter().filter(|(_, ch)| *ch == channel) {
+            match segments.last_mut() {
+                Some(last) if ms - last.1 <= gap_ms => last.1 = ms,
+                _ => segments.push((ms, ms)),
+            }
+        }
+        if !segments.is_empty() {
+            lanes.push(MidiLane { channel, segments });
+        }
+    }
+    Some((lanes, info.duration_secs))
 }
 
 /// Tick ⇄ seconds conversion. Segments are (start_tick, µs per quarter note);
@@ -483,6 +528,7 @@ fn parse_smf(bytes: &[u8]) -> Result<SmfInfo, MidiError> {
     let mut pos = 8 + hlen as usize;
     let mut tempos = Vec::new();
     let mut time_sigs = Vec::new();
+    let mut note_ons: Vec<NoteOn> = Vec::new();
     let mut total_ticks: u32 = 0;
     let mut tracks_seen = 0u16;
 
@@ -589,6 +635,14 @@ fn parse_smf(bytes: &[u8]) -> Result<SmfInfo, MidiError> {
                     if i + n > track.len() {
                         return Err(MidiError::Parse("channel event overruns track".into()));
                     }
+                    // Note-on with velocity 0 is a note-off; only real attacks
+                    // make activity (the reference analyzer does the same).
+                    if b & 0xF0 == 0x90 && track[i + 1] > 0 {
+                        note_ons.push(NoteOn {
+                            tick,
+                            channel: b & 0x0F,
+                        });
+                    }
                     i += n;
                 }
                 _ => return Err(MidiError::Parse(format!("invalid status byte 0x{b:02X}"))),
@@ -608,6 +662,7 @@ fn parse_smf(bytes: &[u8]) -> Result<SmfInfo, MidiError> {
         total_ticks,
         tempos,
         time_signatures: time_sigs,
+        note_ons,
         duration_secs,
     })
 }

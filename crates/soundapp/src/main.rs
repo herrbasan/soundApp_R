@@ -15,6 +15,7 @@ mod eventlog;
 mod perf;
 mod single_instance;
 mod tracker;
+mod waveform;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -271,6 +272,9 @@ struct App {
     dark_mode: bool,
     ui_zoom: f32,
     screenshot_path: Option<String>,
+    /// Deferred secondary-window capture (`--screenshot-delay`).
+    screenshot_delay: Option<Duration>,
+    screenshot_at: Option<Instant>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     scene: Scene,
@@ -387,6 +391,15 @@ struct App {
     dsp_snap: DspSnapshot,
     /// Output-frame counter at the last Monitoring redraw (delta = new frames).
     last_dsp_frames: u64,
+    /// Whole-file overview for the Monitoring window (peaks / MIDI lanes).
+    waveform: waveform::WaveformWorker,
+    /// `(generation, path)` of the overview currently requested.
+    waveform_request: Option<(u64, PathBuf)>,
+    waveform_data: waveform::WaveformData,
+    waveform_duration: f64,
+    waveform_progress: f32,
+    /// Pending seek from a click on the Monitoring overview.
+    monitoring_seek: Option<f64>,
 
     // Phase 3.4 — independent multitrack stem preview mixer.
     mixer_audio: Option<mixer::MixerAudio>,
@@ -1188,6 +1201,62 @@ fn draw_vu_meter(ui: &mut Ui, r: Rect, lvl_db: f32, peak_db: f32, label: &str) {
     );
 }
 
+/// Fold a whole-file peak array into the pixel columns of `r`, mirrored around
+/// the midline (the reference app's `drawWaveform`).
+fn draw_peak_overview(ui: &mut Ui, r: Rect, peaks: &[f32], color: (u8, u8, u8, u8)) {
+    if peaks.is_empty() || r.w < 1.0 || r.h < 2.0 {
+        return;
+    }
+    let mid = r.y + r.h * 0.5;
+    let half = (r.h * 0.5 - 1.0).max(1.0);
+    let cols = r.w.floor().max(1.0) as usize;
+    let step = peaks.len() as f32 / cols as f32;
+    for col in 0..cols {
+        let from = (col as f32 * step) as usize;
+        if from >= peaks.len() {
+            break;
+        }
+        let to = (((col + 1) as f32 * step) as usize).clamp(from + 1, peaks.len());
+        let amp = peaks[from..to].iter().copied().fold(0.0f32, f32::max);
+        let h = (amp * half).max(0.5);
+        ui.scene
+            .rect(r.x + col as f32, mid - h, 1.0, h * 2.0, color);
+    }
+}
+
+/// MIDI channel-activity timeline: one lane per active channel, amber for the
+/// drum channel (10 / index 9), the reference app's `drawMidiTimeline`.
+fn draw_midi_overview(
+    ui: &mut Ui,
+    r: Rect,
+    lanes: &[midi::MidiLane],
+    duration_ms: f32,
+    idle: (u8, u8, u8, u8),
+    active: (u8, u8, u8, u8),
+    drums: (u8, u8, u8, u8),
+) {
+    if lanes.is_empty() || duration_ms <= 0.0 {
+        return;
+    }
+    let lane_h = (r.h / lanes.len() as f32).floor().max(3.0);
+    for (i, lane) in lanes.iter().enumerate() {
+        let y = r.y + i as f32 * lane_h;
+        if y > r.y + r.h - 2.0 {
+            break;
+        }
+        ui.scene
+            .rect(r.x, y + 1.0, r.w, (lane_h - 2.0).max(1.0), idle);
+        let color = if lane.channel == 9 { drums } else { active };
+        for &(start_ms, end_ms) in &lane.segments {
+            let x = r.x + (start_ms / duration_ms).clamp(0.0, 1.0) * r.w;
+            let right = r.x + (end_ms / duration_ms).clamp(0.0, 1.0) * r.w;
+            let w = (right - x).max(2.0).min(r.x + r.w - x);
+            ui.scene
+                .rect(x, y + 2.0, w.max(1.0), (lane_h - 4.0).max(1.0), color);
+        }
+    }
+}
+
 /// The Mute / Solo toggle cell used by the multitrack mixer strips.
 fn mixer_toggle_cell(
     ui: &mut Ui,
@@ -1733,6 +1802,26 @@ fn playlist_from_single_file(file: &std::path::Path) -> (Vec<PathBuf>, usize) {
     (files, idx.unwrap_or(0))
 }
 
+/// Expand dropped paths into mixer stems. A dropped **file** is a stem on its
+/// own — never its parent directory (the old `playlist_from_single_file` route
+/// turned one dropped file into the whole folder). A dropped **folder** still
+/// contributes the audio files inside it.
+fn mixer_stem_files(paths: Vec<PathBuf>, recursive: bool) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if files.len() >= mixer::MAX_STEMS {
+            break;
+        }
+        if path.is_dir() {
+            let room = mixer::MAX_STEMS - files.len();
+            files.extend(playlist_from_folder(&path, recursive).into_iter().take(room));
+        } else if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    files
+}
+
 /// Collect every supported audio file under `dir`, descending when `recursive`.
 fn playlist_from_folder(dir: &std::path::Path, recursive: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -1777,12 +1866,8 @@ enum ScanJob {
         append: bool,
         recursive: bool,
     },
-    MixerPath {
-        path: PathBuf,
-        recursive: bool,
-    },
     MixerDrop {
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         replace_slot: Option<usize>,
         recursive: bool,
     },
@@ -1797,7 +1882,6 @@ enum ScanOutcome {
         files: Vec<PathBuf>,
         append: bool,
     },
-    MixerStems(Vec<PathBuf>),
     MixerDrop {
         files: Vec<PathBuf>,
         replace_slot: Option<usize>,
@@ -2881,9 +2965,10 @@ fn drop_zone_at(cx: f32, cy: f32, pw: f32, ph: f32) -> DropZone {
     }
 }
 
-/// Three-zone drop overlay: add / replace / open-in-mixer. Returns the dropped
-/// path and the zone the pointer was over when it landed.
-fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathBuf, DropZone)> {
+/// Three-zone drop overlay: add / replace / open-in-mixer. Returns **every**
+/// path dropped in this frame and the zone the pointer was over when it landed
+/// (a multi-file drag arrives as one `DroppedFile` event per file).
+fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(Vec<PathBuf>, DropZone)> {
     let hovering = ui.state.hovered_file.is_some();
     if !hovering && ui.state.dropped_files.is_empty() {
         return None;
@@ -2975,7 +3060,8 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(PathB
     }
     ui.scene.end_overlay();
 
-    ui.state.dropped_files.pop().map(|p| (p, zone))
+    let dropped: Vec<PathBuf> = ui.state.dropped_files.drain(..).collect();
+    (!dropped.is_empty()).then_some((dropped, zone))
 }
 
 impl App {
@@ -3070,31 +3156,14 @@ impl App {
                                 ScanOutcome::SingleFile { files, idx }
                             }
                         }
-                        ScanJob::MixerPath { path, recursive } => {
-                            let files = if path.is_dir() {
-                                playlist_from_folder(&path, recursive)
-                            } else {
-                                playlist_from_single_file(&path).0
-                            };
-                            ScanOutcome::MixerStems(
-                                files.into_iter().take(mixer::MAX_STEMS).collect(),
-                            )
-                        }
                         ScanJob::MixerDrop {
-                            path,
+                            paths,
                             replace_slot,
                             recursive,
-                        } => {
-                            let files = if path.is_dir() {
-                                playlist_from_folder(&path, recursive)
-                            } else {
-                                vec![path]
-                            };
-                            ScanOutcome::MixerDrop {
-                                files: files.into_iter().take(mixer::MAX_STEMS).collect(),
-                                replace_slot,
-                            }
-                        }
+                        } => ScanOutcome::MixerDrop {
+                            files: mixer_stem_files(paths, recursive),
+                            replace_slot,
+                        },
                     };
                     let _ = res_tx.send((gen, out));
                 }
@@ -3119,6 +3188,8 @@ impl App {
             dark_mode: config.dark_mode, // Dark mode by default (accessibility requirement)
             ui_zoom: config.ui_zoom.clamp(0.75, 2.0),
             screenshot_path: None,
+            screenshot_delay: None,
+            screenshot_at: None,
             window: None,
             renderer: None,
             scene: Scene::new(),
@@ -3184,6 +3255,12 @@ impl App {
             last_dsp_frames: 0,
             dsp_buf: Vec::new(),
             dsp_snap: DspSnapshot::default(),
+            waveform: waveform::WaveformWorker::new(),
+            waveform_request: None,
+            waveform_data: waveform::WaveformData::Empty,
+            waveform_duration: 0.0,
+            waveform_progress: 0.0,
+            monitoring_seek: None,
             mixer_audio: None,
             mixer_stems,
             mixer_playing: false,
@@ -3380,7 +3457,11 @@ impl App {
     }
 
     fn apply_mixer_drop(&mut self, files: Vec<PathBuf>, replace_slot: Option<usize>) {
-        if files.is_empty() || !self.secondary_windows.is_visible("mixer") {
+        // A drop-zone drop queues the window toggle before the scan completes,
+        // so "pending toggle" counts as open here.
+        let open = self.secondary_windows.is_visible("mixer")
+            || self.pending_window_toggles.iter().any(|r| r.key == "mixer");
+        if files.is_empty() || !open {
             return;
         }
         if self.mixer_audio.is_none() {
@@ -3878,6 +3959,46 @@ impl App {
         self.open_path(path, true, recursive_dirs);
     }
 
+    /// Add-zone drop of several files at once: append them all and start the
+    /// first one. Folders / unsupported items keep the per-path route.
+    fn apply_add_drop(&mut self, paths: Vec<PathBuf>, recursive_dirs: bool) {
+        let current = self.audio.as_ref().and_then(|a| a.current_file());
+        let all_files = !paths.is_empty()
+            && !self.playlist.is_empty()
+            && add_drop_plays_now(current.as_deref())
+            && paths.iter().all(|p| is_supported_audio(p));
+        if all_files {
+            let start = self.playlist.len();
+            self.playlist.extend(paths);
+            self.sync_shuffle_state();
+            self.load_playlist_index(start);
+            return;
+        }
+        for path in paths {
+            self.open_path_add_drop(path, recursive_dirs);
+        }
+    }
+
+    /// Replace-zone drop: the dropped file set *is* the new playlist (a dropped
+    /// folder keeps the normal directory scan), playing from the first file.
+    fn apply_replace_drop(&mut self, paths: Vec<PathBuf>, recursive_dirs: bool) {
+        if let Some(dir) = paths.iter().find(|p| p.is_dir()) {
+            self.open_path(dir.clone(), false, recursive_dirs);
+            return;
+        }
+        let files: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| is_supported_audio(p))
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+        self.playlist = files;
+        self.selected_track = 0;
+        self.sync_shuffle_state();
+        self.load_playlist_index(0);
+    }
+
     /// Drain paths forwarded by later launches. An empty message is a plain
     /// "bring the player forward" request.
     fn poll_open_requests(&mut self) {
@@ -3952,6 +4073,60 @@ impl App {
         }
     }
 
+    /// Keep the Monitoring overview in step with the loaded track. Analysis is
+    /// only requested while the window exists (visible or about to open), so a
+    /// closed Monitoring window costs nothing.
+    fn poll_waveform(&mut self) {
+        let open = self.secondary_windows.is_visible("monitoring")
+            || self
+                .pending_window_toggles
+                .iter()
+                .any(|r| r.key == "monitoring");
+        if !open {
+            // Closing the window abandons a running pass; reopening re-requests.
+            if self.waveform_request.take().is_some() {
+                self.waveform.cancel();
+                self.waveform_data = waveform::WaveformData::Empty;
+                self.waveform_duration = 0.0;
+                self.waveform_progress = 0.0;
+            }
+            return;
+        }
+        let current = self.audio.as_ref().and_then(|a| a.current_file());
+        let tracked = self
+            .waveform_request
+            .as_ref()
+            .map(|(_, path)| path.as_path());
+        if current.as_deref() != tracked {
+            match current {
+                Some(path) => {
+                    let gen = self.waveform.request(path.clone());
+                    self.waveform_request = Some((gen, path));
+                    self.waveform_data = waveform::WaveformData::Empty;
+                    self.waveform_duration = 0.0;
+                    self.waveform_progress = 0.0;
+                }
+                None => {
+                    self.waveform_request = None;
+                    self.waveform_data = waveform::WaveformData::Empty;
+                    self.waveform_duration = 0.0;
+                    self.waveform_progress = 0.0;
+                }
+            }
+        }
+        let Some(gen) = self.waveform_request.as_ref().map(|(gen, _)| *gen) else {
+            return;
+        };
+        for update in self.waveform.poll() {
+            if update.gen != gen {
+                continue;
+            }
+            self.waveform_data = update.data;
+            self.waveform_duration = update.duration;
+            self.waveform_progress = update.progress;
+        }
+    }
+
     /// Poll background directory-scan completions and end-of-track transitions.
     fn poll_transport_and_scans(&mut self) {
         let mut redraw = false;
@@ -3978,14 +4153,6 @@ impl App {
                         self.selected_track = 0;
                         self.sync_shuffle_state();
                         self.load_playlist_index(0);
-                        redraw = true;
-                    }
-                }
-                ScanOutcome::MixerStems(files) => {
-                    let opening = self.secondary_windows.is_visible("mixer")
-                        || self.pending_window_toggles.iter().any(|r| r.key == "mixer");
-                    if opening && !files.is_empty() {
-                        self.open_mixer_with_paths(files);
                         redraw = true;
                     }
                 }
@@ -4214,7 +4381,7 @@ impl App {
         }
 
         let mut intents = MainIntents::default();
-        let pending_drop: Option<(PathBuf, DropZone)>;
+        let pending_drop: Option<(Vec<PathBuf>, DropZone)>;
 
         {
             let mut ui = Ui::new(
@@ -4832,18 +4999,22 @@ impl App {
                 a.set_volume(self.master_vol);
             }
         }
-        if let Some((path, zone)) = pending_drop {
+        if let Some((paths, zone)) = pending_drop {
             perf::note(&format!(
-                "drop zone={zone:?} cursor=({:.0},{:.0}) path={}",
+                "drop zone={zone:?} cursor=({:.0},{:.0}) files={} first={}",
                 self.ui_state.cursor.0,
                 self.ui_state.cursor.1,
-                path.display()
+                paths.len(),
+                paths
+                    .first()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             ));
             // Ctrl held → flat (non-recursive) folder collection.
             let recursive = !self.modifiers.control_key();
             match zone {
-                DropZone::Add => self.open_path_add_drop(path, recursive),
-                DropZone::Replace => self.open_path(path, false, recursive),
+                DropZone::Add => self.apply_add_drop(paths, recursive),
+                DropZone::Replace => self.apply_replace_drop(paths, recursive),
                 DropZone::Mixer => {
                     // Main playback stops the moment the files land: the scan
                     // is async and open_mixer_with_paths (which pauses again,
@@ -4852,16 +5023,20 @@ impl App {
                     if let Some(main) = &self.audio {
                         main.pause();
                     }
-                    self.scan_gen = self.scan_gen.wrapping_add(1);
-                    let _ = self
-                        .scan_tx
-                        .send((self.scan_gen, ScanJob::MixerPath { path, recursive }));
                     if !self.secondary_windows.is_visible("mixer") {
                         self.pending_window_toggles.push(ToggleRequest {
                             key: "mixer",
                             source: "dropzone",
                         });
                     }
+                    let _ = self.scan_tx.send((
+                        self.scan_gen,
+                        ScanJob::MixerDrop {
+                            paths,
+                            replace_slot: None,
+                            recursive,
+                        },
+                    ));
                 }
             }
         }
@@ -5499,28 +5674,21 @@ impl App {
                         .find_by_key_mut(key)
                         .map(|w| w.ui_state.cursor)
                         .unwrap_or((-1.0, -1.0));
-                    let target = if self
-                        .mixer_add_target
-                        .map(|r| r.contains(cursor.0, cursor.1))
-                        .unwrap_or(false)
-                    {
-                        Some(None)
-                    } else {
-                        self.mixer_strip_targets
-                            .iter()
-                            .find(|(r, _)| r.contains(cursor.0, cursor.1))
-                            .map(|(_, slot)| Some(*slot))
-                    };
-                    if let Some(replace_slot) = target {
-                        let _ = self.scan_tx.send((
-                            self.scan_gen,
-                            ScanJob::MixerDrop {
-                                path,
-                                replace_slot,
-                                recursive: true,
-                            },
-                        ));
-                    }
+                    // A strip under the pointer takes the file into that slot;
+                    // anywhere else in the window appends a stem.
+                    let replace_slot = self
+                        .mixer_strip_targets
+                        .iter()
+                        .find(|(r, _)| r.contains(cursor.0, cursor.1))
+                        .map(|(_, slot)| *slot);
+                    let _ = self.scan_tx.send((
+                        self.scan_gen,
+                        ScanJob::MixerDrop {
+                            paths: vec![path],
+                            replace_slot,
+                            recursive: !self.modifiers.control_key(),
+                        },
+                    ));
                 }
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
                     w.ui_state.hovered_file = None;
@@ -5851,8 +6019,145 @@ impl App {
                         // ====================================================
                         "monitoring" => {
                             let snap = &self.dsp_snap;
+                            // Whole-file overview strip above the DSP grid —
+                            // the reference window's OVERVIEW row.
+                            let overview_h = Length::Rem(5.6).resolve(rem).round();
+                            let [overview, panels] = ui.rows(
+                                body,
+                                Length::Px(gap),
+                                [Length::Px(overview_h), Length::fill()],
+                            );
+                            ui.card(overview, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                                let hdr = ui.take(Length::Rem(1.2));
+                                let fs = theme.font_small();
+                                let baseline = (hdr.y + fs * 0.85).round();
+                                ui.text_clipped(
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    "OVERVIEW",
+                                    hdr.x.round(),
+                                    baseline,
+                                    fs,
+                                    hdr.w,
+                                    theme.text_dim,
+                                );
+                                let position = self
+                                    .audio
+                                    .as_ref()
+                                    .map(|a| a.position_secs())
+                                    .unwrap_or(0.0);
+                                let duration = self
+                                    .audio
+                                    .as_ref()
+                                    .map(|a| a.duration_secs())
+                                    .unwrap_or(0.0);
+                                let info = match &self.waveform_data {
+                                    waveform::WaveformData::Peaks(_) => {
+                                        format!("{} / {}", fmt_time(position), fmt_time(duration))
+                                    }
+                                    waveform::WaveformData::Midi(lanes) => format!(
+                                        "MIDI · {} ch · {}",
+                                        lanes.len(),
+                                        fmt_time(self.waveform_duration)
+                                    ),
+                                    waveform::WaveformData::Empty => {
+                                        if self.waveform_progress > 0.0
+                                            && self.waveform_progress < 1.0
+                                        {
+                                            format!(
+                                                "ANALYSING {:.0}%",
+                                                self.waveform_progress * 100.0
+                                            )
+                                        } else {
+                                            "NO OVERVIEW".to_string()
+                                        }
+                                    }
+                                };
+                                let iw = ui.text_sys.measure(
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &info,
+                                    fs,
+                                );
+                                ui.scene.text(
+                                    ui.text_sys,
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    &info,
+                                    (hdr.x + hdr.w - iw).round(),
+                                    baseline,
+                                    fs,
+                                    theme.highlight,
+                                );
+                                let canvas = ui.take_rest();
+                                ui.scene.rounded_rect(
+                                    canvas.x,
+                                    canvas.y,
+                                    canvas.w,
+                                    canvas.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border1,
+                                    1.0,
+                                );
+                                let inner = Rect::new(
+                                    canvas.x + 1.0,
+                                    canvas.y + 1.0,
+                                    (canvas.w - 2.0).max(1.0),
+                                    (canvas.h - 2.0).max(1.0),
+                                );
+                                ui.scene.push_clip(inner.x, inner.y, inner.w, inner.h);
+                                let mid_y = (inner.y + inner.h * 0.5).round();
+                                ui.scene
+                                    .rect(inner.x, mid_y, inner.w, 1.0, theme.border1);
+                                match &self.waveform_data {
+                                    waveform::WaveformData::Peaks(peaks) => {
+                                        draw_peak_overview(ui, inner, peaks, theme.highlight)
+                                    }
+                                    waveform::WaveformData::Midi(lanes) => draw_midi_overview(
+                                        ui,
+                                        inner,
+                                        lanes,
+                                        (self.waveform_duration * 1000.0) as f32,
+                                        rgba(255, 255, 255, 10),
+                                        theme.palette_activate,
+                                        theme.palette_mark,
+                                    ),
+                                    waveform::WaveformData::Empty => {}
+                                }
+                                if duration > 0.0 {
+                                    let frac = (position / duration).clamp(0.0, 1.0) as f32;
+                                    let px = (inner.x + frac * inner.w).round();
+                                    ui.scene.rect(
+                                        px - 0.5,
+                                        inner.y,
+                                        1.5,
+                                        inner.h,
+                                        rgb(235, 235, 235),
+                                    );
+                                }
+                                ui.scene.pop_clip();
+                                // Click / drag the overview to seek.
+                                const OVERVIEW_ID: u32 = 1258;
+                                ui.state.register_focusable(OVERVIEW_ID);
+                                if ui.state.can_hover(OVERVIEW_ID, canvas)
+                                    && ui.state.mouse_pressed
+                                {
+                                    ui.state.active_id = Some(OVERVIEW_ID);
+                                }
+                                if ui.state.active_id == Some(OVERVIEW_ID)
+                                    && ui.state.mouse_down
+                                    && duration > 0.0
+                                {
+                                    let frac = ((ui.state.cursor.0 - inner.x) / inner.w)
+                                        .clamp(0.0, 1.0);
+                                    self.monitoring_seek = Some(frac as f64 * duration);
+                                }
+                                ui.draw_focus_ring(OVERVIEW_ID, canvas, theme.radius1());
+                            });
+
                             let [top_row, bot_row] =
-                                ui.rows(body, Length::Px(gap), [Length::fill(), Length::fill()]);
+                                ui.rows(panels, Length::Px(gap), [Length::fill(), Length::fill()]);
                             let [tl, tr] =
                                 ui.cols(top_row, Length::Px(gap), [Length::fill(), Length::fill()]);
                             let [bl, br] =
@@ -6470,25 +6775,82 @@ impl App {
                                 );
                                 let inaudible = self.mixer_stems[i].muted
                                     || (any_solo && !self.mixer_stems[i].solo);
-                                let lvl = if inaudible {
-                                    0.0
+                                // dBFS scale (−60..0): the old linear peak × 6
+                                // pinned every bar at −15.6 dBFS.
+                                let (rms_db, peak_db) = if inaudible {
+                                    (-60.0, -60.0)
                                 } else {
                                     self.mixer_audio
                                         .as_ref()
-                                        .map(|engine| {
-                                            (engine.meter(self.mixer_stems[i].slot) * 6.0)
-                                                .clamp(0.0, 1.0)
-                                        })
-                                        .unwrap_or(0.0)
+                                        .map(|engine| engine.meter_db(self.mixer_stems[i].slot))
+                                        .unwrap_or((-60.0, -60.0))
                                 };
-                                let vu_h = (fader_r.h * lvl).clamp(0.0, fader_r.h);
-                                if vu_h > 1.0 {
+                                let db_to_y = |db: f32| {
+                                    fader_r.y
+                                        + fader_r.h
+                                            * (1.0 - ((db + 60.0) / 60.0).clamp(0.0, 1.0))
+                                };
+                                let body_top = db_to_y(rms_db).max(fader_r.y + 1.0);
+                                let body_bottom = fader_r.y + fader_r.h - 1.0;
+                                if body_bottom > body_top + 0.5 {
+                                    meter_segment(
+                                        &mut ui,
+                                        fader_r,
+                                        body_top,
+                                        -60.0,
+                                        -12.0,
+                                        theme.palette_activate,
+                                    );
+                                    meter_segment(
+                                        &mut ui,
+                                        fader_r,
+                                        body_top,
+                                        -12.0,
+                                        -3.0,
+                                        theme.palette_mark,
+                                    );
+                                    meter_segment(
+                                        &mut ui,
+                                        fader_r,
+                                        body_top,
+                                        -3.0,
+                                        0.0,
+                                        theme.palette_alert,
+                                    );
+                                }
+                                // 0 VU reference (EBU R68: −18 dBFS).
+                                let vu_y = db_to_y(-18.0).round();
+                                ui.scene.rect(
+                                    fader_r.x + 1.0,
+                                    vu_y,
+                                    (fader_r.w - 2.0).max(1.0),
+                                    1.0,
+                                    rgba(255, 255, 255, 90),
+                                );
+                                // Peak-hold tick + latched clip LED.
+                                let peak_y = db_to_y(peak_db).round();
+                                if peak_db > -59.5 {
                                     ui.scene.rect(
                                         fader_r.x + 1.0,
-                                        fader_r.y + fader_r.h - vu_h,
+                                        peak_y,
                                         (fader_r.w - 2.0).max(1.0),
-                                        vu_h,
-                                        rgb(58, 175, 52),
+                                        1.5,
+                                        rgb(235, 235, 235),
+                                    );
+                                }
+                                if !inaudible
+                                    && self
+                                        .mixer_audio
+                                        .as_ref()
+                                        .map(|engine| engine.clip(self.mixer_stems[i].slot))
+                                        .unwrap_or(false)
+                                {
+                                    ui.scene.rect(
+                                        fader_r.x,
+                                        fader_r.y,
+                                        fader_r.w,
+                                        2.0,
+                                        theme.palette_alert,
                                     );
                                 }
                                 let line_y = (fader_r.y
@@ -7029,6 +7391,12 @@ impl App {
         if settings_tray_changed {
             self.sync_tray_icon();
         }
+        // Monitoring overview click → seek (applied after the scene borrow).
+        if let Some(secs) = self.monitoring_seek.take() {
+            if let Some(audio) = &self.audio {
+                audio.seek(secs);
+            }
+        }
 
         if let Some(required) = parameters_required_height {
             if let Some(mw) = self.secondary_windows.find_by_key_mut("parameters") {
@@ -7210,7 +7578,12 @@ impl ApplicationHandler for App {
                 self.open_mixer_from_playlist();
             }
             if let Some(path) = self.screenshot_path.take() {
-                if let Some(w) = self.secondary_windows.find_by_key_mut(spec.key) {
+                if self.screenshot_delay.is_some() {
+                    // Hold the path until the delay expires (about_to_wait).
+                    self.screenshot_path = Some(path);
+                    self.screenshot_at =
+                        Some(Instant::now() + self.screenshot_delay.take().unwrap_or_default());
+                } else if let Some(w) = self.secondary_windows.find_by_key_mut(spec.key) {
                     w.screenshot_once = Some(path);
                 }
             }
@@ -7673,8 +8046,24 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        // Deferred secondary-window capture (--screenshot-delay): hand the path
+        // to the window now so the next presented frame writes it.
+        if let Some(at) = self.screenshot_at {
+            if Instant::now() >= at {
+                self.screenshot_at = None;
+                if let (Some(path), Some(spec)) =
+                    (self.screenshot_path.take(), self.open_window_spec)
+                {
+                    if let Some(w) = self.secondary_windows.find_by_key_mut(spec.key) {
+                        w.screenshot_once = Some(path);
+                        w.window.request_redraw();
+                    }
+                }
+            }
+        }
         self.poll_open_requests();
         self.poll_transport_and_scans();
+        self.poll_waveform();
         self.poll_mixer();
 
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
@@ -7711,7 +8100,8 @@ impl ApplicationHandler for App {
             || file_drag
             || sync_debug
             || cover_anim
-            || reveal_pending;
+            || reveal_pending
+            || self.screenshot_at.is_some();
 
         let now = Instant::now();
         if animating && now >= self.next_frame {
@@ -7834,6 +8224,7 @@ fn main() {
     let mut backend_locked = false;
     let mut font_engine = FontEngine::Swash;
     let mut app_screenshot: Option<String> = None;
+    let mut screenshot_delay: Option<Duration> = None;
     let mut open_window: Option<String> = None;
     let mut sync_debug = false;
     // Offline render / latency harness (phase A instruments).
@@ -7902,6 +8293,14 @@ fn main() {
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()),
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).unwrap_or(60.0),
             "--screenshot" => app_screenshot = args.next(),
+            // Defer a secondary-window capture: content that arrives
+            // asynchronously (waveform overview, meters) needs real frames.
+            "--screenshot-delay" => {
+                screenshot_delay = args
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(Duration::from_millis)
+            }
             other => file = Some(other.to_string()),
         }
     }
@@ -8133,6 +8532,7 @@ fn main() {
     }
     app.nopaint = nopaint;
     app.screenshot_path = app_screenshot;
+    app.screenshot_delay = screenshot_delay;
     // Phase 1.5: pop a secondary window at startup. With `--screenshot` alongside it,
     // the capture is taken from THAT window (handled in `resumed`).
     app.open_window_spec = open_window.as_deref().and_then(window_spec_by_key);
@@ -8228,6 +8628,29 @@ mod playlist_tests {
         let (list, idx) = playlist_from_single_file(&file);
         assert_eq!(list, vec![file]);
         assert_eq!(idx, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixer_drop_uses_dropped_files_not_the_folder() {
+        // The reported bug: dropping one file on the Multi-Track zone used
+        // `playlist_from_single_file`, so the whole parent folder became stems.
+        let dir = temp_dir("mixerdrop");
+        for name in ["01.m4a", "02.m4a", "03.m4a", "stray.mp3"] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        let dropped = vec![dir.join("02.m4a")];
+        let stems = mixer_stem_files(dropped, true);
+        assert_eq!(stems, vec![dir.join("02.m4a")]);
+
+        // Several files at once stay exactly those files.
+        let dropped = vec![dir.join("03.m4a"), dir.join("01.m4a")];
+        let stems = mixer_stem_files(dropped.clone(), true);
+        assert_eq!(stems, dropped);
+
+        // A dropped folder still contributes its contents.
+        let stems = mixer_stem_files(vec![dir.clone()], false);
+        assert_eq!(stems.len(), 4);
         let _ = fs::remove_dir_all(&dir);
     }
 }

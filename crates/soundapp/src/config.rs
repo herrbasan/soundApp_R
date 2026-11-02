@@ -34,7 +34,9 @@ impl Default for UserConfig {
             master_vol: 0.78,
             show_controls: true,
             chk_locked: false,
-            sw_hq_mode: true,
+            // Off by default: HQ oversampling costs CPU on every decode and is
+            // an explicit opt-in (owner decision 2026-11-02).
+            sw_hq_mode: false,
             sw_keep_tray: false,
             output_device: String::new(),
             selected_soundfont: 0,
@@ -247,5 +249,7 @@ mod tests {
         let back = UserConfig::parse("{\n  \"dark_mode\": false\n}");
         assert!(!back.dark_mode);
         assert_eq!(back.master_vol, UserConfig::default().master_vol);
+        // HQ oversampling is opt-in (owner decision 2026-11-02).
+        assert!(!back.sw_hq_mode);
     }
 }

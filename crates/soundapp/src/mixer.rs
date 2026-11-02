@@ -19,6 +19,11 @@ pub const MAX_STEMS: usize = 20;
 const RING_SECONDS: usize = 4;
 const PREBUFFER_SECS: f64 = 0.200;
 const FADE_SECS: f32 = 0.012;
+/// Meter floor / clip reference (see docs/research/vu-meter-scaling-spec).
+const METER_FLOOR_DB: f32 = -100.0;
+const RMS_TAU_SECS: f32 = 0.077;
+const PEAK_HOLD_SECS: f32 = 1.5;
+const PEAK_FALL_DB_PER_SEC: f32 = 11.76;
 
 struct SlotShared {
     enabled: AtomicBool,
@@ -26,7 +31,12 @@ struct SlotShared {
     gain: AtomicU32,
     pan: AtomicU32,
     muted: AtomicBool,
-    meter: AtomicU32,
+    /// VU body: linear RMS, one-pole with tau = 77 ms (≈99 % in 300 ms).
+    meter_rms: AtomicU32,
+    /// VU tick: peak-hold in dBFS (1.5 s hold, then 11.76 dB/s fall).
+    meter_peak_db: AtomicU32,
+    /// Latched full-scale flag, cleared when the stem is (re)loaded.
+    clip: AtomicBool,
     duration_frames: AtomicU64,
     flush_gen: AtomicU64,
     flush_ack: AtomicU64,
@@ -44,7 +54,9 @@ impl SlotShared {
             gain: AtomicU32::new(1.0f32.to_bits()),
             pan: AtomicU32::new(0.0f32.to_bits()),
             muted: AtomicBool::new(false),
-            meter: AtomicU32::new(0.0f32.to_bits()),
+            meter_rms: AtomicU32::new(0.0f32.to_bits()),
+            meter_peak_db: AtomicU32::new(METER_FLOOR_DB.to_bits()),
+            clip: AtomicBool::new(false),
             duration_frames: AtomicU64::new(0),
             flush_gen: AtomicU64::new(0),
             flush_ack: AtomicU64::new(0),
@@ -53,6 +65,13 @@ impl SlotShared {
             ring_frames: AtomicU64::new(0),
             start_frames: AtomicU64::new(0),
         }
+    }
+
+    fn reset_meter(&self) {
+        self.meter_rms.store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.meter_peak_db
+            .store(METER_FLOOR_DB.to_bits(), Ordering::Relaxed);
+        self.clip.store(false, Ordering::Relaxed);
     }
 }
 
@@ -230,7 +249,7 @@ impl MixerAudio {
         slot.gain.store(1.0f32.to_bits(), Ordering::Relaxed);
         slot.pan.store(0.0f32.to_bits(), Ordering::Relaxed);
         slot.muted.store(false, Ordering::Relaxed);
-        slot.meter.store(0.0f32.to_bits(), Ordering::Relaxed);
+        slot.reset_meter();
         slot.duration_frames.store(0, Ordering::Release);
         slot.ready.store(false, Ordering::Release);
         slot.enabled.store(true, Ordering::Release);
@@ -283,7 +302,7 @@ impl MixerAudio {
         slot.enabled.store(false, Ordering::Release);
         slot.ready.store(false, Ordering::Release);
         slot.duration_frames.store(0, Ordering::Release);
-        slot.meter.store(0.0f32.to_bits(), Ordering::Relaxed);
+        slot.reset_meter();
         if let Some(tx) = &self.stem_tx[index] {
             let _ = tx.send(StemCmd::Clear);
         }
@@ -435,12 +454,34 @@ impl MixerAudio {
         all_slots_ready(&self.shared.slots)
     }
 
+    /// Linear RMS body level of one stem (`0..1`) — test-facing.
+    #[cfg(test)]
     pub fn meter(&self, index: usize) -> f32 {
         self.shared
             .slots
             .get(index)
-            .map(|s| f32::from_bits(s.meter.load(Ordering::Relaxed)))
+            .map(|s| f32::from_bits(s.meter_rms.load(Ordering::Relaxed)))
             .unwrap_or(0.0)
+    }
+
+    /// `(rms_dbfs, peak_dbfs)` for one stem — the values the strip VU draws.
+    pub fn meter_db(&self, index: usize) -> (f32, f32) {
+        let Some(slot) = self.shared.slots.get(index) else {
+            return (METER_FLOOR_DB, METER_FLOOR_DB);
+        };
+        let rms = f32::from_bits(slot.meter_rms.load(Ordering::Relaxed));
+        let peak = f32::from_bits(slot.meter_peak_db.load(Ordering::Relaxed));
+        let rms_db = 20.0 * rms.max(1e-6).log10();
+        (rms_db.max(METER_FLOOR_DB), peak.max(METER_FLOOR_DB))
+    }
+
+    /// True while the stem has hit full scale since it was loaded.
+    pub fn clip(&self, index: usize) -> bool {
+        self.shared
+            .slots
+            .get(index)
+            .map(|s| s.clip.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     pub fn sync_snapshot(&self) -> MixerSyncSnapshot {
@@ -497,7 +538,15 @@ struct MixerOutput {
     rx: mpsc::Receiver<CallbackCmd>,
     consumers: Vec<Option<rtrb::Consumer<f32>>>,
     flush: Vec<u64>,
-    levels: Vec<f32>,
+    /// Mean-square integrator per stem (linear RMS body).
+    rms_ms: Vec<f32>,
+    /// Instant peak per stem, cleared once its hold expires.
+    peak_lin: Vec<f32>,
+    /// Seconds the current peak has been held.
+    hold_s: Vec<f32>,
+    /// Peak-hold value shown by the meter tick, in dBFS.
+    peak_db: Vec<f32>,
+    clip: Vec<bool>,
     played: Vec<u64>,
     underruns: Vec<u64>,
     fade: f32,
@@ -510,12 +559,23 @@ impl MixerOutput {
             rx,
             consumers: (0..MAX_STEMS).map(|_| None).collect(),
             flush: vec![0; MAX_STEMS],
-            levels: vec![0.0; MAX_STEMS],
+            rms_ms: vec![0.0; MAX_STEMS],
+            peak_lin: vec![0.0; MAX_STEMS],
+            hold_s: vec![0.0; MAX_STEMS],
+            peak_db: vec![METER_FLOOR_DB; MAX_STEMS],
+            clip: vec![false; MAX_STEMS],
             played: vec![0; MAX_STEMS],
             underruns: vec![0; MAX_STEMS],
             fade: 0.0,
             transport_gen: 0,
         }
+    }
+
+    fn reset_meters(&mut self, index: usize) {
+        self.rms_ms[index] = 0.0;
+        self.peak_lin[index] = 0.0;
+        self.hold_s[index] = 0.0;
+        self.peak_db[index] = METER_FLOOR_DB;
     }
 
     fn render(&mut self, data: &mut [f32], out_ch: usize, rate: u32, sh: &Shared) {
@@ -530,7 +590,7 @@ impl MixerOutput {
                 }
                 self.flush[index] = generation;
                 slot.flush_ack.store(generation, Ordering::Release);
-                self.levels[index] = 0.0;
+                self.reset_meters(index);
             }
         }
         let transport_gen = sh.transport_gen.load(Ordering::Acquire);
@@ -560,13 +620,14 @@ impl MixerOutput {
             gains[index] = f32::from_bits(slot.gain.load(Ordering::Relaxed));
             enabled[index] = slot.enabled.load(Ordering::Relaxed);
             audible[index] = enabled[index] && !slot.muted.load(Ordering::Relaxed);
-            self.levels[index] *= 0.985;
             if !audible[index] {
-                self.levels[index] = 0.0;
+                self.reset_meters(index);
             }
         }
         let frames = data.len() / out_ch;
         let mut frames_consumed = 0u64;
+        let mut sum_sq = [0.0f32; MAX_STEMS];
+        let mut chunk_peak = [0.0f32; MAX_STEMS];
         for frame in 0..frames {
             let target = if playing { 1.0 } else { 0.0 };
             self.fade += (target - self.fade).clamp(-fade_step, fade_step);
@@ -606,9 +667,10 @@ impl MixerOutput {
                     );
                     mix_l += left;
                     mix_r += right;
+                    sum_sq[index] += (left * left + right * right) * 0.5;
                     let peak = left.abs().max(right.abs());
-                    if peak > self.levels[index] {
-                        self.levels[index] = peak.min(1.0);
+                    if peak > chunk_peak[index] {
+                        chunk_peak[index] = peak;
                     }
                 }
                 sh.position_frames.fetch_add(1, Ordering::Relaxed);
@@ -623,9 +685,46 @@ impl MixerOutput {
                 data[base + channel] = 0.0;
             }
         }
+        let dt = frames as f32 / rate as f32;
+        // One-pole over the chunk: chunk-mean mean-square in, 77 ms tau.
+        let rms_coef = if dt > 0.0 {
+            1.0 - (-dt / RMS_TAU_SECS).exp()
+        } else {
+            0.0
+        };
         for (index, slot) in sh.slots.iter().enumerate() {
-            slot.meter
-                .store(self.levels[index].to_bits(), Ordering::Relaxed);
+            let mean_sq = if frames > 0 {
+                sum_sq[index] / frames as f32
+            } else {
+                0.0
+            };
+            self.rms_ms[index] += (mean_sq - self.rms_ms[index]) * rms_coef;
+            let rms = self.rms_ms[index].max(0.0).sqrt();
+            slot.meter_rms.store(rms.to_bits(), Ordering::Relaxed);
+
+            let peak = chunk_peak[index];
+            if peak >= self.peak_lin[index] {
+                self.peak_lin[index] = peak;
+                self.hold_s[index] = 0.0;
+            } else {
+                self.hold_s[index] += dt;
+                if self.hold_s[index] > PEAK_HOLD_SECS {
+                    // Hold expired: let the dB-domain fall take over.
+                    self.peak_lin[index] = 0.0;
+                }
+            }
+            let raw_db = 20.0 * self.peak_lin[index].max(1e-6).log10();
+            self.peak_db[index] = raw_db
+                .max(self.peak_db[index] - PEAK_FALL_DB_PER_SEC * dt)
+                .max(METER_FLOOR_DB);
+            slot.meter_peak_db
+                .store(self.peak_db[index].to_bits(), Ordering::Relaxed);
+
+            if peak >= 0.999 {
+                self.clip[index] = true;
+            }
+            slot.clip.store(self.clip[index], Ordering::Relaxed);
+
             if self.played[index] > 0 {
                 slot.played_frames
                     .fetch_add(self.played[index], Ordering::Relaxed);
@@ -906,14 +1005,16 @@ mod tests {
         assert!((data[0] - 0.75 * center).abs() < 1e-6);
         assert!((data[1] + 0.25 * center).abs() < 1e-6);
         assert_eq!(sh.position_frames.load(Ordering::Relaxed), 2);
-        assert!((sh.slots[0].meter.load(Ordering::Relaxed) as f32) > 0.0);
+        assert!(
+            f32::from_bits(sh.slots[0].meter_rms.load(Ordering::Relaxed)) > 0.0
+        );
 
         sh.slots[1].muted.store(true, Ordering::Relaxed);
         output.render(&mut data[..2], 2, 48_000, &sh);
         assert!((data[0] - 0.25 * center).abs() < 1e-6);
         assert!((data[1] - 0.25 * center).abs() < 1e-6);
         assert_eq!(
-            f32::from_bits(sh.slots[1].meter.load(Ordering::Relaxed)),
+            f32::from_bits(sh.slots[1].meter_rms.load(Ordering::Relaxed)),
             0.0
         );
     }
