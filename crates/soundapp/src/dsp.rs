@@ -20,6 +20,8 @@ pub const FFT_SIZE: usize = 2048;
 const HOP: usize = FFT_SIZE / 2;
 pub const BANDS: usize = 64;
 pub const OSC_POINTS: usize = 256;
+/// Samples behind one live-wave trace (~21 ms at 48 kHz).
+pub const OSC_SPAN: usize = 1024;
 pub const GONIO_POINTS: usize = 192;
 
 const F_MIN: f32 = 20.0;
@@ -34,9 +36,15 @@ const LUFS_OFFSET: f32 = -0.691;
 pub struct DspSnapshot {
     pub spectrum_db: [f32; BANDS],
     pub peak_hold_db: [f32; BANDS],
+    /// Dominant bin and its level — not shown in the UI, asserted by the DSP
+    /// tests and used by the offline analysis harness.
+    #[allow(dead_code)]
     pub peak_hz: f32,
+    #[allow(dead_code)]
     pub peak_db: f32,
     pub osc_points: Vec<(f32, f32)>,
+    /// Stereo RMS of the last chunk — DSP-test reference, not a readout.
+    #[allow(dead_code)]
     pub rms_db: f32,
     pub gonio_points: Vec<(f32, f32)>,
     pub correlation: f32,
@@ -512,21 +520,41 @@ impl DspAnalyzer {
         if n == 0 {
             return;
         }
-        // Oscilloscope: anchor on the most recent upward zero crossing so the trace
-        // stands still instead of scrolling.
-        let mono: Vec<f32> = self.recent.iter().map(|&(l, _)| l).collect();
-        let mut anchor = n.saturating_sub(OSC_POINTS);
-        let scan_from = n.saturating_sub(OSC_POINTS * 2).max(1);
-        for i in scan_from..n {
+        // Live wave: a stable window anchored on the most recent upward zero
+        // crossing that still leaves a full span in the buffer. (The previous
+        // version anchored near the buffer end, so most of the trace was the
+        // clamped last sample — it drew a flat line.)
+        let mono: Vec<f32> = self.recent.iter().map(|&(l, r)| (l + r) * 0.5).collect();
+        let span = OSC_SPAN.min(n);
+        let latest = n - span;
+        let scan_from = latest.saturating_sub(span).max(1);
+        let mut anchor = latest;
+        for i in scan_from..=latest.min(n - 1) {
             if mono[i - 1] <= 0.0 && mono[i] > 0.0 {
                 anchor = i;
             }
         }
-        anchor = anchor.min(n - 1);
+        let end = (anchor + span).min(n);
+        // Remove the window's DC offset and auto-range: quiet material still has
+        // to read as a waveform, and an offset trace must not ride above the
+        // midline. Loud material stays at unity so the trace does not lie.
+        let mean = if end > anchor {
+            mono[anchor..end].iter().sum::<f32>() / (end - anchor) as f32
+        } else {
+            0.0
+        };
+        let peak = mono[anchor..end]
+            .iter()
+            .fold(0.0f32, |m, s| m.max((s - mean).abs()));
+        let gain = if peak > 1e-4 {
+            (0.85 / peak).clamp(1.0, 8.0)
+        } else {
+            1.0
+        };
         let denom = (OSC_POINTS - 1) as f32;
         for (i, p) in self.osc_points.iter_mut().enumerate() {
-            let idx = (anchor + i).min(n - 1);
-            let s = mono[idx].clamp(-1.0, 1.0);
+            let idx = (anchor + i * span / OSC_POINTS).min(n - 1);
+            let s = ((mono[idx] - mean) * gain).clamp(-1.0, 1.0);
             *p = (i as f32 / denom, 0.5 + 0.5 * s);
         }
 

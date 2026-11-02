@@ -40,6 +40,38 @@ use nui::{
     ICON_LOCK, ICON_SEARCH, ICON_SETTINGS, ICON_SHUFFLE, ICON_TUNE, ICON_VOLUME,
 };
 
+/// Throttled Monitoring numeric readout. Font layout/measure is the expensive
+/// part of that window, and level numbers are noise when they change every
+/// frame — 3 Hz is plenty (owner decision 2026-11-02).
+#[derive(Default)]
+struct MonReadout {
+    at: Option<Instant>,
+    /// `position / duration` for the overview header.
+    time: String,
+    short: String,
+    int: String,
+    mom: String,
+    peak: String,
+}
+
+impl MonReadout {
+    const INTERVAL_MS: u128 = 300;
+
+    fn refresh(&mut self, now: Instant, position: f64, duration: f64, snap: &DspSnapshot) {
+        if let Some(at) = self.at {
+            if now.duration_since(at).as_millis() < Self::INTERVAL_MS {
+                return;
+            }
+        }
+        self.at = Some(now);
+        self.time = format!("{} / {}", fmt_time(position), fmt_time(duration));
+        self.short = format!("{:+.1}", snap.short_term_lufs);
+        self.int = format!("{:+.1}", snap.integrated_lufs);
+        self.mom = format!("{:+.1}", snap.momentary_lufs);
+        self.peak = format!("{:+.1}", snap.true_peak_dbtp);
+    }
+}
+
 /// One channel strip in the Phase 3.4 multitrack preview mixer.
 #[derive(Clone, Debug)]
 struct MixerStem {
@@ -398,6 +430,11 @@ struct App {
     waveform_data: waveform::WaveformData,
     waveform_duration: f64,
     waveform_progress: f32,
+    /// Static label for the overview header ("MIDI · 4 ch · 0:59" / "NO OVERVIEW"),
+    /// rebuilt only when the analysis state changes.
+    waveform_label: String,
+    /// Throttled numeric readout of the Monitoring rail.
+    mon_readout: MonReadout,
     /// Pending seek from a click on the Monitoring overview.
     monitoring_seek: Option<f64>,
 
@@ -1130,35 +1167,59 @@ fn draw_text_at(
     );
 }
 
-/// A dark `inset_card`-style readout box with an uppercase label and a value.
-fn draw_readout(ui: &mut Ui, r: Rect, label: &str, value: &str) {
+/// Compact `label` over `value`, no box — the Monitoring rail's dense readouts.
+fn draw_compact_readout(ui: &mut Ui, r: Rect, label: &str, value: &str) {
     let t = ui.theme;
-    ui.scene
-        .rounded_rect(r.x, r.y, r.w, r.h, t.radius2(), t.base, t.border1, 1.0);
-    let pad = (t.rem * 0.4).round();
-    let lx = (r.x + pad).round();
     let lfs = t.font_xsmall();
+    let vfs = t.font_small();
     ui.scene.text(
         ui.text_sys,
         FontFace::Regular,
         ui.font_engine,
         label,
-        lx,
-        (r.y + pad + lfs * 0.85).round(),
+        r.x.round(),
+        (r.y + lfs * 0.9).round(),
         lfs,
         t.text_muted,
     );
-    let vfs = t.font_small();
     ui.scene.text(
         ui.text_sys,
         FontFace::SemiBold,
         ui.font_engine,
         value,
-        lx,
-        (r.y + r.h - pad - vfs * 0.15).round(),
+        r.x.round(),
+        (r.y + lfs * 1.15 + vfs * 0.9).round(),
         vfs,
         t.text,
     );
+}
+
+/// One rail meter: track, green fill, white peak tick. Scale is −40..0 dB (the
+/// reference's LOUDNESS axis), shared by LUFS and the L/R levels.
+fn draw_rail_meter(ui: &mut Ui, r: Rect, db: f32, peak_db: f32) {
+    let t = ui.theme;
+    ui.scene
+        .rounded_rect(r.x, r.y, r.w, r.h, 2.0, t.base, t.border1, 1.0);
+    let u = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
+    let h = ((r.h - 2.0) * u).max(0.0);
+    if h > 0.5 {
+        ui.scene.rect(
+            r.x + 1.0,
+            r.y + r.h - 1.0 - h,
+            (r.w - 2.0).max(1.0),
+            h,
+            t.palette_activate,
+        );
+    }
+    let cap = (r.y + r.h - 1.0 - h).round();
+    ui.scene
+        .rect(r.x + 1.0, cap, (r.w - 2.0).max(1.0), 1.5, rgb(235, 235, 235));
+    let pu = ((peak_db + 40.0) / 40.0).clamp(0.0, 1.0);
+    if pu > u + 0.01 {
+        let py = (r.y + r.h - 1.0 - (r.h - 2.0) * pu).round();
+        ui.scene
+            .rect(r.x + 1.0, py, (r.w - 2.0).max(1.0), 1.0, t.palette_mark);
+    }
 }
 
 /// One color segment of a VU meter, limited to the region above the `top` fill line.
@@ -1175,30 +1236,6 @@ fn meter_segment(ui: &mut Ui, r: Rect, top: f32, lo_db: f32, hi_db: f32, color: 
             color,
         );
     }
-}
-
-/// Vertical L/R VU meter: dark slot, green/yellow/red fill, white peak tick, label.
-fn draw_vu_meter(ui: &mut Ui, r: Rect, lvl_db: f32, peak_db: f32, label: &str) {
-    let t = ui.theme;
-    ui.scene
-        .rounded_rect(r.x, r.y, r.w, r.h, 2.0, t.base, t.border1, 1.0);
-    let top = r.y + r.h * (1.0 - ((lvl_db + 60.0) / 60.0).clamp(0.0, 1.0));
-    meter_segment(ui, r, top, -60.0, -12.0, t.palette_activate);
-    meter_segment(ui, r, top, -12.0, -3.0, t.palette_mark);
-    meter_segment(ui, r, top, -3.0, 0.0, t.palette_alert);
-    let py = (r.y + r.h * (1.0 - ((peak_db + 60.0) / 60.0).clamp(0.0, 1.0))).round();
-    ui.scene.rect(r.x, py, r.w, 1.5, rgb(235, 235, 235));
-    let lfs = t.font_xsmall();
-    ui.scene.text(
-        ui.text_sys,
-        FontFace::SemiBold,
-        ui.font_engine,
-        label,
-        (r.x + 2.0).round(),
-        (r.y + r.h - 3.0).round(),
-        lfs,
-        t.text_dim,
-    );
 }
 
 /// Fold a whole-file peak array into the pixel columns of `r`, mirrored around
@@ -3260,6 +3297,8 @@ impl App {
             waveform_data: waveform::WaveformData::Empty,
             waveform_duration: 0.0,
             waveform_progress: 0.0,
+            waveform_label: String::new(),
+            mon_readout: MonReadout::default(),
             monitoring_seek: None,
             mixer_audio: None,
             mixer_stems,
@@ -4089,6 +4128,7 @@ impl App {
                 self.waveform_data = waveform::WaveformData::Empty;
                 self.waveform_duration = 0.0;
                 self.waveform_progress = 0.0;
+                self.waveform_label.clear();
             }
             return;
         }
@@ -4105,12 +4145,14 @@ impl App {
                     self.waveform_data = waveform::WaveformData::Empty;
                     self.waveform_duration = 0.0;
                     self.waveform_progress = 0.0;
+                    self.waveform_label = "ANALYSING 0%".to_string();
                 }
                 None => {
                     self.waveform_request = None;
                     self.waveform_data = waveform::WaveformData::Empty;
                     self.waveform_duration = 0.0;
                     self.waveform_progress = 0.0;
+                    self.waveform_label.clear();
                 }
             }
         }
@@ -4124,6 +4166,21 @@ impl App {
             self.waveform_data = update.data;
             self.waveform_duration = update.duration;
             self.waveform_progress = update.progress;
+            self.waveform_label = match &self.waveform_data {
+                waveform::WaveformData::Peaks(_) => String::new(),
+                waveform::WaveformData::Midi(lanes) => format!(
+                    "MIDI · {} ch · {}",
+                    lanes.len(),
+                    fmt_time(update.duration)
+                ),
+                waveform::WaveformData::Empty => {
+                    if update.progress > 0.0 && update.progress < 1.0 {
+                        format!("ANALYSING {:.0}%", update.progress * 100.0)
+                    } else {
+                        "NO OVERVIEW".to_string()
+                    }
+                }
+            };
         }
     }
 
@@ -6019,14 +6076,52 @@ impl App {
                         // ====================================================
                         "monitoring" => {
                             let snap = &self.dsp_snap;
-                            // Whole-file overview strip above the DSP grid —
-                            // the reference window's OVERVIEW row.
-                            let overview_h = Length::Rem(5.6).resolve(rem).round();
-                            let [overview, panels] = ui.rows(
+                            // Reference layout: one wide analysis column plus a
+                            // narrow meter rail. Numbers live in the rail only,
+                            // and refresh at 3 Hz (font layout is the cost).
+                            self.mon_readout.refresh(
+                                Instant::now(),
+                                self.audio
+                                    .as_ref()
+                                    .map(|a| a.position_secs())
+                                    .unwrap_or(0.0),
+                                self.audio.as_ref().map(|a| a.duration_secs()).unwrap_or(0.0),
+                                snap,
+                            );
+                            let rail_w = (body.w * 0.245).max(11.0 * rem);
+                            let [left, rail] = ui.cols(
                                 body,
                                 Length::Px(gap),
-                                [Length::Px(overview_h), Length::fill()],
+                                [Length::fill(), Length::Px(rail_w)],
                             );
+                            let overview_h = Length::Rem(9.5).resolve(rem).round();
+                            let left_rest = (left.h - overview_h - gap * 2.0).max(48.0);
+                            let spectrum_h = (left_rest * 0.58).round();
+                            let [overview, spectrum, waves] = ui.rows(
+                                left,
+                                Length::Px(gap),
+                                [
+                                    Length::Px(overview_h),
+                                    Length::Px(spectrum_h),
+                                    Length::fill(),
+                                ],
+                            );
+                            let [live, vector] =
+                                ui.cols(waves, Length::Px(gap), [Length::fill(), Length::fill()]);
+                            let corr_h = Length::Rem(4.0).resolve(rem).round();
+                            let ebu_h = Length::Rem(8.0).resolve(rem).round();
+                            let [corr, loud, ebu] = ui.rows(
+                                rail,
+                                Length::Px(gap),
+                                [Length::Px(corr_h), Length::fill(), Length::Px(ebu_h)],
+                            );
+                            // Waveforms are grey like the reference player; the
+                            // accent stays on spectra and meters.
+                            let wave_grey = if theme.dark {
+                                rgb(150, 150, 150)
+                            } else {
+                                rgb(100, 100, 100)
+                            };
                             ui.card(overview, Length::Rem(0.85), Length::Rem(0.45), |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
@@ -6051,39 +6146,23 @@ impl App {
                                     .as_ref()
                                     .map(|a| a.duration_secs())
                                     .unwrap_or(0.0);
-                                let info = match &self.waveform_data {
+                                let info: &str = match &self.waveform_data {
                                     waveform::WaveformData::Peaks(_) => {
-                                        format!("{} / {}", fmt_time(position), fmt_time(duration))
+                                        self.mon_readout.time.as_str()
                                     }
-                                    waveform::WaveformData::Midi(lanes) => format!(
-                                        "MIDI · {} ch · {}",
-                                        lanes.len(),
-                                        fmt_time(self.waveform_duration)
-                                    ),
-                                    waveform::WaveformData::Empty => {
-                                        if self.waveform_progress > 0.0
-                                            && self.waveform_progress < 1.0
-                                        {
-                                            format!(
-                                                "ANALYSING {:.0}%",
-                                                self.waveform_progress * 100.0
-                                            )
-                                        } else {
-                                            "NO OVERVIEW".to_string()
-                                        }
-                                    }
+                                    _ => self.waveform_label.as_str(),
                                 };
                                 let iw = ui.text_sys.measure(
                                     FontFace::SemiBold,
                                     ui.font_engine,
-                                    &info,
+                                    info,
                                     fs,
                                 );
                                 ui.scene.text(
                                     ui.text_sys,
                                     FontFace::SemiBold,
                                     ui.font_engine,
-                                    &info,
+                                    info,
                                     (hdr.x + hdr.w - iw).round(),
                                     baseline,
                                     fs,
@@ -6112,7 +6191,7 @@ impl App {
                                     .rect(inner.x, mid_y, inner.w, 1.0, theme.border1);
                                 match &self.waveform_data {
                                     waveform::WaveformData::Peaks(peaks) => {
-                                        draw_peak_overview(ui, inner, peaks, theme.highlight)
+                                        draw_peak_overview(ui, inner, peaks, wave_grey)
                                     }
                                     waveform::WaveformData::Midi(lanes) => draw_midi_overview(
                                         ui,
@@ -6120,7 +6199,7 @@ impl App {
                                         lanes,
                                         (self.waveform_duration * 1000.0) as f32,
                                         rgba(255, 255, 255, 10),
-                                        theme.palette_activate,
+                                        wave_grey,
                                         theme.palette_mark,
                                     ),
                                     waveform::WaveformData::Empty => {}
@@ -6156,15 +6235,8 @@ impl App {
                                 ui.draw_focus_ring(OVERVIEW_ID, canvas, theme.radius1());
                             });
 
-                            let [top_row, bot_row] =
-                                ui.rows(panels, Length::Px(gap), [Length::fill(), Length::fill()]);
-                            let [tl, tr] =
-                                ui.cols(top_row, Length::Px(gap), [Length::fill(), Length::fill()]);
-                            let [bl, br] =
-                                ui.cols(bot_row, Length::Px(gap), [Length::fill(), Length::fill()]);
-
-                            // ---- Top-Left: 64-band logarithmic FFT spectrum ----
-                            ui.card(tl, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            // ---- SPECTRUM: 64-band logarithmic FFT ----
+                            ui.card(spectrum, Length::Rem(0.85), Length::Rem(0.45), |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
@@ -6177,24 +6249,6 @@ impl App {
                                     fs,
                                     hdr.w,
                                     theme.text_dim,
-                                );
-                                let peak_txt =
-                                    format!("Peak: {:.0}Hz ({:+.1}dB)", snap.peak_hz, snap.peak_db);
-                                let ptw = ui.text_sys.measure(
-                                    FontFace::SemiBold,
-                                    ui.font_engine,
-                                    &peak_txt,
-                                    fs,
-                                );
-                                ui.scene.text(
-                                    ui.text_sys,
-                                    FontFace::SemiBold,
-                                    ui.font_engine,
-                                    &peak_txt,
-                                    (hdr.x + hdr.w - ptw).round(),
-                                    baseline,
-                                    fs,
-                                    theme.highlight,
                                 );
                                 let canvas = ui.take_rest();
                                 ui.scene.rounded_rect(
@@ -6257,37 +6311,20 @@ impl App {
                                 ui.scene.pop_clip();
                             });
 
-                            // ---- Top-Right: zero-crossing-stabilized oscilloscope ----
-                            ui.card(tr, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            // ---- LIVE WAVE: stabilized time-domain trace ----
+                            ui.card(live, Length::Rem(0.85), Length::Rem(0.45), |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
-                                    "OSCILLOSCOPE",
+                                    "LIVE WAVE",
                                     hdr.x.round(),
                                     baseline,
                                     fs,
                                     hdr.w,
                                     theme.text_dim,
-                                );
-                                let rms_txt = format!("RMS: {:+.1} dB", snap.rms_db);
-                                let rtw = ui.text_sys.measure(
-                                    FontFace::SemiBold,
-                                    ui.font_engine,
-                                    &rms_txt,
-                                    fs,
-                                );
-                                ui.scene.text(
-                                    ui.text_sys,
-                                    FontFace::SemiBold,
-                                    ui.font_engine,
-                                    &rms_txt,
-                                    (hdr.x + hdr.w - rtw).round(),
-                                    baseline,
-                                    fs,
-                                    theme.highlight,
                                 );
                                 let canvas = ui.take_rest();
                                 ui.scene.rounded_rect(
@@ -6306,52 +6343,28 @@ impl App {
                                     (canvas.w - 2.0).max(1.0),
                                     (canvas.h - 2.0).max(1.0),
                                 );
-                                for ny in [0.75f32, 0.5, 0.25] {
-                                    let gy = (canvas.y + (1.0 - ny) * canvas.h).round();
-                                    ui.scene.rect(canvas.x, gy, canvas.w, 1.0, theme.border1);
-                                }
-                                ui.polyline(canvas, &snap.osc_points, 2.0, theme.highlight);
+                                let mid = (canvas.y + canvas.h * 0.5).round();
+                                ui.scene.rect(canvas.x, mid, canvas.w, 1.0, theme.border1);
+                                ui.polyline(canvas, &snap.osc_points, 1.5, theme.highlight);
                                 ui.scene.pop_clip();
                             });
 
-                            // ---- Bottom-Left: stereo goniometer + correlation ----
-                            ui.card(bl, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            // ---- VECTORSCOPE: stereo Lissajous ----
+                            ui.card(vector, Length::Rem(0.85), Length::Rem(0.45), |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
-                                    "STEREO FIELD (GONIOMETER)",
+                                    "VECTORSCOPE",
                                     hdr.x.round(),
                                     baseline,
                                     fs,
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let corr_txt = format!("Correlation: {:+.2}", snap.correlation);
-                                let ctw = ui.text_sys.measure(
-                                    FontFace::SemiBold,
-                                    ui.font_engine,
-                                    &corr_txt,
-                                    fs,
-                                );
-                                ui.scene.text(
-                                    ui.text_sys,
-                                    FontFace::SemiBold,
-                                    ui.font_engine,
-                                    &corr_txt,
-                                    (hdr.x + hdr.w - ctw).round(),
-                                    baseline,
-                                    fs,
-                                    theme.highlight,
-                                );
-                                let rest = ui.take_rest();
-                                let [radar, corr] = ui.rows(
-                                    rest,
-                                    Length::Px(theme.space_half()),
-                                    [Length::fill(), Length::rem(1.5)],
-                                );
+                                let radar = ui.take_rest();
                                 ui.scene.rounded_rect(
                                     radar.x,
                                     radar.y,
@@ -6406,191 +6419,222 @@ impl App {
                                     );
                                 }
                                 ui.polyline(radar, &snap.gonio_points, 1.5, theme.highlight);
-
-                                // Phase correlation bar: centre 0, fill toward ±1.
-                                ui.scene.rounded_rect(
-                                    corr.x,
-                                    corr.y,
-                                    corr.w,
-                                    corr.h,
-                                    theme.radius1(),
-                                    theme.base,
-                                    theme.border1,
-                                    1.0,
-                                );
-                                let mid = (corr.x + corr.w * 0.5).round();
-                                ui.scene.rect(
-                                    mid - 1.0,
-                                    corr.y + 2.0,
-                                    2.0,
-                                    corr.h - 4.0,
-                                    theme.border3,
-                                );
-                                let c = snap.correlation.clamp(-1.0, 1.0);
-                                let half = corr.w * 0.5;
-                                let (bx0, bwid) = if c >= 0.0 {
-                                    (mid, half * c)
-                                } else {
-                                    (mid + half * c, -half * c)
-                                };
-                                if bwid > 0.5 {
-                                    ui.scene.rect(
-                                        bx0,
-                                        corr.y + 2.0,
-                                        bwid,
-                                        corr.h - 4.0,
-                                        theme.highlight,
-                                    );
-                                }
-                                let lfs2 = theme.font_xsmall();
-                                ui.scene.text(
-                                    ui.text_sys,
-                                    FontFace::Regular,
-                                    ui.font_engine,
-                                    "-1",
-                                    (corr.x + 3.0).round(),
-                                    (corr.y + corr.h * 0.5 + 4.0).round(),
-                                    lfs2,
-                                    theme.text_muted,
-                                );
-                                ui.scene.text(
-                                    ui.text_sys,
-                                    FontFace::Regular,
-                                    ui.font_engine,
-                                    "+1",
-                                    (corr.x + corr.w - 16.0).round(),
-                                    (corr.y + corr.h * 0.5 + 4.0).round(),
-                                    lfs2,
-                                    theme.text_muted,
-                                );
                             });
 
-                            // ---- Bottom-Right: meters + BS.1770 loudness ----
-                            ui.card(br, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            // ---- CORRELATION: phase meter (no numeric readout) ----
+                            ui.card(corr, Length::Rem(0.85), Length::Rem(0.45), |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
-                                    "LEVELS & LOUDNESS (LUFS)",
+                                    "CORRELATION",
                                     hdr.x.round(),
                                     baseline,
                                     fs,
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let int_txt = format!("Int: {:+.1} LUFS", snap.integrated_lufs);
-                                let itw = ui.text_sys.measure(
-                                    FontFace::SemiBold,
-                                    ui.font_engine,
-                                    &int_txt,
-                                    fs,
+                                let rest = ui.take_rest();
+                                let lfs = theme.font_xsmall();
+                                let [bar, lbl_row] = ui.rows(
+                                    rest,
+                                    Length::Px(2.0),
+                                    [Length::fill(), Length::Px((lfs * 1.4).round())],
+                                );
+                                ui.scene.rounded_rect(
+                                    bar.x,
+                                    bar.y,
+                                    bar.w,
+                                    bar.h,
+                                    theme.radius1(),
+                                    theme.base,
+                                    theme.border2,
+                                    1.0,
+                                );
+                                let mid = (bar.x + bar.w * 0.5).round();
+                                ui.scene.rect(
+                                    mid - 0.5,
+                                    bar.y + 2.0,
+                                    1.0,
+                                    (bar.h - 4.0).max(1.0),
+                                    theme.border3,
+                                );
+                                let c = snap.correlation.clamp(-1.0, 1.0);
+                                let half = (bar.w * 0.5 - 2.0).max(1.0);
+                                let fill = (half * c.abs()).max(1.0);
+                                let (fx, fw) = if c >= 0.0 {
+                                    (mid, fill)
+                                } else {
+                                    (mid - fill, fill)
+                                };
+                                ui.scene.rect(
+                                    fx,
+                                    bar.y + 2.0,
+                                    fw,
+                                    (bar.h - 4.0).max(1.0),
+                                    theme.palette_activate,
                                 );
                                 ui.scene.text(
                                     ui.text_sys,
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    "-1",
+                                    lbl_row.x.round(),
+                                    (lbl_row.y + lfs * 0.9).round(),
+                                    lfs,
+                                    theme.text_muted,
+                                );
+                                let right_w = ui.text_sys.measure(
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    "+1",
+                                    lfs,
+                                );
+                                ui.scene.text(
+                                    ui.text_sys,
+                                    FontFace::Regular,
+                                    ui.font_engine,
+                                    "+1",
+                                    (lbl_row.x + lbl_row.w - right_w).round(),
+                                    (lbl_row.y + lfs * 0.9).round(),
+                                    lfs,
+                                    theme.text_muted,
+                                );
+                            });
+
+                            // ---- LOUDNESS: three compact meters + dB axis ----
+                            ui.card(loud, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                                let hdr = ui.take(Length::Rem(1.2));
+                                let fs = theme.font_small();
+                                let baseline = (hdr.y + fs * 0.85).round();
+                                ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
-                                    &int_txt,
-                                    (hdr.x + hdr.w - itw).round(),
+                                    "LOUDNESS",
+                                    hdr.x.round(),
                                     baseline,
                                     fs,
-                                    theme.highlight,
+                                    hdr.w,
+                                    theme.text_dim,
                                 );
                                 let rest = ui.take_rest();
-                                let [meters_r, lufs_r] = ui.cols(
-                                    rest,
-                                    Length::Px(theme.space_half()),
-                                    [Length::rem(6.0), Length::fill()],
+                                let axis_w = (2.2 * rem).round();
+                                let label_h = (1.1 * rem).round();
+                                let bar_area = Rect::new(
+                                    rest.x,
+                                    rest.y,
+                                    (rest.w - axis_w).max(12.0),
+                                    (rest.h - label_h).max(12.0),
                                 );
-                                let [lm, sm, rm] = ui.cols(
-                                    meters_r,
-                                    Length::Px(2.0),
-                                    [Length::fill(), Length::rem(1.5), Length::fill()],
-                                );
-                                draw_vu_meter(ui, lm, snap.vu_l_db, snap.peak_l_db, "L");
-                                draw_vu_meter(ui, rm, snap.vu_r_db, snap.peak_r_db, "R");
-                                let sfs = theme.font_xsmall();
-                                for (db, lbl) in [
+                                let bar_gap = (0.45 * rem).round();
+                                let bar_w =
+                                    ((bar_area.w - bar_gap * 2.0) / 3.0).max(4.0).floor();
+                                let meters = [
+                                    (snap.momentary_lufs, snap.momentary_lufs, "LUFS"),
+                                    (snap.vu_l_db, snap.peak_l_db, "L"),
+                                    (snap.vu_r_db, snap.peak_r_db, "R"),
+                                ];
+                                for (i, (db, peak, label)) in meters.iter().enumerate() {
+                                    let bar = Rect::new(
+                                        bar_area.x + i as f32 * (bar_w + bar_gap),
+                                        bar_area.y,
+                                        bar_w,
+                                        bar_area.h,
+                                    );
+                                    draw_rail_meter(ui, bar, *db, *peak);
+                                    draw_centered_text(
+                                        ui,
+                                        Rect::new(bar.x, bar_area.y + bar_area.h, bar.w, label_h),
+                                        label,
+                                        FontFace::Regular,
+                                        theme.font_xsmall(),
+                                        theme.text_muted,
+                                    );
+                                }
+                                for (db, label) in [
                                     (0.0f32, "0"),
+                                    (-6.0, "-6"),
                                     (-12.0, "-12"),
+                                    (-18.0, "-18"),
                                     (-24.0, "-24"),
+                                    (-30.0, "-30"),
                                     (-36.0, "-36"),
-                                    (-48.0, "-48"),
+                                    (-40.0, "-40"),
                                 ] {
-                                    let y =
-                                        sm.y + (1.0 - ((db + 60.0) / 60.0).clamp(0.0, 1.0)) * sm.h;
+                                    let y = bar_area.y
+                                        + (1.0 - ((db + 40.0) / 40.0).clamp(0.0, 1.0))
+                                            * bar_area.h;
                                     ui.scene.text(
                                         ui.text_sys,
                                         FontFace::Regular,
                                         ui.font_engine,
-                                        lbl,
-                                        sm.x.round(),
-                                        (y + 3.0).round(),
-                                        sfs,
+                                        label,
+                                        (bar_area.x + bar_area.w + 4.0).round(),
+                                        (y + theme.font_xsmall() * 0.35).round(),
+                                        theme.font_xsmall(),
                                         theme.text_muted,
                                     );
                                 }
-                                let [grid_r, btn_row] = ui.rows(
-                                    lufs_r,
-                                    Length::Px(theme.space_half()),
-                                    [Length::fill(), Length::rem(2.1)],
+                            });
+
+                            // ---- EBU R128: compact readout grid (3 Hz) ----
+                            ui.card(ebu, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                                let hdr = ui.take(Length::Rem(1.2));
+                                let fs = theme.font_small();
+                                let baseline = (hdr.y + fs * 0.85).round();
+                                ui.text_clipped(
+                                    FontFace::SemiBold,
+                                    ui.font_engine,
+                                    "EBU R128",
+                                    hdr.x.round(),
+                                    baseline,
+                                    fs,
+                                    (hdr.w - 1.8 * rem).max(10.0),
+                                    theme.text_dim,
                                 );
-                                let [r0, r1] = ui.rows(
-                                    grid_r,
-                                    Length::Px(theme.space_half()),
-                                    [Length::fill(), Length::fill()],
-                                );
-                                let [a0, a1] = ui.cols(
-                                    r0,
-                                    Length::Px(theme.space_half()),
-                                    [Length::fill(), Length::fill()],
-                                );
-                                let [b0, b1] = ui.cols(
-                                    r1,
-                                    Length::Px(theme.space_half()),
-                                    [Length::fill(), Length::fill()],
-                                );
-                                draw_readout(
-                                    ui,
-                                    a0,
-                                    "MOMENTARY",
-                                    &format!("{:+.1} LUFS", snap.momentary_lufs),
-                                );
-                                draw_readout(
-                                    ui,
-                                    a1,
-                                    "SHORT-TERM",
-                                    &format!("{:+.1} LUFS", snap.short_term_lufs),
-                                );
-                                draw_readout(
-                                    ui,
-                                    b0,
-                                    "INTEGRATED",
-                                    &format!("{:+.1} LUFS", snap.integrated_lufs),
-                                );
-                                draw_readout(
-                                    ui,
-                                    b1,
-                                    "TRUE PEAK",
-                                    &format!("{:+.1} dBTP", snap.true_peak_dbtp),
-                                );
-                                let bw2 = Length::Rem(8.0).resolve(rem).round();
+                                let btn_s = (1.3 * rem).round();
                                 let btn = Rect::new(
-                                    btn_row.x + btn_row.w - bw2,
-                                    btn_row.y,
-                                    bw2,
-                                    btn_row.h,
+                                    hdr.x + hdr.w - btn_s,
+                                    hdr.y + (hdr.h - btn_s) * 0.5,
+                                    btn_s,
+                                    btn_s,
                                 );
                                 if ui.button(
                                     1290,
                                     btn,
-                                    "RESET LUFS",
+                                    "",
                                     ICON_RESTART,
                                     ButtonVariant::Outline,
                                 ) {
                                     self.dsp.reset_lufs();
                                 }
+                                let rest = ui.take_rest();
+                                let [r0, r1] = ui.rows(
+                                    rest,
+                                    Length::Px(gap),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                let [a0, a1] = ui.cols(
+                                    r0,
+                                    Length::Px(gap),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                let [b0, b1] = ui.cols(
+                                    r1,
+                                    Length::Px(gap),
+                                    [Length::fill(), Length::fill()],
+                                );
+                                draw_compact_readout(
+                                    ui,
+                                    a0,
+                                    "SHORT LUFS",
+                                    &self.mon_readout.short,
+                                );
+                                draw_compact_readout(ui, a1, "INT LUFS", &self.mon_readout.int);
+                                draw_compact_readout(ui, b0, "MOM LUFS", &self.mon_readout.mom);
+                                draw_compact_readout(ui, b1, "PEAK dBTP", &self.mon_readout.peak);
                             });
                         }
 
