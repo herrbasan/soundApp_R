@@ -1,9 +1,9 @@
 # soundApp_R & NUI Rust — Agent Briefing
 
-> **START HERE:** Read **[`docs/handover_2026-11-02.md`](docs/handover_2026-11-02.md)** for the current working state — Multi-Track drop fixes, HQ-default change, the dBFS stem VU and the Monitoring OVERVIEW row (plus the resampler EOF bug it uncovered). Then **[`docs/handover_2026-10-28.md`](docs/handover_2026-10-28.md)** for the window-toggle root cause, the event log and the output-sample-rate findings, and **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap. `docs/handover_2026-10-24.md` remains valid for architecture and earlier findings.
+> **START HERE:** Read **[`docs/handover_2026-11-08.md`](docs/handover_2026-11-08.md)** — the playback CPU pass (post-track-end core spin, parking, bulk rtrb, adaptive waveform pacing) and the Monitoring pass (mouse-move analysis freeze root cause, redraw storm, canvas padding). Then **[`docs/handover_2026-11-02.md`](docs/handover_2026-11-02.md)** for the Multi-Track drop fixes, HQ-default change, the dBFS stem VU and the Monitoring OVERVIEW row, **[`docs/handover_2026-10-28.md`](docs/handover_2026-10-28.md)** for the window-toggle root cause, the event log and the output-sample-rate findings, and **[`docs/development_plan.md`](docs/development_plan.md)** for benchmarks, solved rendering/typography/FFmpeg traps, and the longer roadmap. `docs/handover_2026-10-24.md` remains valid for architecture and earlier findings.
 > **RESOLVED 2026-10-25 (ALPHATAP field box):** frameless-window DWM composition offset — content displaced down/right, metrics healthy. Root cause: winit's undecorated windows carry `WS_CAPTION|WS_THICKFRAME|…`, and this driver stack places the window surface at that style's frame origin while the client claims the whole window. Fixed by stripping the bits + suppressing non-client painting in `crates/nui/src/render.rs`. Measurements, verified matrix and the one open item (native drag/resize) in **[`docs/handover_alphatap-render-offset-2026-10-25.md`](docs/handover_alphatap-render-offset-2026-10-25.md)**.
 
-**Last handover:** 2026-11-02 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`).
+**Last handover:** 2026-11-08 · **Remote:** `https://github.com/herrbasan/soundApp_R` (branch `master`).
 
 ## Diagnostics you will need
 

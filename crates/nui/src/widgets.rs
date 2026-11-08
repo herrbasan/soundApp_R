@@ -611,6 +611,18 @@ impl Rect {
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
+
+    /// Shrink by `pad` on every side (never below 1x1) — the standard inset for
+    /// a canvas that must not touch the frame of the card it sits in.
+    #[inline]
+    pub fn inset(&self, pad: f32) -> Self {
+        Self {
+            x: self.x + pad,
+            y: self.y + pad,
+            w: (self.w - pad * 2.0).max(1.0),
+            h: (self.h - pad * 2.0).max(1.0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

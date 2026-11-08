@@ -316,7 +316,9 @@ struct App {
     size: (u32, u32),
     audio: Option<Audio>,
     audio_reported: bool,
-    t: f32,
+    /// Wall clock for synthetic animation phases: redraws can arrive outside the
+    /// frame pacing (mouse movement), so a frame counter would freeze them.
+    anim_epoch: Instant,
     frame_ms: u64,
     nopaint: bool,
     next_frame: Instant,
@@ -3288,7 +3290,7 @@ impl App {
             size: (580, 390),
             audio,
             audio_reported: false,
-            t: 0.0,
+            anim_epoch: Instant::now(),
             frame_ms: 16,
             nopaint: false,
             next_frame: Instant::now(),
@@ -5710,10 +5712,17 @@ impl App {
                 eventlog::note(&format!("occluded {key} {occluded}"));
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Same rule as the primary window: while the animation loop already
+                // repaints every window at the frame cadence, a per-move redraw would
+                // let a 1000 Hz mouse drive hundreds of full scene builds per second.
+                let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
+                let paced = playing && self.animate;
                 if let Some(w) = self.secondary_windows.find_by_key_mut(key) {
                     w.ui_state.cursor = (position.x as f32, position.y as f32);
                     nui::update_resize_cursor(&w.window, w.ui_state.cursor, w.size);
-                    w.window.request_redraw();
+                    if !paced || w.ui_state.mouse_down {
+                        w.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -5980,29 +5989,42 @@ impl App {
                 (theme.shade2.0, theme.shade2.1, theme.shade2.2)
             };
             // Phase 3.3 — refresh the DSP snapshot before the UI reads it (Monitoring
-            // only). Feed exactly the frames produced since the last redraw; when the
-            // engine is silent, fall back to a synthetic signal so the panels stay live.
+            // only). Feed exactly the frames produced since the last redraw; with no
+            // engine at all (silent / headless run) a synthetic signal keeps the panels
+            // live, but an engine that merely has no new frames must not be padded with
+            // it — redraws can outpace the audio threads (see the `None` arm below).
             if key == "monitoring" {
                 let mut new_frames: Vec<(f32, f32)> = Vec::new();
-                if let Some(a) = &self.audio {
-                    let fp = a.frames_played.load(std::sync::atomic::Ordering::Relaxed);
-                    let delta = fp.saturating_sub(self.last_dsp_frames) as usize;
-                    self.last_dsp_frames = fp;
-                    let tap = a.dsp_tap();
-                    if let Ok(g) = tap.lock() {
-                        g.snapshot_into(&mut self.dsp_buf);
+                match &self.audio {
+                    Some(a) => {
+                        let fp = a.frames_played.load(std::sync::atomic::Ordering::Relaxed);
+                        let delta = fp.saturating_sub(self.last_dsp_frames) as usize;
+                        self.last_dsp_frames = fp;
+                        let tap = a.dsp_tap();
+                        if let Ok(g) = tap.lock() {
+                            g.snapshot_into(&mut self.dsp_buf);
+                        }
+                        if delta > 0 && !self.dsp_buf.is_empty() {
+                            let take = delta.min(self.dsp_buf.len());
+                            let start = self.dsp_buf.len() - take;
+                            new_frames.extend_from_slice(&self.dsp_buf[start..]);
+                        }
                     }
-                    if delta > 0 && !self.dsp_buf.is_empty() {
-                        let take = delta.min(self.dsp_buf.len());
-                        let start = self.dsp_buf.len() - take;
-                        new_frames.extend_from_slice(&self.dsp_buf[start..]);
+                    // No engine at all (silent / headless run) — a synthetic signal
+                    // keeps the panels alive. Never use it as filler for an engine that
+                    // simply has no new frames: a redraw outside the frame pacing (the
+                    // mouse movement path) used to push 2048 stale-t synthetic samples
+                    // per frame, swamping the analysis so every display froze until the
+                    // movement stopped and the 60 Hz pacing handed the real audio back.
+                    None => {
+                        new_frames =
+                            synth_dsp_frames(self.anim_epoch.elapsed().as_secs_f32(), 2048)
                     }
                 }
-                if new_frames.is_empty() {
-                    new_frames = synth_dsp_frames(self.t, 2048);
+                if !new_frames.is_empty() {
+                    self.dsp.process(&new_frames);
+                    self.dsp_snap = self.dsp.snapshot();
                 }
-                self.dsp.process(&new_frames);
-                self.dsp_snap = self.dsp.snapshot();
             }
 
             let close_clicked;
@@ -6216,6 +6238,7 @@ impl App {
                             );
                             // Waveforms are grey like the reference player; the
                             // accent stays on spectra and meters.
+                            let canvas_pad = Length::Rem(0.5).resolve(rem).round();
                             let wave_grey = if theme.dark {
                                 rgb(150, 150, 150)
                             } else {
@@ -6274,7 +6297,7 @@ impl App {
                                     fs,
                                     theme.highlight,
                                 );
-                                let canvas = ui.take_rest();
+                                let canvas = ui.take_rest().inset(canvas_pad);
                                 ui.scene.rounded_rect(
                                     canvas.x,
                                     canvas.y,
@@ -6358,7 +6381,7 @@ impl App {
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let canvas = ui.take_rest();
+                                let canvas = ui.take_rest().inset(canvas_pad);
                                 ui.scene.rounded_rect(
                                     canvas.x,
                                     canvas.y,
@@ -6434,7 +6457,7 @@ impl App {
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let canvas = ui.take_rest();
+                                let canvas = ui.take_rest().inset(canvas_pad);
                                 ui.scene.rounded_rect(
                                     canvas.x,
                                     canvas.y,
@@ -6472,7 +6495,7 @@ impl App {
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let radar = ui.take_rest();
+                                let radar = ui.take_rest().inset(canvas_pad);
                                 ui.scene.rounded_rect(
                                     radar.x,
                                     radar.y,
@@ -8275,7 +8298,6 @@ impl ApplicationHandler for App {
                 66
             };
             self.next_frame = now + Duration::from_millis(frame_ms);
-            self.t += frame_ms as f32 / 1000.0;
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
