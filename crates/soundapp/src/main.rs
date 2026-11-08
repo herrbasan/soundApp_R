@@ -6259,6 +6259,9 @@ impl App {
                             // Waveforms are grey like the reference player; the
                             // accent stays on spectra and meters.
                             let canvas_pad = Length::Rem(0.5).resolve(rem).round();
+                            // ~10 px at 100 % — the trace inside a display canvas
+                            // keeps this much clearance from the canvas border.
+                            let draw_pad = Length::Rem(0.625).resolve(rem).round();
                             let wave_grey = if theme.dark {
                                 rgb(150, 150, 150)
                             } else {
@@ -6335,18 +6338,22 @@ impl App {
                                     (canvas.h - 2.0).max(1.0),
                                 );
                                 ui.scene.push_clip(inner.x, inner.y, inner.w, inner.h);
-                                let mid_y = (inner.y + inner.h * 0.5).round();
+                                // Content padding: the trace must not touch the
+                                // canvas border (only the drawing is inset — the
+                                // click/drag seek area stays the full canvas).
+                                let draw = inner.inset(draw_pad);
+                                let mid_y = (draw.y + draw.h * 0.5).round();
                                 ui.scene
-                                    .rect(inner.x, mid_y, inner.w, 1.0, theme.border1);
+                                    .rect(draw.x, mid_y, draw.w, 1.0, theme.border1);
                                 match &self.waveform_data {
                                     waveform::WaveformData::Peaks { peak, rms } => {
                                         draw_peak_overview(
-                                            ui, inner, peak, rms, wave_env, wave_core,
+                                            ui, draw, peak, rms, wave_env, wave_core,
                                         )
                                     }
                                     waveform::WaveformData::Midi(lanes) => draw_midi_overview(
                                         ui,
-                                        inner,
+                                        draw,
                                         lanes,
                                         (self.waveform_duration * 1000.0) as f32,
                                         rgba(255, 255, 255, 10),
@@ -6357,12 +6364,12 @@ impl App {
                                 }
                                 if duration > 0.0 {
                                     let frac = (position / duration).clamp(0.0, 1.0) as f32;
-                                    let px = (inner.x + frac * inner.w).round();
+                                    let px = (draw.x + frac * draw.w).round();
                                     ui.scene.rect(
                                         px - 0.5,
-                                        inner.y,
+                                        draw.y,
                                         1.5,
-                                        inner.h,
+                                        draw.h,
                                         rgb(235, 235, 235),
                                     );
                                 }
@@ -6495,8 +6502,9 @@ impl App {
                                     (canvas.h - 2.0).max(1.0),
                                 );
                                 let mid = (canvas.y + canvas.h * 0.5).round();
-                                ui.scene.rect(canvas.x, mid, canvas.w, 1.0, theme.border1);
-                                ui.polyline(canvas, &snap.osc_points, 1.5, theme.highlight);
+                                let draw = canvas.inset(draw_pad);
+                                ui.scene.rect(draw.x, mid, draw.w, 1.0, theme.border1);
+                                ui.polyline(draw, &snap.osc_points, 1.5, theme.highlight);
                                 ui.scene.pop_clip();
                             });
 
@@ -6526,9 +6534,14 @@ impl App {
                                     theme.border1,
                                     1.0,
                                 );
-                                let cx = radar.x + radar.w * 0.5;
-                                let cy = radar.y + radar.h * 0.5;
-                                let rad = (radar.w.min(radar.h) * 0.5 - 8.0).max(4.0);
+                                let draw = radar.inset(draw_pad);
+                                let cx = draw.x + draw.w * 0.5;
+                                let cy = draw.y + draw.h * 0.5;
+                                let lfs = theme.font_xsmall();
+                                // The rim labels sit on the circle, so the circle
+                                // keeps a label band inside the padded canvas.
+                                let rad =
+                                    (draw.w.min(draw.h) * 0.5 - lfs * 1.15).max(4.0);
                                 let tau = std::f32::consts::TAU;
                                 for i in 0..32 {
                                     let a0 = i as f32 / 32.0 * tau;
@@ -6551,12 +6564,11 @@ impl App {
                                     .line(cx, cy - rad, cx, cy + rad, 1.0, theme.border1);
                                 ui.scene
                                     .line(cx - rad, cy, cx + rad, cy, 1.0, theme.border1);
-                                let lfs = theme.font_xsmall();
                                 for (lbl, lx, ly) in [
-                                    ("L", cx - d - 12.0, cy - d + 4.0),
-                                    ("R", cx + d + 2.0, cy + d + 6.0),
-                                    ("+M", cx + 3.0, cy - rad + 6.0),
-                                    ("-S", cx + 3.0, cy + rad),
+                                    ("L", cx - d - lfs, cy - d + lfs * 0.35),
+                                    ("R", cx + d + lfs * 0.2, cy + d + lfs * 0.5),
+                                    ("+M", cx + lfs * 0.25, cy - rad + lfs * 0.5),
+                                    ("-S", cx + lfs * 0.25, cy + rad),
                                 ] {
                                     ui.scene.text(
                                         ui.text_sys,
@@ -6569,7 +6581,7 @@ impl App {
                                         theme.text_muted,
                                     );
                                 }
-                                ui.polyline(radar, &snap.gonio_points, 1.5, theme.highlight);
+                                ui.polyline(draw, &snap.gonio_points, 1.5, theme.highlight);
                             });
 
                             // ---- CORRELATION: phase meter (no numeric readout) ----
