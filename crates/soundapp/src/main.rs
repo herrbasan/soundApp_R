@@ -6263,12 +6263,15 @@ impl App {
                                 Length::Px(gap),
                                 [Length::Px(corr_h), Length::fill(), Length::Px(ebu_h)],
                             );
-                            // Waveforms are grey like the reference player; the
-                            // accent stays on spectra and meters.
-                            let canvas_pad = Length::Rem(0.5).resolve(rem).round();
-                            // ~10 px at 100 % — the trace inside a display canvas
-                            // keeps this much clearance from the canvas border.
-                            let draw_pad = Length::Rem(0.625).resolve(rem).round();
+                            // One spacing unit for the whole window: u = 0.5 rem
+                            // (= `theme.space_half()`, the gap between cards). Cards
+                            // pad with u, the drawing inside a display canvas keeps u
+                            // clear of the canvas border, and no extra frame is added
+                            // between a card's padding and its canvas — that double
+                            // inset was the oversized margin.
+                            let u = Length::Rem(0.5);
+                            let card_pad = u;
+                            let draw_pad = u.resolve(rem).round();
                             let wave_grey = if theme.dark {
                                 rgb(150, 150, 150)
                             } else {
@@ -6281,7 +6284,7 @@ impl App {
                             } else {
                                 (rgba(100, 100, 100, 90), rgb(70, 70, 70))
                             };
-                            ui.card(overview, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            ui.card(overview, card_pad, card_pad, |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
@@ -6327,7 +6330,7 @@ impl App {
                                     fs,
                                     theme.highlight,
                                 );
-                                let canvas = ui.take_rest().inset(canvas_pad);
+                                let canvas = ui.take_rest();
                                 ui.scene.rounded_rect(
                                     canvas.x,
                                     canvas.y,
@@ -6401,7 +6404,7 @@ impl App {
                             });
 
                             // ---- SPECTRUM: 64-band logarithmic FFT ----
-                            ui.card(spectrum, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            ui.card(spectrum, card_pad, card_pad, |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
@@ -6415,7 +6418,7 @@ impl App {
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let canvas = ui.take_rest().inset(canvas_pad);
+                                let canvas = ui.take_rest();
                                 ui.scene.rounded_rect(
                                     canvas.x,
                                     canvas.y,
@@ -6477,7 +6480,7 @@ impl App {
                             });
 
                             // ---- LIVE WAVE: stabilized time-domain trace ----
-                            ui.card(live, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            ui.card(live, card_pad, card_pad, |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
@@ -6491,7 +6494,7 @@ impl App {
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let canvas = ui.take_rest().inset(canvas_pad);
+                                let canvas = ui.take_rest();
                                 ui.scene.rounded_rect(
                                     canvas.x,
                                     canvas.y,
@@ -6516,7 +6519,7 @@ impl App {
                             });
 
                             // ---- VECTORSCOPE: stereo Lissajous ----
-                            ui.card(vector, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            ui.card(vector, card_pad, card_pad, |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
@@ -6530,7 +6533,7 @@ impl App {
                                     hdr.w,
                                     theme.text_dim,
                                 );
-                                let radar = ui.take_rest().inset(canvas_pad);
+                                let radar = ui.take_rest();
                                 ui.scene.rounded_rect(
                                     radar.x,
                                     radar.y,
@@ -6592,7 +6595,7 @@ impl App {
                             });
 
                             // ---- CORRELATION: phase meter (no numeric readout) ----
-                            ui.card(corr, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            ui.card(corr, card_pad, card_pad, |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
@@ -6682,7 +6685,7 @@ impl App {
                             });
 
                             // ---- LOUDNESS: three compact meters + dB axis ----
-                            ui.card(loud, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            ui.card(loud, card_pad, card_pad, |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
@@ -6758,7 +6761,7 @@ impl App {
                             });
 
                             // ---- EBU R128: compact readout grid (3 Hz) ----
-                            ui.card(ebu, Length::Rem(0.85), Length::Rem(0.45), |ui| {
+                            ui.card(ebu, card_pad, card_pad, |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
                                 let baseline = (hdr.y + fs * 0.85).round();
