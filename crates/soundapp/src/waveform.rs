@@ -20,9 +20,22 @@ use crate::midi;
 /// into the available columns.
 pub const PEAK_POINTS: usize = 1600;
 /// Decode rate for the overview pass: peaks are per-bucket maxima, so a low
-/// rate is inaudible and much cheaper than the playback rate.
-const OVERVIEW_RATE: u32 = 16_000;
+/// rate is inaudible and much cheaper than the playback rate. 8 kHz keeps
+/// every peak the 1600-point display can resolve while halving the frame
+/// count of the former 16 kHz (the codec decode dominates, so the saving is
+/// partial — but it comes free).
+const OVERVIEW_RATE: u32 = 8_000;
 const READ_FRAMES: usize = 8_192;
+/// Instant-feel budget: a scan whose projected full-speed cost fits inside
+/// this window runs UNPACED. A 2-5 min track decodes at 16 kHz in a few
+/// hundred ms, so most overviews land instantly; the budget is the ceiling
+/// the user perceives as "instant".
+const INSTANT_BUDGET: f32 = 1.0;
+/// CPU ceiling for scans that overrun the instant budget (fraction of one
+/// core). A 1 h track settles here — the overview trickles in over tens of
+/// seconds instead of pegging a core. Between the two regimes the duty
+/// decays smoothly (`INSTANT_BUDGET / projected`), so there is no cliff.
+const LONG_TRACK_DUTY: f32 = 0.30;
 /// MIDI note-ons closer than this stay in the same activity segment.
 const MIDI_GAP_MS: f32 = 1_000.0;
 
@@ -112,13 +125,6 @@ impl WaveformWorker {
     }
 }
 
-/// Decode duty cycle for the overview pass. Unpaced, FFmpeg decodes at
-/// 100-300x realtime — a multi-second full-core CPU spike on every track
-/// change while Monitoring is open. Capping the duty cycle stretches the
-/// same scan over ~8x the wall time, invisible next to playback; the
-/// progressive progress ticks keep the panel alive during the longer scan.
-const DUTY_CYCLE: f32 = 0.12;
-
 fn analyse(
     job: &Job,
     latest: &AtomicU64,
@@ -170,6 +176,9 @@ fn analyse(
     let mut bucket_peak = 0.0f32;
     let mut buf = vec![0.0f32; READ_FRAMES * 2];
     let mut sent = 0.0f32;
+    let scan_start = Instant::now();
+    let mut decoded_frames = 0u64;
+    let mut work_acc = Duration::ZERO;
     loop {
         if stale(job.gen) {
             return None;
@@ -211,16 +220,34 @@ fn analyse(
                 data: WaveformData::Peaks(peaks.clone()),
             });
         }
-        // Pace to DUTY_CYCLE: sleep the complement of the chunk's work time
-        // so the scan stays a background cost, not a per-track-change spike.
-        // The stale check at the loop top bounds the cancellation latency to
-        // one paced chunk.
+        // Adaptive pacing. Cumulative work over decoded fraction projects
+        // the full-speed scan cost: a projection inside INSTANT_BUDGET runs
+        // unpaced (a 2-5 min track finishes in a few hundred ms — instant),
+        // a larger one decays the duty towards LONG_TRACK_DUTY so a 1 h
+        // track trickles in instead of pegging a core. The stale check at
+        // the loop top bounds cancellation latency to one paced chunk.
         let work = chunk_t0.elapsed();
-        let rest = work.mul_f32((1.0 - DUTY_CYCLE) / DUTY_CYCLE);
+        work_acc += work;
+        decoded_frames += read as u64;
+        let duty = if decoded_frames < total_frames / 50 {
+            // Under 2% decoded the projection is warmup noise — run free;
+            // the window is small by construction.
+            1.0
+        } else {
+            let projected =
+                work_acc.as_secs_f32() * total_frames as f32 / decoded_frames as f32;
+            (INSTANT_BUDGET / projected).clamp(LONG_TRACK_DUTY, 1.0)
+        };
+        let rest = work.mul_f32((1.0 - duty) / duty);
         if rest > Duration::ZERO {
             std::thread::sleep(rest);
         }
     }
+    eprintln!(
+        "[waveform] overview ready in {:.0} ms ({:.0} s audio)",
+        scan_start.elapsed().as_secs_f64() * 1000.0,
+        duration
+    );
     // Trailing partial bucket (the file ended mid-bucket).
     if point < PEAK_POINTS && bucket_peak > 0.0 {
         peaks[point] = bucket_peak.min(1.0);
