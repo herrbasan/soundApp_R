@@ -6229,13 +6229,15 @@ impl App {
                                 self.audio.as_ref().map(|a| a.duration_secs()).unwrap_or(0.0),
                                 snap,
                             );
-                            let rail_w = (body.w * 0.245).max(11.0 * rem);
+                            // Meter rail: narrow enough that the analysis column keeps
+                            // the space, wide enough for the three loudness bars.
+                            let rail_w = (body.w * 0.21).max(10.0 * rem);
                             let [left, rail] = ui.cols(
                                 body,
                                 Length::Px(gap),
                                 [Length::fill(), Length::Px(rail_w)],
                             );
-                            let overview_h = Length::Rem(9.5).resolve(rem).round();
+                            let overview_h = Length::Rem(11.0).resolve(rem).round();
                             let left_rest = (left.h - overview_h - gap * 2.0).max(48.0);
                             let spectrum_h = (left_rest * 0.58).round();
                             let [overview, spectrum, waves] = ui.rows(
@@ -6247,9 +6249,14 @@ impl App {
                                     Length::fill(),
                                 ],
                             );
-                            let [live, vector] =
-                                ui.cols(waves, Length::Px(gap), [Length::fill(), Length::fill()]);
-                            let corr_h = Length::Rem(4.0).resolve(rem).round();
+                            // Live wave gets the wider half: the goniometer is a
+                            // circle, so extra width there is wasted canvas.
+                            let [live, vector] = ui.cols(
+                                waves,
+                                Length::Px(gap),
+                                [Length::Fill(1.5), Length::Fill(1.0)],
+                            );
+                            let corr_h = Length::Rem(5.5).resolve(rem).round();
                             let ebu_h = Length::Rem(8.0).resolve(rem).round();
                             let [corr, loud, ebu] = ui.rows(
                                 rail,
@@ -6601,17 +6608,24 @@ impl App {
                                 );
                                 let rest = ui.take_rest();
                                 let lfs = theme.font_xsmall();
-                                let [bar, lbl_row] = ui.rows(
-                                    rest,
-                                    Length::Px(2.0),
-                                    [Length::fill(), Length::Px((lfs * 1.4).round())],
-                                );
+                                // A meter is a line, not a block: fixed ~7 px track
+                                // (5 px coloured core) with real air between it and
+                                // the scale numbers, centred in whatever height the
+                                // card got. `fill` used to let the track collapse to
+                                // a single pixel once the label row took its share.
+                                let bar_h = (0.45 * rem).round().max(7.0);
+                                let air = (0.55 * rem).round();
+                                let lbl_h = (lfs * 1.4).round();
+                                let block = bar_h + air + lbl_h;
+                                let top = rest.y + ((rest.h - block) * 0.5).max(0.0);
+                                let bar = Rect::new(rest.x, top, rest.w, bar_h);
+                                let lbl_row = Rect::new(rest.x, top + bar_h + air, rest.w, lbl_h);
                                 ui.scene.rounded_rect(
                                     bar.x,
                                     bar.y,
                                     bar.w,
                                     bar.h,
-                                    theme.radius1(),
+                                    (bar_h * 0.5).round(),
                                     theme.base,
                                     theme.border2,
                                     1.0,
@@ -6619,9 +6633,9 @@ impl App {
                                 let mid = (bar.x + bar.w * 0.5).round();
                                 ui.scene.rect(
                                     mid - 0.5,
-                                    bar.y + 2.0,
+                                    bar.y + 1.0,
                                     1.0,
-                                    (bar.h - 4.0).max(1.0),
+                                    (bar.h - 2.0).max(1.0),
                                     theme.border3,
                                 );
                                 let c = snap.correlation.clamp(-1.0, 1.0);
@@ -6634,9 +6648,9 @@ impl App {
                                 };
                                 ui.scene.rect(
                                     fx,
-                                    bar.y + 2.0,
+                                    bar.y + 1.0,
                                     fw,
-                                    (bar.h - 4.0).max(1.0),
+                                    (bar.h - 2.0).max(1.0),
                                     theme.palette_activate,
                                 );
                                 ui.scene.text(
@@ -6684,11 +6698,12 @@ impl App {
                                 );
                                 let rest = ui.take_rest();
                                 let axis_w = (2.2 * rem).round();
+                                let axis_gap = (0.5 * rem).round();
                                 let label_h = (1.1 * rem).round();
                                 let bar_area = Rect::new(
                                     rest.x,
                                     rest.y,
-                                    (rest.w - axis_w).max(12.0),
+                                    (rest.w - axis_w - axis_gap).max(12.0),
                                     (rest.h - label_h).max(12.0),
                                 );
                                 let bar_gap = (0.45 * rem).round();
@@ -6734,7 +6749,7 @@ impl App {
                                         FontFace::Regular,
                                         ui.font_engine,
                                         label,
-                                        (bar_area.x + bar_area.w + 4.0).round(),
+                                        (bar_area.x + bar_area.w + axis_gap).round(),
                                         (y + theme.font_xsmall() * 0.35).round(),
                                         theme.font_xsmall(),
                                         theme.text_muted,
