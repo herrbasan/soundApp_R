@@ -1248,24 +1248,51 @@ fn meter_segment(ui: &mut Ui, r: Rect, top: f32, lo_db: f32, hi_db: f32, color: 
 
 /// Fold a whole-file peak array into the pixel columns of `r`, mirrored around
 /// the midline (the reference app's `drawWaveform`).
-fn draw_peak_overview(ui: &mut Ui, r: Rect, peaks: &[f32], color: (u8, u8, u8, u8)) {
-    if peaks.is_empty() || r.w < 1.0 || r.h < 2.0 {
+/// Whole-file overview: translucent peak envelope + solid RMS core per
+/// column on a logarithmic dB scale — the standard waveform-display look
+/// (Audacity / SoundCloud / Reaper). Padding keeps the loudest bars off the
+/// container border; the dB floor spreads loud masters that would otherwise
+/// render as one solid block on a linear scale.
+fn draw_peak_overview(
+    ui: &mut Ui,
+    r: Rect,
+    peak: &[f32],
+    rms: &[f32],
+    envelope: (u8, u8, u8, u8),
+    core: (u8, u8, u8, u8),
+) {
+    if peak.is_empty() || r.w < 8.0 || r.h < 8.0 {
         return;
     }
-    let mid = r.y + r.h * 0.5;
-    let half = (r.h * 0.5 - 1.0).max(1.0);
-    let cols = r.w.floor().max(1.0) as usize;
-    let step = peaks.len() as f32 / cols as f32;
+    const PAD: f32 = 3.0;
+    const DB_FLOOR: f32 = 48.0;
+    let inner = Rect::new(r.x + PAD, r.y + PAD, r.w - PAD * 2.0, r.h - PAD * 2.0);
+    let mid = inner.y + inner.h * 0.5;
+    let half = (inner.h * 0.5).max(1.0);
+    let cols = inner.w.floor().max(1.0) as usize;
+    let step = peak.len() as f32 / cols as f32;
+    let norm = |amp: f32| -> f32 {
+        if amp <= 1e-5 {
+            0.0
+        } else {
+            (1.0 + 20.0 * amp.log10() / DB_FLOOR).clamp(0.0, 1.0)
+        }
+    };
     for col in 0..cols {
         let from = (col as f32 * step) as usize;
-        if from >= peaks.len() {
+        if from >= peak.len() {
             break;
         }
-        let to = (((col + 1) as f32 * step) as usize).clamp(from + 1, peaks.len());
-        let amp = peaks[from..to].iter().copied().fold(0.0f32, f32::max);
-        let h = (amp * half).max(0.5);
-        ui.scene
-            .rect(r.x + col as f32, mid - h, 1.0, h * 2.0, color);
+        let to = (((col + 1) as f32 * step) as usize).clamp(from + 1, peak.len());
+        let pk = norm(peak[from..to].iter().copied().fold(0.0f32, f32::max));
+        let rm = norm(rms[from..to].iter().copied().fold(0.0f32, f32::max)).min(pk);
+        let x = inner.x + col as f32;
+        let ph = (pk * half).max(0.5);
+        ui.scene.rect(x, mid - ph, 1.0, ph * 2.0, envelope);
+        if rm > 0.0 {
+            let ch = rm * half;
+            ui.scene.rect(x, mid - ch, 1.0, ch * 2.0, core);
+        }
     }
 }
 
@@ -4267,7 +4294,7 @@ impl App {
             self.waveform_duration = update.duration;
             self.waveform_progress = update.progress;
             self.waveform_label = match &self.waveform_data {
-                waveform::WaveformData::Peaks(_) => String::new(),
+                waveform::WaveformData::Peaks { .. } => String::new(),
                 waveform::WaveformData::Midi(lanes) => format!(
                     "MIDI · {} ch · {}",
                     lanes.len(),
@@ -6194,6 +6221,13 @@ impl App {
                             } else {
                                 rgb(100, 100, 100)
                             };
+                            // Overview bands: translucent peak envelope, solid
+                            // RMS core.
+                            let (wave_env, wave_core) = if theme.dark {
+                                (rgba(150, 150, 150, 90), rgb(190, 190, 190))
+                            } else {
+                                (rgba(100, 100, 100, 90), rgb(70, 70, 70))
+                            };
                             ui.card(overview, Length::Rem(0.85), Length::Rem(0.45), |ui| {
                                 let hdr = ui.take(Length::Rem(1.2));
                                 let fs = theme.font_small();
@@ -6219,7 +6253,7 @@ impl App {
                                     .map(|a| a.duration_secs())
                                     .unwrap_or(0.0);
                                 let info: &str = match &self.waveform_data {
-                                    waveform::WaveformData::Peaks(_) => {
+                                    waveform::WaveformData::Peaks { .. } => {
                                         self.mon_readout.time.as_str()
                                     }
                                     _ => self.waveform_label.as_str(),
@@ -6262,8 +6296,10 @@ impl App {
                                 ui.scene
                                     .rect(inner.x, mid_y, inner.w, 1.0, theme.border1);
                                 match &self.waveform_data {
-                                    waveform::WaveformData::Peaks(peaks) => {
-                                        draw_peak_overview(ui, inner, peaks, wave_grey)
+                                    waveform::WaveformData::Peaks { peak, rms } => {
+                                        draw_peak_overview(
+                                            ui, inner, peak, rms, wave_env, wave_core,
+                                        )
                                     }
                                     waveform::WaveformData::Midi(lanes) => draw_midi_overview(
                                         ui,

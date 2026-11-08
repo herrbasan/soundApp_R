@@ -43,8 +43,14 @@ const MIDI_GAP_MS: f32 = 1_000.0;
 pub enum WaveformData {
     /// Nothing to draw (unsupported source, failed decode).
     Empty,
-    /// Peak magnitude per point, `0..1`.
-    Peaks(Vec<f32>),
+    /// Per-point peak magnitude and RMS level, `0..1`, peak-normalised
+    /// together. The two bands give the overview its depth: a translucent
+    /// peak envelope with a solid RMS core (the Audacity/SoundCloud look)
+    /// instead of one solid wall of bars.
+    Peaks {
+        peak: Vec<f32>,
+        rms: Vec<f32>,
+    },
     /// One lane per active MIDI channel, segments in milliseconds.
     Midi(Vec<midi::MidiLane>),
 }
@@ -171,9 +177,11 @@ fn analyse(
     let total_frames = (duration * OVERVIEW_RATE as f64) as u64;
     let frames_per_point = (total_frames / PEAK_POINTS as u64).max(1);
     let mut peaks = vec![0.0f32; PEAK_POINTS];
+    let mut rms = vec![0.0f32; PEAK_POINTS];
     let mut point = 0usize;
     let mut acc = 0u64;
     let mut bucket_peak = 0.0f32;
+    let mut bucket_sum_sq = 0.0f64;
     let mut buf = vec![0.0f32; READ_FRAMES * 2];
     let mut sent = 0.0f32;
     let scan_start = Instant::now();
@@ -189,18 +197,23 @@ fn analyse(
             break;
         }
         for frame in buf[..read].chunks_exact(2) {
-            let peak = frame[0].abs().max(frame[1].abs());
+            let l = frame[0];
+            let r = frame[1];
+            let peak = l.abs().max(r.abs());
             if peak > bucket_peak {
                 bucket_peak = peak;
             }
+            bucket_sum_sq += (l * l + r * r) as f64 * 0.5;
             acc += 1;
             if acc >= frames_per_point {
                 if point < PEAK_POINTS {
                     peaks[point] = bucket_peak.min(1.0);
+                    rms[point] = (bucket_sum_sq / acc as f64).sqrt().min(1.0) as f32;
                     point += 1;
                 }
                 acc = 0;
                 bucket_peak = 0.0;
+                bucket_sum_sq = 0.0;
                 if point >= PEAK_POINTS {
                     break;
                 }
@@ -217,7 +230,10 @@ fn analyse(
                 gen: job.gen,
                 duration,
                 progress,
-                data: WaveformData::Peaks(peaks.clone()),
+                data: WaveformData::Peaks {
+                    peak: peaks.clone(),
+                    rms: rms.clone(),
+                },
             });
         }
         // Adaptive pacing. Cumulative work over decoded fraction projects
@@ -251,20 +267,27 @@ fn analyse(
     // Trailing partial bucket (the file ended mid-bucket).
     if point < PEAK_POINTS && bucket_peak > 0.0 {
         peaks[point] = bucket_peak.min(1.0);
+        if acc > 0 {
+            rms[point] = (bucket_sum_sq / acc as f64).sqrt().min(1.0) as f32;
+        }
     }
     // Peak-normalise the overview: the reference drew raw peaks, which turns any
     // quietly-mastered track into a flat line (−32 dBTP reads as 2 % height).
+    // One scale for both bands so the RMS core stays honest inside the envelope.
     let loudest = peaks.iter().copied().fold(0.0f32, f32::max);
     if loudest > 1e-4 {
         let scale = 1.0 / loudest;
         for peak in &mut peaks {
             *peak = (*peak * scale).min(1.0);
         }
+        for level in &mut rms {
+            *level = (*level * scale).min(1.0);
+        }
     }
     Some(WaveformUpdate {
         gen: job.gen,
         duration,
         progress: 1.0,
-        data: WaveformData::Peaks(peaks),
+        data: WaveformData::Peaks { peak: peaks, rms },
     })
 }
