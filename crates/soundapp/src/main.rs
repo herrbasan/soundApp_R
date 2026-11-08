@@ -6263,15 +6263,14 @@ impl App {
                                 Length::Px(gap),
                                 [Length::Px(corr_h), Length::fill(), Length::Px(ebu_h)],
                             );
-                            // One spacing unit for the whole window: u = 0.5 rem
-                            // (= `theme.space_half()`, the gap between cards). Cards
-                            // pad with u, the drawing inside a display canvas keeps u
-                            // clear of the canvas border, and no extra frame is added
-                            // between a card's padding and its canvas — that double
-                            // inset was the oversized margin.
-                            let u = Length::Rem(0.5);
-                            let card_pad = u;
-                            let draw_pad = u.resolve(rem).round();
+                            // Spacing scale for the whole window, in units of u = 0.25 rem:
+                            // card padding = 4u, gap between cards = 2u, drawing clearance
+                            // inside a display canvas = 2u, and a card's label band =
+                            // cap height + 4u, so the air above the label, the air below it
+                            // and the side padding are all the same number.
+                            let card_pad = Length::Rem(1.0);
+                            let band_gap = (rem * 1.0).round();
+                            let draw_pad = (rem * 0.5).round();
                             let wave_grey = if theme.dark {
                                 rgb(150, 150, 150)
                             } else {
@@ -6284,10 +6283,16 @@ impl App {
                             } else {
                                 (rgba(100, 100, 100, 90), rgb(70, 70, 70))
                             };
-                            ui.card(overview, card_pad, card_pad, |ui| {
-                                let hdr = ui.take(Length::Rem(1.2));
+                            ui.card(overview, card_pad, Length::Px(0.0), |ui| {
                                 let fs = theme.font_small();
-                                let baseline = (hdr.y + fs * 0.85).round();
+                                // Label band = cap height + one padding unit, with the
+                                // baseline on the cap's bottom edge. The air above the
+                                // label, the air below it and the side padding are then
+                                // the same number � a band sized to the full font box
+                                // left the face's leading as extra space above.
+                                let cap = (fs * 0.70).round();
+                                let hdr = ui.take(Length::Px(cap + band_gap));
+                                let baseline = (hdr.y + cap).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
@@ -6404,10 +6409,16 @@ impl App {
                             });
 
                             // ---- SPECTRUM: 64-band logarithmic FFT ----
-                            ui.card(spectrum, card_pad, card_pad, |ui| {
-                                let hdr = ui.take(Length::Rem(1.2));
+                            ui.card(spectrum, card_pad, Length::Px(0.0), |ui| {
                                 let fs = theme.font_small();
-                                let baseline = (hdr.y + fs * 0.85).round();
+                                // Label band = cap height + one padding unit, with the
+                                // baseline on the cap's bottom edge. The air above the
+                                // label, the air below it and the side padding are then
+                                // the same number � a band sized to the full font box
+                                // left the face's leading as extra space above.
+                                let cap = (fs * 0.70).round();
+                                let hdr = ui.take(Length::Px(cap + band_gap));
+                                let baseline = (hdr.y + cap).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
@@ -6480,10 +6491,16 @@ impl App {
                             });
 
                             // ---- LIVE WAVE: stabilized time-domain trace ----
-                            ui.card(live, card_pad, card_pad, |ui| {
-                                let hdr = ui.take(Length::Rem(1.2));
+                            ui.card(live, card_pad, Length::Px(0.0), |ui| {
                                 let fs = theme.font_small();
-                                let baseline = (hdr.y + fs * 0.85).round();
+                                // Label band = cap height + one padding unit, with the
+                                // baseline on the cap's bottom edge. The air above the
+                                // label, the air below it and the side padding are then
+                                // the same number � a band sized to the full font box
+                                // left the face's leading as extra space above.
+                                let cap = (fs * 0.70).round();
+                                let hdr = ui.take(Length::Px(cap + band_gap));
+                                let baseline = (hdr.y + cap).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
@@ -6519,10 +6536,16 @@ impl App {
                             });
 
                             // ---- VECTORSCOPE: stereo Lissajous ----
-                            ui.card(vector, card_pad, card_pad, |ui| {
-                                let hdr = ui.take(Length::Rem(1.2));
+                            ui.card(vector, card_pad, Length::Px(0.0), |ui| {
                                 let fs = theme.font_small();
-                                let baseline = (hdr.y + fs * 0.85).round();
+                                // Label band = cap height + one padding unit, with the
+                                // baseline on the cap's bottom edge. The air above the
+                                // label, the air below it and the side padding are then
+                                // the same number � a band sized to the full font box
+                                // left the face's leading as extra space above.
+                                let cap = (fs * 0.70).round();
+                                let hdr = ui.take(Length::Px(cap + band_gap));
+                                let baseline = (hdr.y + cap).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
@@ -6595,10 +6618,16 @@ impl App {
                             });
 
                             // ---- CORRELATION: phase meter (no numeric readout) ----
-                            ui.card(corr, card_pad, card_pad, |ui| {
-                                let hdr = ui.take(Length::Rem(1.2));
+                            ui.card(corr, card_pad, Length::Px(0.0), |ui| {
                                 let fs = theme.font_small();
-                                let baseline = (hdr.y + fs * 0.85).round();
+                                // Label band = cap height + one padding unit, with the
+                                // baseline on the cap's bottom edge. The air above the
+                                // label, the air below it and the side padding are then
+                                // the same number � a band sized to the full font box
+                                // left the face's leading as extra space above.
+                                let cap = (fs * 0.70).round();
+                                let hdr = ui.take(Length::Px(cap + band_gap));
+                                let baseline = (hdr.y + cap).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
@@ -6685,10 +6714,16 @@ impl App {
                             });
 
                             // ---- LOUDNESS: three compact meters + dB axis ----
-                            ui.card(loud, card_pad, card_pad, |ui| {
-                                let hdr = ui.take(Length::Rem(1.2));
+                            ui.card(loud, card_pad, Length::Px(0.0), |ui| {
                                 let fs = theme.font_small();
-                                let baseline = (hdr.y + fs * 0.85).round();
+                                // Label band = cap height + one padding unit, with the
+                                // baseline on the cap's bottom edge. The air above the
+                                // label, the air below it and the side padding are then
+                                // the same number � a band sized to the full font box
+                                // left the face's leading as extra space above.
+                                let cap = (fs * 0.70).round();
+                                let hdr = ui.take(Length::Px(cap + band_gap));
+                                let baseline = (hdr.y + cap).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
@@ -6761,10 +6796,16 @@ impl App {
                             });
 
                             // ---- EBU R128: compact readout grid (3 Hz) ----
-                            ui.card(ebu, card_pad, card_pad, |ui| {
-                                let hdr = ui.take(Length::Rem(1.2));
+                            ui.card(ebu, card_pad, Length::Px(0.0), |ui| {
                                 let fs = theme.font_small();
-                                let baseline = (hdr.y + fs * 0.85).round();
+                                // Label band = cap height + one padding unit, with the
+                                // baseline on the cap's bottom edge. The air above the
+                                // label, the air below it and the side padding are then
+                                // the same number � a band sized to the full font box
+                                // left the face's leading as extra space above.
+                                let cap = (fs * 0.70).round();
+                                let hdr = ui.take(Length::Px(cap + band_gap));
+                                let baseline = (hdr.y + cap).round();
                                 ui.text_clipped(
                                     FontFace::SemiBold,
                                     ui.font_engine,
