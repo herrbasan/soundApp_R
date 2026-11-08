@@ -1,6 +1,6 @@
 #define MyAppName "SoundApp R"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.0"
+  #define MyAppVersion "0.2.1"
 #endif
 #define MyAppPublisher "David Renelt"
 #define MyAppExeName "soundapp_r.exe"

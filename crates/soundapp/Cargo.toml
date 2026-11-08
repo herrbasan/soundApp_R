@@ -1,6 +1,6 @@
 [package]
 name = "soundapp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "soundApp_R — Native Rust Audio Player & Analyzer built on NUI Rust."
 publish = false

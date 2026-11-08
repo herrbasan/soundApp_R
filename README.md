@@ -49,7 +49,7 @@ Two diagnostic logs sit beside `user.json`, both truncated per session:
 ### Windows Release
 
 ```powershell
-.\scripts\make-release.ps1 -Version 0.2.0
+.\scripts\make-release.ps1 -Version 0.2.1
 # optional: -Publish creates the matching GitHub release with gh
 ```
 
