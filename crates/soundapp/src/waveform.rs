@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use crate::audio::FFmpegStream;
 use crate::midi;
@@ -111,6 +112,13 @@ impl WaveformWorker {
     }
 }
 
+/// Decode duty cycle for the overview pass. Unpaced, FFmpeg decodes at
+/// 100-300x realtime — a multi-second full-core CPU spike on every track
+/// change while Monitoring is open. Capping the duty cycle stretches the
+/// same scan over ~8x the wall time, invisible next to playback; the
+/// progressive progress ticks keep the panel alive during the longer scan.
+const DUTY_CYCLE: f32 = 0.12;
+
 fn analyse(
     job: &Job,
     latest: &AtomicU64,
@@ -166,6 +174,7 @@ fn analyse(
         if stale(job.gen) {
             return None;
         }
+        let chunk_t0 = Instant::now();
         let read = stream.read(&mut buf);
         if read == 0 {
             break;
@@ -201,6 +210,15 @@ fn analyse(
                 progress,
                 data: WaveformData::Peaks(peaks.clone()),
             });
+        }
+        // Pace to DUTY_CYCLE: sleep the complement of the chunk's work time
+        // so the scan stays a background cost, not a per-track-change spike.
+        // The stale check at the loop top bounds the cancellation latency to
+        // one paced chunk.
+        let work = chunk_t0.elapsed();
+        let rest = work.mul_f32((1.0 - DUTY_CYCLE) / DUTY_CYCLE);
+        if rest > Duration::ZERO {
+            std::thread::sleep(rest);
         }
     }
     // Trailing partial bucket (the file ended mid-bucket).

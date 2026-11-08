@@ -412,6 +412,9 @@ struct App {
     playlist: Vec<PathBuf>,
     /// Metadata of the currently-loaded file (from FFmpeg).
     track_meta: Option<TrackMetadata>,
+    /// `audio.meta_gen()` already latched into `track_meta`. The gen check
+    /// replaces the old per-frame full-struct clone+compare (64 KB cover).
+    meta_seen_gen: u64,
     /// Background directory scanner so SMB `read_dir` / `is_dir` never touches the UI thread.
     scan_tx: std::sync::mpsc::Sender<(u64, ScanJob)>,
     scan_rx: std::sync::mpsc::Receiver<(u64, ScanOutcome)>,
@@ -3307,6 +3310,7 @@ impl App {
             shuffle_history: VecDeque::new(),
             playlist: Vec::new(),
             track_meta: None,
+            meta_seen_gen: 0,
             scan_tx,
             scan_rx,
             scan_gen: 0,
@@ -4392,9 +4396,14 @@ impl App {
         // changes crossfade over COVER_FADE_SECS (previous view stays on
         // screen underneath); a `None` meta while a load is still pending is
         // the decoder's transient reset, not a final "no art" state.
+        // The generation gate is the whole point: `metadata()` clones the
+        // 64 KB cover buffer, so it must only run when the engine says the
+        // metadata actually changed.
         self.step_cover_fade();
-        let meta = self.audio.as_ref().and_then(|a| a.metadata());
-        if meta != self.track_meta {
+        let meta_gen = self.audio.as_ref().map(|a| a.meta_gen()).unwrap_or(0);
+        if meta_gen != self.meta_seen_gen {
+            self.meta_seen_gen = meta_gen;
+            let meta = self.audio.as_ref().and_then(|a| a.metadata());
             let transient_reset = meta.is_none() && self.open_pending.is_some();
             if !transient_reset {
                 let incoming = meta.as_ref().and_then(|m| m.cover_rgba.clone());

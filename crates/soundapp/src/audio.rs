@@ -318,6 +318,9 @@ struct Shared {
     /// When false the callback skips the DSP tap entirely (Monitoring closed).
     dsp_enabled: Arc<AtomicBool>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
+    /// Bumped on every `meta` write. The UI polls this instead of cloning
+    /// (and byte-comparing) the 64 KB cover buffer every frame.
+    meta_gen: Arc<AtomicU64>,
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
     /// Active SoundFont for MIDI sources. Written by the decoder thread
@@ -416,6 +419,7 @@ pub struct Audio {
     out_played: Arc<AtomicU64>,
     cmd_tx: mpsc::Sender<Cmd>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
+    meta_gen: Arc<AtomicU64>,
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
     midi_native_bpm: Arc<AtomicU32>,
@@ -500,6 +504,7 @@ impl Audio {
     pub fn load_file(&self, path: PathBuf) {
         self.transport_gen.fetch_add(1, Ordering::SeqCst);
         *self.meta.lock().unwrap() = None;
+        self.meta_gen.fetch_add(1, Ordering::Release);
         *self.current.lock().unwrap() = Some(path.clone());
         let _ = self.cmd_tx.send(Cmd::Load(path));
         wake_all(&self.wake);
@@ -541,6 +546,12 @@ impl Audio {
     }
     pub fn metadata(&self) -> Option<TrackMetadata> {
         self.meta.lock().unwrap().clone()
+    }
+    /// Generation of the published metadata — bump on every write. Poll this
+    /// instead of calling `metadata()` per frame: the struct owns a 64 KB
+    /// cover buffer that must not be cloned (or compared) on the UI cadence.
+    pub fn meta_gen(&self) -> u64 {
+        self.meta_gen.load(Ordering::Acquire)
     }
     pub fn current_file(&self) -> Option<PathBuf> {
         self.current.lock().unwrap().clone()
@@ -659,6 +670,7 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         dsp_enabled: Arc::new(AtomicBool::new(false)),
         dsp: Arc::new(Mutex::new(DspTap::new(rate))),
         meta: Arc::new(Mutex::new(None)),
+        meta_gen: Arc::new(AtomicU64::new(next_meta_epoch())),
         current: Arc::new(Mutex::new(None)),
         soundfont: Arc::new(Mutex::new(crate::midi::default_soundfont())),
         midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
@@ -728,13 +740,12 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
                 let tgen = sh.transport_gen.load(Ordering::Relaxed);
                 let flush = sh.flush_gen.load(Ordering::Acquire);
 
-                // A seek/load flushed the ring: drop stale audio with a bounded pop
-                // and acknowledge so the decoder thread only pushes new audio AFTER
-                // the flush has completed.
+                // A seek/load flushed the ring: drop stale audio with one bulk
+                // chunk read and acknowledge so the decoder thread only pushes
+                // new audio AFTER the flush has completed.
                 if flush != local_flush {
-                    let avail = consumer.slots();
-                    for _ in 0..avail {
-                        let _ = consumer.pop();
+                    if let Ok(chunk) = consumer.read_chunk(consumer.slots()) {
+                        chunk.commit_all();
                     }
                     local_flush = flush;
                     sh.flush_ack.store(flush, Ordering::Release);
@@ -750,7 +761,39 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
                 // Fix #6: skip the tap entirely unless a consumer is attached.
                 let dsp_on = sh.dsp_enabled.load(Ordering::Relaxed);
                 let frames = data.len() / out_ch;
-                let mut popped: u64 = 0;
+
+                // Bulk pull: one (two-slice) ring move replaces a per-sample
+                // pop across the whole buffer. `pop_partial_slice` returns
+                // (filled, unfilled); the unfilled tail becomes explicit
+                // zeros, and a dry ring + stage EOF is the real end of
+                // track — only now is the track over, and buffered audio
+                // is never cut (Fix #1/#2).
+                let filled = if pull {
+                    let (_, rest) = consumer.pop_partial_slice(data);
+                    let missing = rest.len();
+                    if missing > 0 {
+                        rest.fill(0.0);
+                        if !sh.loop_enabled.load(Ordering::Relaxed)
+                            && sh.stage_eof.load(Ordering::Acquire)
+                        {
+                            sh.stage_eof.store(false, Ordering::Release);
+                            sh.playing.store(false, Ordering::Release);
+                            sh.track_ended.store(true, Ordering::Release);
+                        }
+                    }
+                    data.len() - missing
+                } else {
+                    data.fill(0.0);
+                    0
+                };
+                // The stretcher thread owns `frames_played` (audible source
+                // position); the callback only reports what it played.
+                if filled > 0 {
+                    sh.started.store(true, Ordering::Relaxed);
+                    sh.out_played
+                        .fetch_add((filled / out_ch) as u64, Ordering::Relaxed);
+                }
+
                 for f in 0..frames {
                     vol_smooth += (target_vol - vol_smooth) * 0.005;
 
@@ -782,44 +825,17 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
                     }
 
                     for c in 0..out_ch {
-                        let s = if pull {
-                            match consumer.pop() {
-                                Ok(v) => {
-                                    sh.started.store(true, Ordering::Relaxed);
-                                    popped += 1;
-                                    v
-                                }
-                                Err(_) => {
-                                    // Fix #1/#2: the output ring is drained *and*
-                                    // the stretcher signalled EOF — only now is
-                                    // the track really over. Never cut buffered audio.
-                                    if !sh.loop_enabled.load(Ordering::Relaxed)
-                                        && sh.stage_eof.load(Ordering::Acquire)
-                                    {
-                                        sh.stage_eof.store(false, Ordering::Release);
-                                        sh.playing.store(false, Ordering::Release);
-                                        sh.track_ended.store(true, Ordering::Release);
-                                    }
-                                    0.0
-                                }
-                            }
-                        } else {
-                            0.0
-                        };
                         // Boost up to 200% (+6 dB) must never wrap or hard-clip.
-                        data[f * out_ch + c] = (s * vol_smooth * gain).clamp(-1.0, 1.0);
+                        // Reads back what the bulk pull placed there — pull and
+                        // shape are deliberately separate passes now.
+                        data[f * out_ch + c] =
+                            (data[f * out_ch + c] * vol_smooth * gain).clamp(-1.0, 1.0);
                     }
                     if dsp_on {
                         let l = data[f * out_ch];
                         let r = if out_ch > 1 { data[f * out_ch + 1] } else { l };
                         dsp_frames.push((l, r));
                     }
-                }
-                // The stretcher thread owns `frames_played` (audible source
-                // position); the callback only reports what it played.
-                if popped > 0 {
-                    sh.out_played
-                        .fetch_add(popped / out_ch as u64, Ordering::Relaxed);
                 }
                 if !dsp_frames.is_empty() {
                     // Fix #7: `try_lock` — the real-time thread never waits on
@@ -880,6 +896,7 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         out_played: shared.out_played.clone(),
         cmd_tx,
         meta: shared.meta.clone(),
+        meta_gen: shared.meta_gen.clone(),
         current: shared.current.clone(),
         dsp: shared.dsp.clone(),
         midi_native_bpm: shared.midi_native_bpm.clone(),
@@ -888,6 +905,23 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         engine_stopped: shared.engine_stopped.clone(),
         wake: shared.wake.clone(),
     })
+}
+
+/// Each `Shared` instance strides `meta_gen` from this process-global epoch so
+/// a mid-session engine recreation (output-device switch) always starts above
+/// any counter value the UI has already seen — the generation stays monotonic
+/// across `Audio` lifetimes.
+static META_GEN_EPOCH: AtomicU64 = AtomicU64::new(0);
+fn next_meta_epoch() -> u64 {
+    META_GEN_EPOCH.fetch_add(1_000_000, Ordering::Relaxed)
+}
+
+impl Shared {
+    /// Publish metadata and bump the generation the UI polls.
+    fn set_meta(&self, m: Option<TrackMetadata>) {
+        *self.meta.lock().unwrap() = m;
+        self.meta_gen.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Notify every idle-parked thread (decoder, stretcher, engine-power monitor).
@@ -902,6 +936,16 @@ fn wake_all(wake: &(Mutex<u64>, Condvar)) {
 fn idle_wait(sh: &Shared, ms: u64) {
     let guard = sh.wake.0.lock().unwrap();
     let _ = sh.wake.1.wait_timeout(guard, Duration::from_millis(ms));
+}
+
+/// Park until a transport-visible flip (`wake_all`). Only legal where nothing
+/// else can move the loop's inputs: not playing (the device stream is stopped,
+/// so ring occupancy is frozen), no source at all, or the stage already
+/// signalled EOF. While playing, loops must stay on `idle_wait` — ring space
+/// changes without any wake (rtrb has no callbacks).
+fn park(sh: &Shared) {
+    let guard = sh.wake.0.lock().unwrap();
+    drop(sh.wake.1.wait(guard));
 }
 
 /// Pause decision for [`engine_power_thread`]. Requires callback quiescence
@@ -932,6 +976,14 @@ fn engine_power_thread(stream: Arc<cpal::Stream>, sh: Shared) {
                 eprintln!("[audio] engine start failed: {e}");
                 sh.engine_stopped.store(true, Ordering::Release);
             }
+        }
+        // Settled and stopped: park. Every path back (play/seek/load, and a
+        // seek-while-stopped needs the stream running for its flush
+        // handshake) fires `wake_all`. While running — or waiting for the
+        // post-pause fade to reach quiescence, an edge with no wake — the
+        // 50 ms poll above stays.
+        if sh.engine_stopped.load(Ordering::Acquire) && engine_wants_stop(&sh) {
+            park(&sh);
         }
     }
 }
@@ -1779,12 +1831,16 @@ fn decoder_thread(
             continue;
         }
         if silence {
-            idle_wait(&sh, 5);
+            // Only a Cmd::Load can end this state, and every Cmd sender wakes.
+            park(&sh);
             continue;
         }
 
         if matches!(engine, Engine::None) || !sh.playing.load(Ordering::Relaxed) {
-            idle_wait(&sh, 5);
+            // Not playing: ring occupancy is frozen until a transport flip
+            // (play/seek/load all fire `wake_all`), so a timed poll would
+            // just burn wakeups on a state that cannot change.
+            park(&sh);
             continue;
         }
 
@@ -1997,9 +2053,14 @@ fn decoder_thread(
         // stretcher thread downstream of this ring (Phase B).
         let frames = raw.len() / 2;
         let fits = (producer.slots() / out_ch).min(frames);
-        for f in 0..fits {
-            for c in 0..out_ch {
-                let _ = producer.push(raw[f * 2 + c.min(1)]);
+        if out_ch == 2 {
+            // Bulk move — same slot-count argument as push_frames_fit.
+            let _ = producer.push_partial_slice(&raw[..fits * 2]);
+        } else {
+            for f in 0..fits {
+                for c in 0..out_ch {
+                    let _ = producer.push(raw[f * 2 + c.min(1)]);
+                }
             }
         }
 
@@ -2020,6 +2081,7 @@ fn decoder_thread(
                         );
                     }
                     *sh.meta.lock().unwrap() = Some(m);
+                    sh.meta_gen.fetch_add(1, Ordering::Release);
                 }
             }
             // Engine::Openmpt publishes its metadata at open (open_tracker) —
@@ -2142,7 +2204,18 @@ fn stretcher_thread(
                     eof_seen = true;
                     sh.stage_eof.store(true, Ordering::Release);
                 }
-            } else if !sh.decoder_eof.load(Ordering::Acquire) {
+            } else if !sh.playing.load(Ordering::Relaxed) {
+                // Paused / track ended: ring occupancy is frozen until a
+                // transport flip fires `wake_all`, so a timed poll would
+                // burn wakeups on a state that cannot change. This park is
+                // also the fix for the post-track busy spin: once the
+                // callback latched `track_ended` (playing=false, eof_seen
+                // matched no sleep branch) the loop used to re-spin a full
+                // core until the UI's next event woke it — with no
+                // auto-advance, forever. eof_seen while STILL playing keeps
+                // the timed wait: loop-mode refill has no wake.
+                park(&sh);
+            } else {
                 idle_wait(&sh, 3);
             }
         }
@@ -2216,9 +2289,16 @@ fn copy_frames(
 fn push_frames_fit(producer: &mut rtrb::Producer<f32>, src: &mut Vec<f32>, out_ch: usize) -> usize {
     let frames = src.len() / 2;
     let fits = (producer.slots() / out_ch).min(frames);
-    for f in 0..fits {
-        for c in 0..out_ch {
-            let _ = producer.push(src[f * 2 + c.min(1)]);
+    if out_ch == 2 {
+        // Bulk move: one (two-slice) copy replaces two pushes per frame. The
+        // slot count cannot shrink underneath a lone producer, so the slice
+        // always fits whole and the returned remainders are empty.
+        let _ = producer.push_partial_slice(&src[..fits * 2]);
+    } else {
+        for f in 0..fits {
+            for c in 0..out_ch {
+                let _ = producer.push(src[f * 2 + c.min(1)]);
+            }
         }
     }
     src.drain(0..fits * 2);
@@ -2247,7 +2327,7 @@ fn open_ffmpeg(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
     };
 
     *sh.current.lock().unwrap() = Some(path.to_path_buf());
-    *sh.meta.lock().unwrap() = None;
+    sh.set_meta(None);
     *engine = Engine::Ffmpeg(handle);
     post_load(sh, total, flush_target);
 }
@@ -2313,7 +2393,7 @@ fn open_tracker(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
     let flush_target = pre_load(sh);
 
     *sh.current.lock().unwrap() = Some(path.to_path_buf());
-    *sh.meta.lock().unwrap() = None;
+    sh.set_meta(None);
 
     match crate::tracker::TrackerEngine::open(path, out_rate) {
         Ok(mut eng) => {
@@ -2335,6 +2415,7 @@ fn open_tracker(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
                 .map(|d| (d * out_rate as f64) as u64)
                 .unwrap_or(u64::MAX);
             *sh.meta.lock().unwrap() = Some(meta);
+            sh.meta_gen.fetch_add(1, Ordering::Release);
             *engine = Engine::Openmpt(eng);
             post_load(sh, total, flush_target);
         }
@@ -2407,7 +2488,7 @@ fn open_midi(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
     let flush_target = pre_load(sh);
 
     *sh.current.lock().unwrap() = Some(path.to_path_buf());
-    *sh.meta.lock().unwrap() = None;
+    sh.set_meta(None);
 
     let soundfont = sh.soundfont.lock().unwrap().clone();
     match crate::midi::MidiEngine::open(path, out_rate, &soundfont) {
@@ -2420,6 +2501,7 @@ fn open_midi(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
                 .store((eng.native_bpm() as f32).to_bits(), Ordering::Relaxed);
             let meta = midi_track_metadata(path, eng.info(), dur, out_rate);
             *sh.meta.lock().unwrap() = Some(meta);
+            sh.meta_gen.fetch_add(1, Ordering::Release);
             *engine = Engine::Midi(eng);
             post_load(sh, (dur * out_rate as f64) as u64, flush_target);
         }
@@ -3065,6 +3147,7 @@ mod tests {
             dsp_enabled: Arc::new(AtomicBool::new(false)),
             dsp: Arc::new(Mutex::new(DspTap::new(rate))),
             meta: Arc::new(Mutex::new(None)),
+            meta_gen: Arc::new(AtomicU64::new(next_meta_epoch())),
             current: Arc::new(Mutex::new(None)),
             soundfont: Arc::new(Mutex::new(crate::midi::default_soundfont())),
             midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
@@ -3133,6 +3216,7 @@ mod tests {
             engine_stopped: Arc::new(AtomicBool::new(false)),
             callback_idle: Arc::new(AtomicBool::new(false)),
             wake: Arc::new((Mutex::new(0u64), Condvar::new())),
+            meta_gen: Arc::new(AtomicU64::new(next_meta_epoch())),
         }
     }
 
