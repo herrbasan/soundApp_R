@@ -319,6 +319,11 @@ struct App {
     /// Wall clock for synthetic animation phases: redraws can arrive outside the
     /// frame pacing (mouse movement), so a frame counter would freeze them.
     anim_epoch: Instant,
+    /// 1 Hz `--trace` telemetry for the Monitoring window: frames rendered and
+    /// audio samples fed to the analyser since the last line.
+    mon_frames: u32,
+    mon_samples: u64,
+    mon_log: Instant,
     frame_ms: u64,
     nopaint: bool,
     next_frame: Instant,
@@ -3291,6 +3296,9 @@ impl App {
             audio,
             audio_reported: false,
             anim_epoch: Instant::now(),
+            mon_frames: 0,
+            mon_samples: 0,
+            mon_log: Instant::now(),
             frame_ms: 16,
             nopaint: false,
             next_frame: Instant::now(),
@@ -4244,6 +4252,49 @@ impl App {
     /// Keep the Monitoring overview in step with the loaded track. Analysis is
     /// only requested while the window exists (visible or about to open), so a
     /// closed Monitoring window costs nothing.
+    /// Feed the Monitoring analyser. This is deliberately a *poll*, not part of
+    /// the window's render path: analysis used to run only when a frame was
+    /// drawn, which tied the displayed data to the repaint cadence — a redraw
+    /// storm (mouse movement) then flooded it with filler, and a repaint that
+    /// never happened left it stale. Polled from `about_to_wait`, it advances
+    /// once per loop tick while the engine has new audio; the render only reads
+    /// `dsp_snap`.
+    fn poll_dsp(&mut self) {
+        if !self.secondary_windows.is_visible("monitoring") {
+            self.last_dsp_frames = 0;
+            return;
+        }
+        let mut new_frames: Vec<(f32, f32)> = Vec::new();
+        match &self.audio {
+            Some(a) => {
+                let fp = a.frames_played.load(std::sync::atomic::Ordering::Relaxed);
+                let delta = fp.saturating_sub(self.last_dsp_frames) as usize;
+                self.last_dsp_frames = fp;
+                let tap = a.dsp_tap();
+                if let Ok(g) = tap.lock() {
+                    g.snapshot_into(&mut self.dsp_buf);
+                }
+                if delta > 0 && !self.dsp_buf.is_empty() {
+                    let take = delta.min(self.dsp_buf.len());
+                    let start = self.dsp_buf.len() - take;
+                    new_frames.extend_from_slice(&self.dsp_buf[start..]);
+                }
+            }
+            // No engine at all (silent / headless run) — a synthetic signal keeps
+            // the panels alive. Never filler for an engine that merely has no new
+            // frames: that swamped the analysis with a static picture.
+            None => {
+                new_frames = synth_dsp_frames(self.anim_epoch.elapsed().as_secs_f32(), 2048)
+            }
+        }
+        if new_frames.is_empty() {
+            return;
+        }
+        self.dsp.process(&new_frames);
+        self.dsp_snap = self.dsp.snapshot();
+        self.mon_samples += new_frames.len() as u64;
+    }
+
     fn poll_waveform(&mut self) {
         let open = self.secondary_windows.is_visible("monitoring")
             || self
@@ -4568,9 +4619,6 @@ impl App {
         let monitoring_visible = self.secondary_windows.is_visible("monitoring");
         let parameters_visible = self.secondary_windows.is_visible("parameters");
         let parameters_icon = if self.chk_locked { ICON_LOCK } else { ICON_TUNE };
-        if let Some(a) = &self.audio {
-            a.set_dsp_enabled(monitoring_visible);
-        }
 
         let mut intents = MainIntents::default();
         let pending_drop: Option<(Vec<PathBuf>, DropZone)>;
@@ -5993,38 +6041,10 @@ impl App {
             // engine at all (silent / headless run) a synthetic signal keeps the panels
             // live, but an engine that merely has no new frames must not be padded with
             // it — redraws can outpace the audio threads (see the `None` arm below).
+            // The DSP snapshot is refreshed by `poll_dsp` (loop tick), not here:
+            // analysis must not depend on how often a frame happens to be drawn.
             if key == "monitoring" {
-                let mut new_frames: Vec<(f32, f32)> = Vec::new();
-                match &self.audio {
-                    Some(a) => {
-                        let fp = a.frames_played.load(std::sync::atomic::Ordering::Relaxed);
-                        let delta = fp.saturating_sub(self.last_dsp_frames) as usize;
-                        self.last_dsp_frames = fp;
-                        let tap = a.dsp_tap();
-                        if let Ok(g) = tap.lock() {
-                            g.snapshot_into(&mut self.dsp_buf);
-                        }
-                        if delta > 0 && !self.dsp_buf.is_empty() {
-                            let take = delta.min(self.dsp_buf.len());
-                            let start = self.dsp_buf.len() - take;
-                            new_frames.extend_from_slice(&self.dsp_buf[start..]);
-                        }
-                    }
-                    // No engine at all (silent / headless run) — a synthetic signal
-                    // keeps the panels alive. Never use it as filler for an engine that
-                    // simply has no new frames: a redraw outside the frame pacing (the
-                    // mouse movement path) used to push 2048 stale-t synthetic samples
-                    // per frame, swamping the analysis so every display froze until the
-                    // movement stopped and the 60 Hz pacing handed the real audio back.
-                    None => {
-                        new_frames =
-                            synth_dsp_frames(self.anim_epoch.elapsed().as_secs_f32(), 2048)
-                    }
-                }
-                if !new_frames.is_empty() {
-                    self.dsp.process(&new_frames);
-                    self.dsp_snap = self.dsp.snapshot();
-                }
+                self.mon_frames += 1;
             }
 
             let close_clicked;
@@ -8244,6 +8264,14 @@ impl ApplicationHandler for App {
         self.poll_transport_and_scans();
         self.poll_waveform();
         self.poll_mixer();
+        // The DSP tap feeds the Monitoring window; gate it here rather than in the
+        // primary window's render path, which does not run while the player is idle
+        // (paused, or the window hidden) — a Monitoring window opened in that state
+        // used to stay empty until something else happened to repaint the player.
+        if let Some(a) = &self.audio {
+            a.set_dsp_enabled(self.secondary_windows.is_visible("monitoring"));
+        }
+        self.poll_dsp();
         // `--drop-probe`: replay one drop through the real handler.
         if let Some((paths, zone)) = self.drop_probe.take() {
             self.apply_drop(paths, zone);
@@ -8287,6 +8315,23 @@ impl ApplicationHandler for App {
             || self.screenshot_at.is_some();
 
         let now = Instant::now();
+        // 1 Hz flight recorder for "the Monitoring window is frozen" reports: the
+        // pace inputs (playing / animate / animating) next to the data actually
+        // delivered to the analyser. A display that is idle-looking with frames/s
+        // near 60 but samples/s at 0 has no audio reaching it — a different bug
+        // from a repaint that never happens (`frames/s` 0).
+        if eventlog::trace_on()
+            && self.secondary_windows.is_visible("monitoring")
+            && now.duration_since(self.mon_log) >= Duration::from_secs(1)
+        {
+            eventlog::note(&format!(
+                "monitor pace playing={playing} animate={} animating={animating} ui_anim={ui_anim} frames/s={} samples/s={}",
+                self.animate, self.mon_frames, self.mon_samples
+            ));
+            self.mon_frames = 0;
+            self.mon_samples = 0;
+            self.mon_log = now;
+        }
         if animating && now >= self.next_frame {
             // Low-footprint cadence: the base player only needs ~15 fps for its
             // progress bar and MM:SS text; full-rate only while a DSP window is up.
