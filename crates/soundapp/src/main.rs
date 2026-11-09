@@ -5238,6 +5238,7 @@ impl App {
             if let Some(a) = &self.audio {
                 a.set_volume(self.master_vol);
             }
+            self.save_config_req = true;
         }
         if let Some((paths, zone)) = pending_drop {
             self.apply_drop(paths, zone);
@@ -8054,6 +8055,7 @@ impl ApplicationHandler for App {
                         if let Some(a) = &self.audio {
                             a.set_volume(self.master_vol);
                         }
+                        self.save_config_req = true;
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -8167,12 +8169,14 @@ impl ApplicationHandler for App {
                             if let Some(a) = &self.audio {
                                 a.set_volume(self.master_vol);
                             }
+                            self.save_config_req = true;
                         }
                         Key::Named(NamedKey::ArrowDown) if !focused_text => {
                             self.master_vol = (self.master_vol - 0.05).clamp(0.0, 2.0);
                             if let Some(a) = &self.audio {
                                 a.set_volume(self.master_vol);
                             }
+                            self.save_config_req = true;
                         }
                         Key::Named(NamedKey::Space) if !focused_text && !event.repeat => {
                             if let Some(a) = &self.audio {
@@ -8275,6 +8279,13 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         log_focus_change(self);
         diag_watch(self);
+        // Flush requested config changes (master volume etc.) on the next loop
+        // tick, so a change reaches user.json even if the process is later
+        // killed without a graceful exit (harness runs, task manager).
+        if self.save_config_req {
+            self.save_config_req = false;
+            self.save_config();
+        }
         // Re-arm global keys as soon as the OS says the key is physically up:
         // a carried-over entry is exactly what suppresses the focus-change
         // re-delivery of a key the user is still holding.
