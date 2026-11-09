@@ -338,6 +338,10 @@ struct App {
     pace_at: Instant,
     pace_frames: u32,
     pace_slow: u32,
+    /// Frame interval the pacing loop last scheduled; the slow-frame counter
+    /// compares against this plus a margin, so paced frames at the cadence
+    /// itself are not counted as stalls.
+    pace_budget_ms: u64,
 
     // Phase 1.5 multi-window: secondary windows sharing `text_sys`, plus queued
     // show/hide toggles executed in `window_event` where `event_loop` is available.
@@ -3178,6 +3182,17 @@ impl App {
         }
     }
 
+    /// A load is in flight: a track is queued but no metadata has arrived.
+    /// `false` once the engine reports the load failed — otherwise a track
+    /// that never opens holds the frame loop at 60 fps for the whole session
+    /// (the failed-open burn seen in the field logs).
+    fn load_pending(&self) -> bool {
+        let Some(a) = &self.audio else {
+            return false;
+        };
+        !self.playlist.is_empty() && self.track_meta.is_none() && !a.load_failed()
+    }
+
     fn new(
         audio: Option<Audio>,
         animate: bool,
@@ -3308,6 +3323,7 @@ impl App {
             pace_at: Instant::now(),
             pace_frames: 0,
             pace_slow: 0,
+            pace_budget_ms: 66,
 
             secondary_windows: secondary_windows,
             window_geom,
@@ -5324,10 +5340,9 @@ impl App {
         }
 
         self.build_scene(w, h, scale);
+        let waiting_for_meta = self.load_pending();
         if let Some(renderer) = &mut self.renderer {
             // With --open-window the screenshot belongs to that secondary window.
-            let waiting_for_meta =
-                self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
             let shot = if self.open_window_spec.is_some() || waiting_for_meta {
                 None
             } else {
@@ -5347,7 +5362,7 @@ impl App {
             let dt = now.duration_since(last);
             if dt < Duration::from_millis(500) {
                 self.pace_frames += 1;
-                if dt > Duration::from_millis(66) {
+                if dt > Duration::from_millis(self.pace_budget_ms + 20) {
                     self.pace_slow += 1;
                 }
             }
@@ -8366,8 +8381,7 @@ impl ApplicationHandler for App {
                 .as_ref()
                 .map(|engine| engine.is_playing())
                 .unwrap_or(false);
-        let pending_meta =
-            self.audio.is_some() && !self.playlist.is_empty() && self.track_meta.is_none();
+        let pending_meta = self.load_pending();
         let file_drag = self.ui_state.hovered_file.is_some();
         let sync_debug = self.mixer_sync_debug && self.secondary_windows.is_visible("mixer");
         // Widget transitions (hover fades, popups, dialogs) drive their own 60 fps
@@ -8425,6 +8439,7 @@ impl ApplicationHandler for App {
                 66
             };
             self.next_frame = now + Duration::from_millis(frame_ms);
+            self.pace_budget_ms = frame_ms;
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -8852,10 +8867,11 @@ fn main() {
             }
         }
         println!(
-            "[headless] end pos {:.3}s / dur {:.3}s after {:.1}s",
+            "[headless] end pos {:.3}s / dur {:.3}s after {:.1}s load_failed={}",
             a.position_secs(),
             a.duration_secs(),
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            a.load_failed()
         );
         std::process::exit(0);
     }

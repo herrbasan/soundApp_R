@@ -321,6 +321,11 @@ struct Shared {
     /// Bumped on every `meta` write. The UI polls this instead of cloning
     /// (and byte-comparing) the 64 KB cover buffer every frame.
     meta_gen: Arc<AtomicU64>,
+    /// Set when the last load failed to open (missing file, unsupported,
+    /// unreadable). Cleared at each new load attempt. The UI checks this so
+    /// "metadata pending" cannot wait forever on a track that never opens —
+    /// that wait used to hold the frame loop at 60 fps for the whole session.
+    load_failed: Arc<AtomicBool>,
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
     /// Active SoundFont for MIDI sources. Written by the decoder thread
@@ -420,6 +425,7 @@ pub struct Audio {
     cmd_tx: mpsc::Sender<Cmd>,
     meta: Arc<Mutex<Option<TrackMetadata>>>,
     meta_gen: Arc<AtomicU64>,
+    load_failed: Arc<AtomicBool>,
     current: Arc<Mutex<Option<PathBuf>>>,
     dsp: Arc<Mutex<DspTap>>,
     midi_native_bpm: Arc<AtomicU32>,
@@ -505,6 +511,7 @@ impl Audio {
         self.transport_gen.fetch_add(1, Ordering::SeqCst);
         *self.meta.lock().unwrap() = None;
         self.meta_gen.fetch_add(1, Ordering::Release);
+        self.load_failed.store(false, Ordering::Release);
         *self.current.lock().unwrap() = Some(path.clone());
         let _ = self.cmd_tx.send(Cmd::Load(path));
         wake_all(&self.wake);
@@ -552,6 +559,11 @@ impl Audio {
     /// cover buffer that must not be cloned (or compared) on the UI cadence.
     pub fn meta_gen(&self) -> u64 {
         self.meta_gen.load(Ordering::Acquire)
+    }
+    /// True when the last `load_file` failed to open. The UI stops treating
+    /// the track as metadata-pending on this instead of waiting forever.
+    pub fn load_failed(&self) -> bool {
+        self.load_failed.load(Ordering::Acquire)
     }
     pub fn current_file(&self) -> Option<PathBuf> {
         self.current.lock().unwrap().clone()
@@ -671,6 +683,7 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         dsp: Arc::new(Mutex::new(DspTap::new(rate))),
         meta: Arc::new(Mutex::new(None)),
         meta_gen: Arc::new(AtomicU64::new(next_meta_epoch())),
+        load_failed: Arc::new(AtomicBool::new(false)),
         current: Arc::new(Mutex::new(None)),
         soundfont: Arc::new(Mutex::new(crate::midi::default_soundfont())),
         midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
@@ -897,6 +910,7 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         cmd_tx,
         meta: shared.meta.clone(),
         meta_gen: shared.meta_gen.clone(),
+        load_failed: shared.load_failed.clone(),
         current: shared.current.clone(),
         dsp: shared.dsp.clone(),
         midi_native_bpm: shared.midi_native_bpm.clone(),
@@ -2320,6 +2334,8 @@ fn open_ffmpeg(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
 
     let total = if handle.is_null() {
         eprintln!("[audio] FFmpeg open failed for {}", path.display());
+        sh.load_failed.store(true, Ordering::Release);
+        crate::eventlog::note(&format!("load failed ffmpeg {}", path.display()));
         0
     } else {
         let dur = unsafe { sa_ffmpeg_duration(handle) };
@@ -2421,6 +2437,8 @@ fn open_tracker(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
         }
         Err(e) => {
             eprintln!("[audio] libopenmpt open failed for {}: {e}", path.display());
+            sh.load_failed.store(true, Ordering::Release);
+            crate::eventlog::note(&format!("load failed tracker {}", path.display()));
             *engine = Engine::None;
             post_load(sh, 0, flush_target);
         }
@@ -2511,6 +2529,8 @@ fn open_midi(engine: &mut Engine, path: &Path, out_rate: u32, sh: &Shared) {
                 path.display(),
                 soundfont.display()
             );
+            sh.load_failed.store(true, Ordering::Release);
+            crate::eventlog::note(&format!("load failed midi {}", path.display()));
             *engine = Engine::None;
             post_load(sh, 0, flush_target);
         }
@@ -3148,6 +3168,7 @@ mod tests {
             dsp: Arc::new(Mutex::new(DspTap::new(rate))),
             meta: Arc::new(Mutex::new(None)),
             meta_gen: Arc::new(AtomicU64::new(next_meta_epoch())),
+            load_failed: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
             soundfont: Arc::new(Mutex::new(crate::midi::default_soundfont())),
             midi_native_bpm: Arc::new(AtomicU32::new(120.0f32.to_bits())),
@@ -3217,6 +3238,7 @@ mod tests {
             callback_idle: Arc::new(AtomicBool::new(false)),
             wake: Arc::new((Mutex::new(0u64), Condvar::new())),
             meta_gen: Arc::new(AtomicU64::new(next_meta_epoch())),
+            load_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
