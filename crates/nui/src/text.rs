@@ -362,6 +362,20 @@ impl TextSystem {
         cy: f32,
         px: f32,
     ) -> Option<PositionedGlyph> {
+        let ag = self.icon_atlas_glyph(icon, px)?;
+        Some(PositionedGlyph {
+            x: (cx - ag.w as f32 * 0.5).round() as i32,
+            y: (cy - ag.h as f32 * 0.5).round() as i32,
+            uv_x: ag.uv_x,
+            uv_y: ag.uv_y,
+            w: ag.w,
+            h: ag.h,
+        })
+    }
+
+    /// Get-or-render a Material Icon glyph's atlas entry (the lookup half of
+    /// [`Self::layout_icon_centered`]).
+    fn icon_atlas_glyph(&mut self, icon: &str, px: f32) -> Option<AtlasGlyph> {
         let px_tenths = (px * 10.0).round() as u16;
         let shaped = self.get_or_shape(FontFace::Icons, icon, px);
         let &(gid, _, _, _) = shaped.first()?;
@@ -372,50 +386,59 @@ impl TextSystem {
             px_tenths,
             subpx_bin: 0,
         };
-        let ag = if let Some(&cached) = self.cache.get(&key) {
-            cached
-        } else {
-            let fref = self.fonts[FontFace::Icons as usize].as_ref();
-            let mut scaler = self.scale_ctx.builder(fref).size(px).hint(true).build();
-            let img = Render::new(&[Source::Outline, Source::Bitmap(StrikeWith::BestFit)])
-                .format(Format::Alpha)
-                .render(&mut scaler, gid);
-            let entry = if let Some(img) = img {
-                let w = img.placement.width as u16;
-                let h = img.placement.height as u16;
-                let (ux, uy) = self.alloc_atlas(w, h, &img.data);
-                AtlasGlyph {
-                    uv_x: ux,
-                    uv_y: uy,
-                    w,
-                    h,
-                    offset_x: img.placement.left as i16,
-                    offset_y: -(img.placement.top as i16),
-                }
-            } else {
-                AtlasGlyph {
-                    uv_x: 0,
-                    uv_y: 0,
-                    w: 0,
-                    h: 0,
-                    offset_x: 0,
-                    offset_y: 0,
-                }
-            };
-            self.cache.insert(key, entry);
-            entry
-        };
-        if ag.w == 0 || ag.h == 0 {
-            return None;
+        if let Some(&cached) = self.cache.get(&key) {
+            return Some(cached);
         }
-        Some(PositionedGlyph {
-            x: (cx - ag.w as f32 * 0.5).round() as i32,
-            y: (cy - ag.h as f32 * 0.5).round() as i32,
-            uv_x: ag.uv_x,
-            uv_y: ag.uv_y,
-            w: ag.w,
-            h: ag.h,
-        })
+        let fref = self.fonts[FontFace::Icons as usize].as_ref();
+        let mut scaler = self.scale_ctx.builder(fref).size(px).hint(true).build();
+        let img = Render::new(&[Source::Outline, Source::Bitmap(StrikeWith::BestFit)])
+            .format(Format::Alpha)
+            .render(&mut scaler, gid);
+        let entry = if let Some(img) = img {
+            let w = img.placement.width as u16;
+            let h = img.placement.height as u16;
+            let (ux, uy) = self.alloc_atlas(w, h, &img.data);
+            AtlasGlyph {
+                uv_x: ux,
+                uv_y: uy,
+                w,
+                h,
+                offset_x: img.placement.left as i16,
+                offset_y: -(img.placement.top as i16),
+            }
+        } else {
+            AtlasGlyph {
+                uv_x: 0,
+                uv_y: 0,
+                w: 0,
+                h: 0,
+                offset_x: 0,
+                offset_y: 0,
+            }
+        };
+        self.cache.insert(key, entry);
+        if entry.w == 0 || entry.h == 0 {
+            None
+        } else {
+            Some(entry)
+        }
+    }
+
+    /// Rasterize a Material Icon glyph into a white RGBA bitmap — straight
+    /// alpha from the glyph coverage, no background. CPU-side composition
+    /// (baking icons into tiles) uses this instead of scene primitives so the
+    /// icon is one pixel-exact layer everywhere it appears.
+    pub fn rasterize_icon_rgba(&mut self, icon: &str, px: f32) -> Option<(u16, u16, Vec<u8>)> {
+        let ag = self.icon_atlas_glyph(icon, px)?;
+        let stride = ATLAS_W as usize;
+        let mut rgba = Vec::with_capacity(ag.w as usize * ag.h as usize * 4);
+        for y in 0..ag.h as usize {
+            for x in 0..ag.w as usize {
+                let cov = self.atlas[(ag.uv_y as usize + y) * stride + ag.uv_x as usize + x];
+                rgba.extend_from_slice(&[255, 255, 255, cov]);
+            }
+        }
+        Some((ag.w, ag.h, rgba))
     }
 
     /// Lay `text` out horizontally, rotate the rasterized run by -45° (text reads

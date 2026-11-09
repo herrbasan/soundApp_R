@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
@@ -352,7 +353,10 @@ struct App {
     /// Cover pixels currently resting in the scene's image slot (`None` = the
     /// procedural default tile is showing). Updated per frame during a fade so
     /// a track change mid-transition starts from what is on screen.
-    cover_resting: Option<(u32, u32, Vec<u8>)>,
+    cover_resting: Option<CoverView>,
+    /// The view currently loaded into the scene's image slot, so the slot is
+    /// re-uploaded only when the resting view actually changes.
+    cover_slot_view: Option<CoverView>,
     /// Active cover crossfade, if any.
     cover_fade: Option<CoverFade>,
     /// Last logged foreground window (OS-observed, `None` = outside the app).
@@ -774,49 +778,118 @@ fn first_audio_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     files.into_iter().next()
 }
 
-/// Cover images and the default tile are square RGBA of this side (the decode
-/// bridge caps embedded art at 128).
+/// Cover images and the default tiles are square RGBA of this side (the
+/// decode bridge caps embedded art at 128).
 const COVER_TILE_SIDE: u32 = 128;
 /// Duration of one cover crossfade.
 const COVER_FADE_SECS: f32 = 0.2;
 
-/// One cover transition: the outgoing view (`None` = default tile) fading
-/// into the incoming view over [`COVER_FADE_SECS`].
+/// One side of a cover transition: decoded art or a baked default tile.
+#[derive(Clone, PartialEq, Debug)]
+enum CoverView {
+    /// Decoded cover art or a composited fade frame.
+    Image(Vec<u8>),
+    /// The baked default tile: solid background with the volume icon baked
+    /// in — for a loaded track without embedded art (`true`, blue) or the
+    /// no-file state (`false`, grey). Baked as a buffer so the icon is one
+    /// pixel-exact layer through every fade instead of popping between a
+    /// scene primitive and the image slot.
+    Default(bool),
+}
+
+/// The two baked default tiles (blue for a loaded track, grey for no file).
+/// Built once: rasterizing the icon needs a text system, and this must work
+/// outside a live window borrow.
+static DEFAULT_TILES: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+
+fn default_cover_tiles() -> &'static (Vec<u8>, Vec<u8>) {
+    DEFAULT_TILES.get_or_init(|| {
+        let side = COVER_TILE_SIDE as usize;
+        let mut ts = nui::TextSystem::new();
+        let mut build = |bg: [u8; 3], icon: [u8; 4]| -> Vec<u8> {
+            let mut buf = vec![0u8; side * side * 4];
+            for px in buf.chunks_exact_mut(4) {
+                px[..3].copy_from_slice(&bg);
+                px[3] = 255;
+            }
+            // Icon raster size mirrors the old primitive ratio (58/126 of the
+            // cover side).
+            if let Some((w, h, rgba)) = ts.rasterize_icon_rgba(ICON_VOLUME, 58.0 / 126.0 * 128.0)
+            {
+                let x0 = (side - w as usize) / 2;
+                let y0 = (side - h as usize) / 2;
+                let icon_a = icon[3] as f32 / 255.0;
+                for iy in 0..h as usize {
+                    for ix in 0..w as usize {
+                        let src = (iy * w as usize + ix) * 4;
+                        // Straight-alpha over: coverage scales the icon alpha.
+                        let a = rgba[src + 3] as f32 / 255.0 * icon_a;
+                        if a <= 0.0 {
+                            continue;
+                        }
+                        let dx = x0 + ix;
+                        let dy = y0 + iy;
+                        if dx >= side || dy >= side {
+                            continue;
+                        }
+                        let dst = (dy * side + dx) * 4;
+                        for c in 0..3 {
+                            let v = icon[c] as f32 * a + buf[dst + c] as f32 * (1.0 - a);
+                            buf[dst + c] = v.round() as u8;
+                        }
+                        buf[dst + 3] = 255;
+                    }
+                }
+            }
+            buf
+        };
+        (
+            build([34, 150, 195], [0, 0, 0, 140]),
+            build([60, 60, 60], [255, 255, 255, 55]),
+        )
+    })
+}
+
+/// The 128² RGBA buffer of a cover view.
+fn cover_view_buffer(view: &CoverView) -> (u32, u32, Vec<u8>) {
+    let tiles = default_cover_tiles();
+    match view {
+        CoverView::Image(buf) => (COVER_TILE_SIDE, COVER_TILE_SIDE, buf.clone()),
+        CoverView::Default(true) => (COVER_TILE_SIDE, COVER_TILE_SIDE, tiles.0.clone()),
+        CoverView::Default(false) => (COVER_TILE_SIDE, COVER_TILE_SIDE, tiles.1.clone()),
+    }
+}
+
+/// Ease-out cubic: fast at the start, settling gently at the end.
+fn ease_out_cubic(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    1.0 - (1.0 - x).powi(3)
+}
+
+/// One cover transition: the outgoing view fading into the incoming view
+/// over [`COVER_FADE_SECS`], with ease-out pacing.
 struct CoverFade {
-    old: Option<(u32, u32, Vec<u8>)>,
-    new: Option<(u32, u32, Vec<u8>)>,
+    old: CoverView,
+    new: CoverView,
     started: Instant,
 }
 
-/// Solid default-tile RGBA buffer (the has-track fallback blue).
-fn cover_tile_rgba() -> Vec<u8> {
-    let px = (COVER_TILE_SIDE as usize) * (COVER_TILE_SIDE as usize);
-    let mut v = Vec::with_capacity(px * 4);
-    for _ in 0..px {
-        v.extend_from_slice(&[34, 150, 195, 255]);
-    }
-    v
-}
-
-/// Straight-alpha crossfade of two 128x128 RGBA views; a `None` side blends
-/// the solid default-tile color. Mismatched sizes degrade to the tile (the
-/// decode bridge caps covers at 128, so this is a guard, not an expectation).
-fn blend_covers(
-    old: Option<&(u32, u32, Vec<u8>)>,
-    new: Option<&(u32, u32, Vec<u8>)>,
-    t: f32,
-) -> Vec<u8> {
+/// Straight-alpha crossfade of two 128x128 RGBA views. Mismatched sizes
+/// degrade to the matching default tile (the decode bridge caps covers at
+/// 128, so this is a guard, not an expectation).
+fn blend_covers(old: &CoverView, new: &CoverView, t: f32) -> Vec<u8> {
     let side = COVER_TILE_SIDE as usize;
     let len = side * side * 4;
-    let tile = cover_tile_rgba();
-    let a: &[u8] = match old {
-        Some((w, h, d)) if *w as usize == side && *h as usize == side && d.len() == len => d,
-        _ => &tile,
+    let resolve = |view: &CoverView| -> Vec<u8> {
+        let (w, h, buf) = cover_view_buffer(view);
+        if w as usize == side && h as usize == side && buf.len() == len {
+            buf
+        } else {
+            default_cover_tiles().0.clone()
+        }
     };
-    let b: &[u8] = match new {
-        Some((w, h, d)) if *w as usize == side && *h as usize == side && d.len() == len => d,
-        _ => &tile,
-    };
+    let a = resolve(old);
+    let b = resolve(new);
     let t = t.clamp(0.0, 1.0);
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
@@ -3333,7 +3406,8 @@ impl App {
             secondary_windows: secondary_windows,
             window_geom,
             default_dir,
-            cover_resting: None,
+            cover_resting: Some(CoverView::Default(false)),
+            cover_slot_view: None,
             cover_fade: None,
             focus_log: Some("<unset>".to_string()),
             pending_window_toggles: Vec::new(),
@@ -4013,46 +4087,52 @@ impl App {
     }
 
     /// Begin a cover crossfade from the currently displayed view to
-    /// `incoming` (`None` = the default tile). Default→default is nothing
-    /// visual and hard-clears instead.
+    /// `incoming` (`None` = the baked default tile for the current track
+    /// state). Equal views (default→default of the same variant) are nothing
+    /// visual and skip the fade entirely.
     fn begin_cover_fade(&mut self, incoming: Option<(u32, u32, Vec<u8>)>) {
-        if self.cover_resting.is_none() && incoming.is_none() {
+        let has_track = self
+            .audio
+            .as_ref()
+            .map(|a| a.current_file().is_some())
+            .unwrap_or(false);
+        let new_view = match incoming {
+            Some(rgba) => CoverView::Image(rgba.2),
+            None => CoverView::Default(has_track),
+        };
+        // The resting view is always `Some` (initialised at startup, kept by
+        // every fade completion); fall back to the state-matching default.
+        let old_view = self
+            .cover_resting
+            .clone()
+            .unwrap_or_else(|| CoverView::Default(has_track));
+        if old_view == new_view {
             self.cover_fade = None;
-            self.scene.clear_image();
+            self.cover_resting = Some(new_view);
             return;
         }
         self.cover_fade = Some(CoverFade {
-            old: self.cover_resting.clone(),
-            new: incoming,
+            old: old_view,
+            new: new_view,
             started: Instant::now(),
         });
     }
 
-    /// Advance the cover crossfade one frame: composite old→new at the elapsed
-    /// fraction into the scene's single image slot. The composited frame also
-    /// becomes `cover_resting`, so a track change mid-fade starts the next
-    /// transition from what is actually on screen.
+    /// Advance the cover crossfade one frame: composite old→new at the eased
+    /// elapsed fraction into the resting view (build_scene uploads resting to
+    /// the scene's image slot). The composite becomes `cover_resting`, so a
+    /// track change mid-fade starts the next transition from what is on
+    /// screen.
     fn step_cover_fade(&mut self) {
         let Some(f) = self.cover_fade.as_ref() else { return };
-        let t = f.started.elapsed().as_secs_f32() / COVER_FADE_SECS;
-        if t >= 1.0 {
+        let raw = f.started.elapsed().as_secs_f32() / COVER_FADE_SECS;
+        if raw >= 1.0 {
             let done = self.cover_fade.take().unwrap();
-            match done.new {
-                Some((w, h, rgba)) => {
-                    self.scene.set_image(w, h, rgba.clone());
-                    self.cover_resting = Some((w, h, rgba));
-                }
-                None => {
-                    self.scene.clear_image();
-                    self.cover_resting = None;
-                }
-            }
+            self.cover_resting = Some(done.new);
             return;
         }
-        let buf = blend_covers(f.old.as_ref(), f.new.as_ref(), t);
-        self.scene
-            .set_image(COVER_TILE_SIDE, COVER_TILE_SIDE, buf.clone());
-        self.cover_resting = Some((COVER_TILE_SIDE, COVER_TILE_SIDE, buf));
+        let buf = blend_covers(&f.old, &f.new, ease_out_cubic(raw));
+        self.cover_resting = Some(CoverView::Image(buf));
     }
 
     /// Load `playlist[idx]` into the engine.
@@ -4492,6 +4572,20 @@ impl App {
     }
 
     fn build_scene(&mut self, w: u32, h: u32, _dpi_scale: f32) {
+        static FRAME_TRACE: OnceLock<bool> = OnceLock::new();
+        if *FRAME_TRACE.get_or_init(|| std::env::var("SOUNDAPP_COVER_TRACE").is_ok()) {
+            let due = self
+                .drop_probe_trace_at
+                .map(|t| Instant::now() >= t)
+                .unwrap_or(true);
+            if due {
+                self.drop_probe_trace_at = Some(Instant::now() + Duration::from_millis(200));
+                eprintln!(
+                    "[cover] frame at {:.0} ms",
+                    self.start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
         // The whole minimalist UI scales with the *actual* window size, so window
         // border/corner drags, `+/-/0` and `Ctrl+Wheel` (which resizes the window)
         // all produce the same smooth scaling.
@@ -4837,63 +4931,21 @@ impl App {
                 cover_s,
                 cover_s,
             );
-            let has_track = file.is_some();
-            // The scene's image slot is live during a fade even when the
-            // incoming view is the default tile (the fade composites it).
-            let showing_image = self.cover_fade.is_some() || self.cover_resting.is_some();
-            ui.scene.push_clip(cover.x, cover.y, cover.w, cover.h);
-            if showing_image {
-                ui.scene.image_quad(cover.x, cover.y, cover.w, cover.h);
-                // While a fade involves the default view on one side, the
-                // volume glyph rides on top with that side's weight so it
-                // fades with the tile instead of popping when the procedural
-                // fallback takes over at the end.
-                if let Some(f) = &self.cover_fade {
-                    let ft =
-                        (f.started.elapsed().as_secs_f32() / COVER_FADE_SECS).clamp(0.0, 1.0);
-                    let w = if f.new.is_none() {
-                        ft
-                    } else if f.old.is_none() {
-                        1.0 - ft
-                    } else {
-                        0.0
-                    };
-                    if w > 0.005 && has_track {
-                        ui.scene.icon_centered(
-                            ui.text_sys,
-                            ICON_VOLUME,
-                            (cover.x + cover.w * 0.5).round(),
-                            (cover.y + cover.h * 0.5).round(),
-                            (58.0 * scale).round(),
-                            rgba(0, 0, 0, (140.0 * w) as u8),
-                        );
-                    }
-                }
-            } else {
-                ui.scene.rect(
-                    cover.x,
-                    cover.y,
-                    cover.w,
-                    cover.h,
-                    if has_track {
-                        rgb(34, 150, 195)
-                    } else {
-                        rgb(60, 60, 60)
-                    },
+            // The cover view always lives in the scene's image slot: real art
+            // and the baked default tiles (background + volume icon) are one
+            // pixel-exact layer, so the icon never pops between a fade and
+            // the resting state.
+            if self.cover_slot_view.as_ref() != self.cover_resting.as_ref() {
+                let (w, h, buf) = cover_view_buffer(
+                    self.cover_resting
+                        .as_ref()
+                        .unwrap_or(&CoverView::Default(false)),
                 );
-                ui.scene.icon_centered(
-                    ui.text_sys,
-                    ICON_VOLUME,
-                    (cover.x + cover.w * 0.5).round(),
-                    (cover.y + cover.h * 0.5).round(),
-                    (58.0 * scale).round(),
-                    if has_track {
-                        rgba(0, 0, 0, 140)
-                    } else {
-                        rgba(255, 255, 255, 55)
-                    },
-                );
+                ui.scene.set_image(w, h, buf);
+                self.cover_slot_view = self.cover_resting.clone();
             }
+            ui.scene.push_clip(cover.x, cover.y, cover.w, cover.h);
+            ui.scene.image_quad(cover.x, cover.y, cover.w, cover.h);
             // Diagonal -45° format ribbon, hidden while the cursor is on the cover.
             // The endpoints sit well outside the clipped square so the capsule caps
             // are cut off and the sash runs edge-to-edge.
@@ -8500,7 +8552,9 @@ impl ApplicationHandler for App {
             let frame_ms = if pending_meta || dsp_open || ui_anim || file_drag || sync_debug || cover_anim {
                 self.frame_ms
             } else {
-                66
+                // EXPERIMENT (2026-11-09): honor --fps during plain playback to
+                // measure the 60 fps cost. Default was hard-coded 66.
+                self.frame_ms
             };
             self.next_frame = now + Duration::from_millis(frame_ms);
             self.pace_budget_ms = frame_ms;
@@ -9392,12 +9446,21 @@ mod params_tests {
         };
         let red = solid(255, 0, 0);
         let blue = solid(0, 0, 255);
-        assert_eq!(&blend_covers(Some(&red), Some(&blue), 0.0)[0..4], &[255, 0, 0, 255]);
-        assert_eq!(&blend_covers(Some(&red), Some(&blue), 1.0)[0..4], &[0, 0, 255, 255]);
-        assert_eq!(&blend_covers(Some(&red), Some(&blue), 0.5)[0..4], &[128, 0, 128, 255]);
-        // A None side blends against the solid default-tile color.
-        assert_eq!(&blend_covers(None, Some(&red), 0.0)[0..4], &[34, 150, 195, 255]);
-        assert_eq!(&blend_covers(Some(&red), None, 1.0)[0..4], &[34, 150, 195, 255]);
+        let red_view = CoverView::Image(red.2);
+        let blue_view = CoverView::Image(blue.2);
+        assert_eq!(&blend_covers(&red_view, &blue_view, 0.0)[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&blend_covers(&red_view, &blue_view, 1.0)[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&blend_covers(&red_view, &blue_view, 0.5)[0..4], &[128, 0, 128, 255]);
+        // A Default side blends against the baked default tile; the tile
+        // corner is background (the baked icon is centered ink).
+        assert_eq!(
+            &blend_covers(&CoverView::Default(true), &red_view, 0.0)[0..4],
+            &[34, 150, 195, 255]
+        );
+        assert_eq!(
+            &blend_covers(&red_view, &CoverView::Default(true), 1.0)[0..4],
+            &[34, 150, 195, 255]
+        );
     }
 
     #[test]
@@ -9413,17 +9476,21 @@ mod params_tests {
         }
         app.step_cover_fade();
         assert!(app.cover_fade.is_none());
-        let (_, _, px) = app.cover_resting.clone().expect("resting cover");
+        let px = match app.cover_resting.clone().expect("resting cover") {
+            CoverView::Image(px) => px,
+            other => panic!("expected the art view, got {other:?}"),
+        };
         assert_eq!(px, cover.2);
 
-        // Fading back to the default tile clears the slot at completion.
+        // Fading back to the default tile rests on the baked default view
+        // (background + icon), never on an empty slot.
         app.begin_cover_fade(None);
         if let Some(f) = &mut app.cover_fade {
             f.started = Instant::now() - Duration::from_secs(1);
         }
         app.step_cover_fade();
         assert!(app.cover_fade.is_none());
-        assert!(app.cover_resting.is_none());
+        assert!(matches!(app.cover_resting, Some(CoverView::Default(_))));
     }
 
     #[test]
