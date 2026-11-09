@@ -189,7 +189,20 @@ impl MixerAudio {
     }
 
     pub fn load_playlist(&mut self, paths: &[PathBuf]) {
-        self.clear();
+        // Stop first: the new set starts from position 0 once prebuffered.
+        self.shared.playing.store(false, Ordering::SeqCst);
+        self.shared.play_pending.store(false, Ordering::SeqCst);
+        let count = paths.len().min(MAX_STEMS);
+        // Slots that are immediately reloaded must NOT go through clear_slot:
+        // its queued StemCmd::Clear races the StemCmd::Load inside the stem
+        // worker — Clear sets enabled=false and the ~10 ms flush-ack wait
+        // keeps the slot disabled exactly when poll() looks, and poll then
+        // cancels the scheduled start (the silent re-drop). The Load command
+        // re-initialises the slot itself and its flush drains the old ring,
+        // so only the leftovers beyond the new set are cleared.
+        for index in count..MAX_STEMS {
+            self.clear_slot(index);
+        }
         self.shared.position_frames.store(0, Ordering::SeqCst);
         self.shared.transport_gen.fetch_add(1, Ordering::SeqCst);
         for (index, path) in paths.iter().take(MAX_STEMS).enumerate() {
@@ -203,6 +216,7 @@ impl MixerAudio {
                 && !self.shared.shutdown.load(Ordering::Acquire),
             Ordering::SeqCst,
         );
+        trace_transport(&self.shared, "load_playlist end");
     }
 
     pub fn load_stem(&mut self, index: usize, path: PathBuf) {
@@ -289,14 +303,6 @@ impl MixerAudio {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.shared.playing.store(false, Ordering::SeqCst);
-        self.shared.play_pending.store(false, Ordering::SeqCst);
-        for index in 0..MAX_STEMS {
-            self.clear_slot(index);
-        }
-    }
-
     fn clear_slot(&mut self, index: usize) {
         let slot = &self.shared.slots[index];
         slot.enabled.store(false, Ordering::Release);
@@ -315,6 +321,7 @@ impl MixerAudio {
         if !play {
             self.shared.playing.store(false, Ordering::SeqCst);
             self.shared.play_pending.store(false, Ordering::SeqCst);
+            trace_transport(&self.shared, "set_playing(false)");
             return;
         }
         if !self
@@ -323,6 +330,7 @@ impl MixerAudio {
             .iter()
             .any(|s| s.enabled.load(Ordering::Acquire))
         {
+            trace_transport(&self.shared, "set_playing(true) no stems");
             return;
         }
         let duration = self.duration_secs();
@@ -335,6 +343,7 @@ impl MixerAudio {
         } else {
             self.shared.play_pending.store(true, Ordering::SeqCst);
         }
+        trace_transport(&self.shared, "set_playing(true)");
     }
 
     pub fn toggle_play(&mut self) -> bool {
@@ -346,6 +355,26 @@ impl MixerAudio {
     pub fn is_playing(&self) -> bool {
         self.shared.playing.load(Ordering::Acquire)
             || self.shared.play_pending.load(Ordering::Acquire)
+    }
+
+    /// Diagnostic for harness runs: (playing, play_pending, enabled, ready).
+    pub fn debug_transport(&self) -> (bool, bool, usize, usize) {
+        let mut enabled = 0;
+        let mut ready = 0;
+        for slot in &self.shared.slots {
+            if slot.enabled.load(Ordering::Relaxed) {
+                enabled += 1;
+                if slot.ready.load(Ordering::Relaxed) {
+                    ready += 1;
+                }
+            }
+        }
+        (
+            self.shared.playing.load(Ordering::Relaxed),
+            self.shared.play_pending.load(Ordering::Relaxed),
+            enabled,
+            ready,
+        )
     }
 
     pub fn set_loop(&self, enabled: bool) {
@@ -377,6 +406,7 @@ impl MixerAudio {
             resume && !self.shared.shutdown.load(Ordering::Acquire),
             Ordering::SeqCst,
         );
+        trace_transport(&self.shared, "seek_secs");
         let duration = self.duration_secs();
         let clamped = seconds.max(0.0);
         let clamped = if duration > 0.0 {
@@ -426,11 +456,13 @@ impl MixerAudio {
         if !any_loaded {
             self.shared.playing.store(false, Ordering::SeqCst);
             self.shared.play_pending.store(false, Ordering::SeqCst);
+            trace_transport(&self.shared, "poll no stems");
             return;
         }
         if self.shared.play_pending.load(Ordering::Acquire) && self.all_ready() {
             self.shared.play_pending.store(false, Ordering::SeqCst);
             self.shared.playing.store(true, Ordering::SeqCst);
+            trace_transport(&self.shared, "poll start (pending+ready)");
         }
         let duration = self.duration_secs();
         match end_action(
@@ -445,6 +477,14 @@ impl MixerAudio {
                 self.shared
                     .position_frames
                     .store((duration * self.rate as f64) as u64, Ordering::SeqCst);
+                trace_transport(
+                    &self.shared,
+                    &format!(
+                        "poll end_action pos={:.2} dur={:.2}",
+                        self.position_secs(),
+                        duration
+                    ),
+                );
             }
             None => {}
         }
@@ -858,8 +898,7 @@ fn stem_worker(
     }
 }
 
-fn wait_flush_ack(slot: &SlotShared, generation: u64, sh: &Shared) {
-    let deadline = Instant::now() + Duration::from_millis(500);
+fn wait_flush_ack(slot: &SlotShared, generation: u64, sh: &Shared) {    let deadline = Instant::now() + Duration::from_millis(500);
     while slot.flush_ack.load(Ordering::Acquire) < generation {
         if sh.shutdown.load(Ordering::Acquire) {
             return;
@@ -868,6 +907,7 @@ fn wait_flush_ack(slot: &SlotShared, generation: u64, sh: &Shared) {
             eprintln!("[mixer] callback flush acknowledgement timed out; transport stopped");
             sh.playing.store(false, Ordering::SeqCst);
             sh.play_pending.store(false, Ordering::SeqCst);
+            trace_transport(sh, "wait_flush_ack timeout");
             return;
         }
         thread::sleep(Duration::from_millis(1));
@@ -885,6 +925,20 @@ fn shape_stem(left: f32, right: f32, gain: f32, left_gain: f32, right_gain: f32)
 
 fn longest_duration_frames(durations: &[u64]) -> u64 {
     durations.iter().copied().max().unwrap_or(0)
+}
+
+/// Harness tracing (SOUNDAPP_MIXER_TRACE=1): one line per transport-state
+/// writer, so a vanished `play_pending` names its killer.
+fn trace_transport(sh: &Shared, what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("SOUNDAPP_MIXER_TRACE").is_ok());
+    if on {
+        eprintln!(
+            "[mixer-trace] {what} playing={} pending={}",
+            sh.playing.load(Ordering::Relaxed),
+            sh.play_pending.load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// Readiness gate for `play_pending`: every enabled stem must be prebuffered.

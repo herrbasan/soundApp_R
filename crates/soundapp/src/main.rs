@@ -477,6 +477,12 @@ struct App {
     /// `--drop-probe` injection, applied once on the first idle pass (the drop
     /// path cannot be scripted: winit drops arrive through OLE).
     drop_probe: Option<(Vec<PathBuf>, DropZone)>,
+    /// Further `--drop-probe` occurrences: applied on a fixed delay after the
+    /// previous drop, so a second drop can hit a MIXER that is already open
+    /// and playing (the re-drop regression class).
+    drop_probe_queue: Vec<(Vec<PathBuf>, DropZone)>,
+    drop_probe_next: Option<(Instant, Vec<PathBuf>, DropZone)>,
+    drop_probe_trace_at: Option<Instant>,
     /// Print the resulting mixer stem list after a probe drop.
     drop_probe_report: bool,
     /// Transient status text shown in the Settings footer after a save.
@@ -3090,7 +3096,6 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(Vec<P
             ),
             DropZone::Add,
             "Add to current",
-            "Release to add",
         ),
         (
             Rect::new(
@@ -3101,7 +3106,6 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(Vec<P
             ),
             DropZone::Replace,
             "Replace playlist",
-            "Release to replace",
         ),
         (
             Rect::new(
@@ -3111,12 +3115,11 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(Vec<P
                 ph - 12.0 * scale,
             ),
             DropZone::Mixer,
-            "Open in Mixer",
-            "Release for Mixer",
+            "Multitrack",
         ),
     ];
     let fs = (13.0 * scale).round();
-    for (r, z, label, active_label) in zones {
+    for (r, z, label) in zones {
         let hot = z == zone;
         ui.scene.rounded_rect(
             r.x,
@@ -3137,19 +3140,21 @@ fn draw_drop_overlay(ui: &mut Ui, pw: f32, ph: f32, scale: f32) -> Option<(Vec<P
             if hot { 2.0 } else { 1.0 },
         );
         let baseline = (r.y + r.h * 0.5 + fs * 0.33).round();
-        let (text, color) = if hot {
-            (active_label, rgb(255, 255, 255))
+        // The label never changes on hover — only the highlight does — so the
+        // zone text stays stable under the cursor.
+        let color = if hot {
+            rgb(255, 255, 255)
         } else {
-            (label, rgb(165, 165, 165))
+            rgb(165, 165, 165)
         };
         let tw = ui
             .text_sys
-            .measure(FontFace::SemiBold, ui.font_engine, text, fs);
+            .measure(FontFace::SemiBold, ui.font_engine, label, fs);
         ui.scene.text(
             ui.text_sys,
             FontFace::SemiBold,
             ui.font_engine,
-            text,
+            label,
             (r.x + (r.w - tw) * 0.5).round(),
             baseline,
             fs,
@@ -3395,6 +3400,9 @@ impl App {
             save_config_req: false,
             apply_zoom_req: false,
             drop_probe: None,
+            drop_probe_queue: Vec::new(),
+            drop_probe_next: None,
+            drop_probe_trace_at: None,
             drop_probe_report: false,
             config_status: String::new(),
         }
@@ -3694,6 +3702,20 @@ impl App {
             return;
         };
         engine.poll();
+        if self.drop_probe_report {
+            let due = self
+                .drop_probe_trace_at
+                .map(|t| Instant::now() >= t)
+                .unwrap_or(true);
+            if due {
+                self.drop_probe_trace_at = Some(Instant::now() + Duration::from_secs(1));
+                let (playing, pending, enabled, ready) = engine.debug_transport();
+                eprintln!(
+                    "[drop-probe] poll playing={playing} pending={pending} ready={ready}/{enabled} pos={:.2}",
+                    engine.position_secs()
+                );
+            }
+        }
         self.mixer_playing = engine.is_playing();
         let duration = engine.duration_secs();
         let scrubbing = self
@@ -4148,6 +4170,18 @@ impl App {
                     },
                 ));
             }
+        }
+    }
+
+    /// Queue the next `--drop-probe` occurrence, 5 s after the drop just
+    /// applied — enough for a mixer set to prebuffer and start playing.
+    fn schedule_next_drop_probe(&mut self) {
+        if self.drop_probe_next.is_some() {
+            return;
+        }
+        if !self.drop_probe_queue.is_empty() {
+            let (paths, zone) = self.drop_probe_queue.remove(0);
+            self.drop_probe_next = Some((Instant::now() + Duration::from_secs(5), paths, zone));
         }
     }
 
@@ -8337,6 +8371,27 @@ impl ApplicationHandler for App {
                     self.quitting = true;
                     println!("[poc] auto-quit reached");
                     self.flush_pacing("auto-quit");
+                    if self.drop_probe_report {
+                        let (mplaying, mpos) = match &self.mixer_audio {
+                            Some(engine) => (engine.is_playing(), engine.position_secs()),
+                            None => (false, 0.0),
+                        };
+                        println!(
+                            "[drop-probe] mixer playing={} pos={:.2}s stems={} playing_flag={}",
+                            mplaying,
+                            mpos,
+                            self.mixer_stems.len(),
+                            self.mixer_playing
+                        );
+                        let (pplaying, ppos) = match &self.audio {
+                            Some(a) => (a.is_playing(), a.position_secs()),
+                            None => (false, 0.0),
+                        };
+                        println!(
+                            "[drop-probe] player playing={} pos={:.2}s",
+                            pplaying, ppos
+                        );
+                    }
                 }
                 event_loop.exit();
                 return;
@@ -8369,9 +8424,18 @@ impl ApplicationHandler for App {
             a.set_dsp_enabled(self.secondary_windows.is_visible("monitoring"));
         }
         self.poll_dsp();
-        // `--drop-probe`: replay one drop through the real handler.
+        // `--drop-probe`: replay one drop through the real handler; further
+        // probes follow on a fixed delay (see drop_probe_queue).
         if let Some((paths, zone)) = self.drop_probe.take() {
             self.apply_drop(paths, zone);
+            self.schedule_next_drop_probe();
+        }
+        if let Some((at, paths, zone)) = self.drop_probe_next.clone() {
+            if Instant::now() >= at {
+                self.drop_probe_next = None;
+                self.apply_drop(paths, zone);
+                self.schedule_next_drop_probe();
+            }
         }
 
         let playing = self.audio.as_ref().map(|a| a.is_playing()).unwrap_or(false);
@@ -8550,6 +8614,7 @@ fn main() {
     let mut app_screenshot: Option<String> = None;
     let mut screenshot_delay: Option<Duration> = None;
     let mut drop_probe: Option<(Vec<PathBuf>, DropZone)> = None;
+    let mut drop_probe_queue: Vec<(Vec<PathBuf>, DropZone)> = Vec::new();
     let mut open_window: Option<String> = None;
     let mut sync_debug = false;
     // Offline render / latency harness (phase A instruments).
@@ -8624,7 +8689,8 @@ fn main() {
             "--screenshot" => app_screenshot = args.next(),
             // `--drop-probe <mixer|add|replace> <path[;path…]>` replays one drop
             // through the real handler — drag-and-drop comes in over OLE and
-            // cannot be scripted, and this path has regressed twice.
+            // cannot be scripted, and this path has regressed twice. Repeated
+            // flags queue further drops, each applied 5 s after the previous.
             "--drop-probe" => {
                 let zone = match args.next().as_deref() {
                     Some("add") => DropZone::Add,
@@ -8637,7 +8703,11 @@ fn main() {
                     .filter(|item| !item.is_empty())
                     .map(PathBuf::from)
                     .collect();
-                drop_probe = Some((paths, zone));
+                if drop_probe.is_none() {
+                    drop_probe = Some((paths, zone));
+                } else {
+                    drop_probe_queue.push((paths, zone));
+                }
             }
             // Defer a secondary-window capture: content that arrives
             // asynchronously (waveform overview, meters) needs real frames.
@@ -8920,6 +8990,7 @@ fn main() {
         app.drop_probe_report = true;
     }
     app.drop_probe = drop_probe;
+    app.drop_probe_queue = drop_probe_queue;
     // Phase 1.5: pop a secondary window at startup. With `--screenshot` alongside it,
     // the capture is taken from THAT window (handled in `resumed`).
     app.open_window_spec = open_window.as_deref().and_then(window_spec_by_key);
