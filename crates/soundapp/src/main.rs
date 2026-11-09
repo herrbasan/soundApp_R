@@ -8552,9 +8552,7 @@ impl ApplicationHandler for App {
             let frame_ms = if pending_meta || dsp_open || ui_anim || file_drag || sync_debug || cover_anim {
                 self.frame_ms
             } else {
-                // EXPERIMENT (2026-11-09): honor --fps during plain playback to
-                // measure the 60 fps cost. Default was hard-coded 66.
-                self.frame_ms
+                66
             };
             self.next_frame = now + Duration::from_millis(frame_ms);
             self.pace_budget_ms = frame_ms;
