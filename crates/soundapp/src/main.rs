@@ -8541,6 +8541,7 @@ fn main() {
     let mut trk_separation: f32 = 100.0;
     let mut trk_interp: i32 = 0;
     let mut latency_probe = false;
+    let mut headless = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -8570,6 +8571,9 @@ fn main() {
             }
             "--trk-interp" => trk_interp = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--latency-probe" => latency_probe = true,
+            // Engine-only real-time playback: no window, no renderer, no event
+            // loop. The io-probe baseline for "how much CPU is UI".
+            "--headless" => headless = true,
             "--backend" => {
                 if let Some(b) = args.next() {
                     backend_locked = true;
@@ -8805,6 +8809,42 @@ fn main() {
             "[probe] end pos {:.3}s / dur {:.3}s",
             a.position_secs(),
             a.duration_secs()
+        );
+        std::process::exit(0);
+    }
+
+    // --headless: engine-only real-time playback, measured by scripts/io-probe.ps1
+    // as the no-UI baseline. No window, no renderer, no event loop.
+    if headless {
+        let a = match audio::start_with(crate::audio::Source::Silence, cfg.output_device_name()) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[headless] audio init failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        let path = startup_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(default_start));
+        a.set_volume(cfg.master_vol);
+        a.set_params(PlaybackParams::default());
+        println!("[headless] loading {}", path.display());
+        a.load_file(path);
+        a.play();
+        let run = seconds.unwrap_or(30.0);
+        let t0 = Instant::now();
+        while t0.elapsed().as_secs_f64() < run {
+            std::thread::sleep(Duration::from_millis(250));
+            let dur = a.duration_secs();
+            if dur > 0.0 && a.position_secs() >= dur - 0.05 {
+                break;
+            }
+        }
+        println!(
+            "[headless] end pos {:.3}s / dur {:.3}s after {:.1}s",
+            a.position_secs(),
+            a.duration_secs(),
+            t0.elapsed().as_secs_f64()
         );
         std::process::exit(0);
     }
