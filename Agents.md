@@ -120,8 +120,9 @@ soundApp_R/
         midi.rs           # FluidSynth 2.6.1 SoundFont synth + SMF parser/tempo map/sequencer
                           #   (+ note-on collection → Monitoring channel timeline)
         tracker.rs        # libopenmpt 0.8.9 tracked-module source engine
-        waveform.rs       # Monitoring OVERVIEW: own-thread FFmpeg peak scan (16 kHz, 1600 buckets,
-                          #   progressive, generation-cancelled) + MIDI channel lanes from midi.rs
+        waveform.rs       # Monitoring OVERVIEW: own-thread whole-file scans — FFmpeg peak scan
+                          #   (8 kHz, 1600 buckets, adaptive duty, generation-cancelled) for audio,
+                          #   offline libopenmpt render for tracker modules, MIDI channel lanes from midi.rs
         dsp.rs            # Real-time 2048-pt Hann FFT (64 log bands), stabilized oscilloscope,
                           #   stereo goniometer & BS.1770-4 K-weighted LUFS
         config.rs         # Persistent user.json configuration loader/writer (fields: dark_mode,

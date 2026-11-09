@@ -5,6 +5,10 @@
 //!   (`getWaveformStreaming` in the original decoder),
 //! * MIDI → per-channel note-on activity lanes (`midi_analyzer.js`).
 //!
+//! plus a third mode the reference handled through its FFmpeg build's tracker
+//! decoder: tracker modules render offline through the playback engine
+//! ([`crate::tracker::TrackerEngine`]) and fold into the same peaks.
+//!
 //! Analysis runs on its own thread against its own FFmpeg handle, so the audio
 //! path never waits on it and a new track cancels the old pass by generation.
 
@@ -131,18 +135,21 @@ impl WaveformWorker {
     }
 }
 
+/// One update that abandons the canvas: unsupported source or failed decode.
+fn empty(job: &Job, progress: f32, duration: f64) -> WaveformUpdate {
+    WaveformUpdate {
+        gen: job.gen,
+        duration,
+        progress,
+        data: WaveformData::Empty,
+    }
+}
+
 fn analyse(
     job: &Job,
     latest: &AtomicU64,
     tx: &mpsc::Sender<WaveformUpdate>,
 ) -> Option<WaveformUpdate> {
-    let stale = |gen: u64| latest.load(Ordering::Relaxed) != gen;
-    let empty = |progress: f32, duration: f64| WaveformUpdate {
-        gen: job.gen,
-        duration,
-        progress,
-        data: WaveformData::Empty,
-    };
     if midi::is_midi_file(&job.path) {
         let parsed = std::fs::read(&job.path)
             .ok()
@@ -154,26 +161,65 @@ fn analyse(
                 progress: 1.0,
                 data: WaveformData::Midi(lanes),
             },
-            None => empty(1.0, 0.0),
+            None => empty(job, 1.0, 0.0),
         });
     }
-    // Tracker modules render through libopenmpt, not FFmpeg; an overview would
-    // need a full module render. No overview instead of a wrong one.
+    // Tracker modules render through the playback engine itself: libopenmpt is
+    // already linked for tracker.rs, while FFmpeg's tracker decoder is optional
+    // at its build time. `play.at_end = stop` (set in TrackerEngine::open)
+    // makes the offline render end deterministically.
     if crate::tracker::is_tracker_file(&job.path) {
-        return Some(empty(1.0, 0.0));
+        return scan_tracker(job, latest, tx);
     }
 
     let mut stream = match FFmpegStream::open(&job.path, OVERVIEW_RATE) {
         Ok(stream) => stream,
         Err(e) => {
             eprintln!("[waveform] overview unavailable: {e}");
-            return Some(empty(1.0, 0.0));
+            return Some(empty(job, 1.0, 0.0));
         }
     };
     let duration = stream.duration_secs();
     if duration <= 0.0 {
-        return Some(empty(1.0, 0.0));
+        return Some(empty(job, 1.0, 0.0));
     }
+    fold_peaks(job, latest, tx, duration, |buf| stream.read(buf))
+}
+
+/// Tracker overview: one offline pass through [`crate::tracker::TrackerEngine`] —
+/// the same engine playback uses, so the overview always matches what is heard.
+/// Modules render far faster than realtime; the shared adaptive duty still
+/// bounds pathological cases. The closure reports interleaved stereo samples
+/// to match the FFmpeg reader's contract.
+fn scan_tracker(
+    job: &Job,
+    latest: &AtomicU64,
+    tx: &mpsc::Sender<WaveformUpdate>,
+) -> Option<WaveformUpdate> {
+    let mut engine = match crate::tracker::TrackerEngine::open(&job.path, OVERVIEW_RATE) {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("[waveform] tracker overview unavailable: {e}");
+            return Some(empty(job, 1.0, 0.0));
+        }
+    };
+    let Some(duration) = engine.duration_secs().filter(|d| *d > 0.0) else {
+        return Some(empty(job, 1.0, 0.0));
+    };
+    fold_peaks(job, latest, tx, duration, |buf| engine.render(buf) * 2)
+}
+
+/// Shared whole-file fold: per-bucket peak/RMS maxima over interleaved stereo
+/// frames, 5 % progress ticks, adaptive duty pacing, final peak normalisation.
+/// `read` fills the buffer and returns the sample count written (0 = end).
+fn fold_peaks(
+    job: &Job,
+    latest: &AtomicU64,
+    tx: &mpsc::Sender<WaveformUpdate>,
+    duration: f64,
+    mut read: impl FnMut(&mut [f32]) -> usize,
+) -> Option<WaveformUpdate> {
+    let stale = |gen: u64| latest.load(Ordering::Relaxed) != gen;
     let total_frames = (duration * OVERVIEW_RATE as f64) as u64;
     let frames_per_point = (total_frames / PEAK_POINTS as u64).max(1);
     let mut peaks = vec![0.0f32; PEAK_POINTS];
@@ -192,7 +238,7 @@ fn analyse(
             return None;
         }
         let chunk_t0 = Instant::now();
-        let read = stream.read(&mut buf);
+        let read = read(&mut buf);
         if read == 0 {
             break;
         }
