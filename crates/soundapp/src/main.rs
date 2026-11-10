@@ -376,6 +376,17 @@ struct App {
     /// Duplicate-delivery detector: last handled key press and last release.
     last_press: Option<(String, Instant)>,
     last_release: Option<Instant>,
+    /// Instant any app window last gained focus. The remote-desktop session
+    /// re-delivers an Escape into the window that gains focus ~1 ms after the
+    /// click ("dies the moment I click"), so an Escape this close to a focus
+    /// gain is injected input, not a human reaction.
+    focus_gained_at: Option<Instant>,
+    /// Instant the last Escape was RELEASED. Updated only in the shared key
+    /// block, before main/secondary routing. The injected stream is
+    /// press/release pairs ~1 ms apart (field log 2026-11-10: release at
+    /// 2184.24 ms, press at 2184.75 ms -> request-close), so a press that
+    /// follows a release this closely is the next injected edge.
+    escape_released_at: Option<Instant>,
     /// Last toggle per window key: (key, when, now_visible).
     last_toggle: Vec<(&'static str, Instant, bool)>,
     /// Global keys whose PHYSICAL key was still down when the pass acted on
@@ -964,6 +975,57 @@ fn physical_key_down(_vk: i32) -> bool {
 /// so it is injected input — Parsec delivers one ~1 ms after a new window
 /// appears, which closed freshly launched instances deterministically.
 const LAUNCH_ESCAPE_GUARD_MS: u64 = 250;
+
+/// Window of time after a focus gain in which an Escape is injected input: the
+/// remote-desktop session re-delivers the key ~1 ms after the click that
+/// focused the window.
+const FOCUS_ESCAPE_GUARD_MS: u64 = 250;
+
+/// Window of time after an Escape RELEASE in which the next Escape press is the
+/// injected stream's next edge. Measured gaps in that stream are 0-1 ms; a
+/// human second press never lands inside 150 ms.
+const ESCAPE_RELEASE_GUARD_MS: u64 = 150;
+
+/// Why an Escape event must be ignored, if it must (`None` = real input).
+///
+/// The remote-desktop session that drives this machine injects Escape into the
+/// window it has just shown or focused, and cycles it thereafter. Field log
+/// 2026-11-10: launch press 0.5-4 ms after the first frame; a press 1 ms after
+/// the previous release closed the running player ("dies the moment I click").
+/// Four signatures separate that from a human press:
+/// (1) the first frame has not been presented — the window is not on screen;
+/// (2) the key is not physically down (message-level ghost, REPEAT-ECHO class);
+/// (3) the press lands within `LAUNCH_ESCAPE_GUARD_MS` of the first frame;
+/// (4) the press lands within `FOCUS_ESCAPE_GUARD_MS` of a focus gain or
+///     `ESCAPE_RELEASE_GUARD_MS` of the previous Escape release.
+fn escape_ghost_verdict(
+    first_frame_at: Option<Instant>,
+    focus_gained_at: Option<Instant>,
+    escape_released_at: Option<Instant>,
+    now: Instant,
+    key_down: bool,
+) -> Option<&'static str> {
+    let Some(shown) = first_frame_at else {
+        return Some("first frame not presented yet");
+    };
+    if !key_down {
+        return Some("key not physically down");
+    }
+    if now.saturating_duration_since(shown) < Duration::from_millis(LAUNCH_ESCAPE_GUARD_MS) {
+        return Some("within 250 ms of the first frame (remote-desktop input)");
+    }
+    if let Some(focus) = focus_gained_at {
+        if now.saturating_duration_since(focus) < Duration::from_millis(FOCUS_ESCAPE_GUARD_MS) {
+            return Some("within 250 ms of a focus gain (remote-desktop input)");
+        }
+    }
+    if let Some(released) = escape_released_at {
+        if now.saturating_duration_since(released) < Duration::from_millis(ESCAPE_RELEASE_GUARD_MS) {
+            return Some("within 150 ms of the previous Escape release (remote-desktop stream)");
+        }
+    }
+    None
+}
 
 /// Virtual-key code for a printable character the global pass cares about
 /// (letters map to their uppercase ASCII value on Win32).
@@ -3430,6 +3492,8 @@ impl App {
             diag_stalls: Vec::new(),
             last_press: None,
             last_release: None,
+            focus_gained_at: None,
+            escape_released_at: None,
             last_toggle: Vec::new(),
             physical_held: Vec::new(),
             focus_ring: VecDeque::from(["main"]),
@@ -4509,22 +4573,15 @@ impl App {
     }
 
     /// Why an Escape event must be ignored, if it must (`None` = real input).
-    /// (1) The first frame has not been presented yet — the window is not on
-    /// screen, so no user can be addressing it. (2) Message-level ghost: the OS
-    /// re-delivers key-down to the window that gains focus and the key is not
-    /// physically down (REPEAT-ECHO class). (3) Launch window: a real Escape
-    /// within 250 ms of the first frame is injected remote-desktop input.
+    /// See `escape_ghost_verdict` for the four injected-input signatures.
     fn escape_ghost_reason(&self) -> Option<&'static str> {
-        let Some(shown) = self.first_frame_at else {
-            return Some("first frame not presented yet");
-        };
-        if !physical_key_down(VK_ESCAPE) {
-            return Some("key not physically down");
-        }
-        if shown.elapsed() < Duration::from_millis(LAUNCH_ESCAPE_GUARD_MS) {
-            return Some("within 250 ms of the first frame (remote-desktop input)");
-        }
-        None
+        escape_ghost_verdict(
+            self.first_frame_at,
+            self.focus_gained_at,
+            self.escape_released_at,
+            Instant::now(),
+            physical_key_down(VK_ESCAPE),
+        )
     }
 
     /// Poll background directory-scan completions and end-of-track transitions.
@@ -5541,6 +5598,7 @@ impl App {
 
     /// Record a window as the most recently focused SoundApp window.
     fn note_focus(&mut self, key: &'static str) {
+        self.focus_gained_at = Some(Instant::now());
         self.focus_ring.retain(|entry| *entry != key);
         self.focus_ring.push_front(key);
         while self.focus_ring.len() > 8 {
@@ -8078,6 +8136,13 @@ impl ApplicationHandler for App {
                 self.last_press = Some((token, now));
             } else if key.state == ElementState::Released {
                 self.last_release = Some(now);
+                // Escape-only anchor for the injected-stream guard: the stream
+                // is press/release pairs ~1 ms apart, so the next press must be
+                // judged against this release. Recorded here — before the
+                // main/secondary partition — so both handlers see it.
+                if matches!(&key.logical_key, Key::Named(NamedKey::Escape)) {
+                    self.escape_released_at = Some(now);
+                }
             }
             if key.state == ElementState::Pressed
                 && self.handle_global_shortcut(event_loop, key)
@@ -9810,5 +9875,215 @@ mod params_tests {
         assert_eq!(mutes, vec![true, true, true, false]);
         toggle_tracker_solo(&mut mutes, 3, true);
         assert_eq!(mutes, vec![false; 4]);
+    }
+}
+
+#[cfg(test)]
+mod escape_guard_tests {
+    use super::*;
+
+    /// Age past both timing guards, so a real press is allowed.
+    const SETTLED_MS: u64 = 2000;
+
+    fn verdict(age_ms: u64, key_down: bool) -> Option<&'static str> {
+        let now = Instant::now();
+        let first_frame = now - Duration::from_millis(age_ms);
+        escape_ghost_verdict(Some(first_frame), None, None, now, key_down)
+    }
+
+    #[test]
+    fn escape_before_the_first_frame_is_refused() {
+        let now = Instant::now();
+        assert_eq!(
+            escape_ghost_verdict(None, None, None, now, true),
+            Some("first frame not presented yet")
+        );
+    }
+
+    #[test]
+    fn escape_with_the_key_up_is_a_message_ghost() {
+        assert_eq!(
+            verdict(SETTLED_MS, false),
+            Some("key not physically down")
+        );
+    }
+
+    #[test]
+    fn escape_inside_the_launch_window_is_refused() {
+        assert_eq!(
+            verdict(100, true),
+            Some("within 250 ms of the first frame (remote-desktop input)")
+        );
+    }
+
+    #[test]
+    fn escape_after_the_launch_window_passes() {
+        assert_eq!(verdict(SETTLED_MS, true), None);
+    }
+
+    #[test]
+    fn escape_after_a_focus_gain_is_refused() {
+        let now = Instant::now();
+        let focused = now - Duration::from_millis(5);
+        assert_eq!(
+            escape_ghost_verdict(
+                Some(now - Duration::from_millis(SETTLED_MS)),
+                Some(focused),
+                None,
+                now,
+                true
+            ),
+            Some("within 250 ms of a focus gain (remote-desktop input)")
+        );
+    }
+
+    #[test]
+    fn escape_well_after_a_focus_gain_passes() {
+        let now = Instant::now();
+        let focused = now - Duration::from_millis(600);
+        assert_eq!(
+            escape_ghost_verdict(
+                Some(now - Duration::from_millis(SETTLED_MS)),
+                Some(focused),
+                None,
+                now,
+                true
+            ),
+            None
+        );
+    }
+
+    /// The field kill sequence: release at 2184.24 ms, press at 2184.75 ms.
+    #[test]
+    fn escape_right_after_a_release_is_the_injected_stream() {
+        let now = Instant::now();
+        let released = now - Duration::from_millis(1);
+        assert_eq!(
+            escape_ghost_verdict(
+                Some(now - Duration::from_millis(SETTLED_MS)),
+                Some(now - Duration::from_millis(SETTLED_MS)),
+                Some(released),
+                now,
+                true
+            ),
+            Some("within 150 ms of the previous Escape release (remote-desktop stream)")
+        );
+    }
+
+    #[test]
+    fn escape_well_after_a_release_passes() {
+        let now = Instant::now();
+        let released = now - Duration::from_millis(400);
+        assert_eq!(
+            escape_ghost_verdict(
+                Some(now - Duration::from_millis(SETTLED_MS)),
+                Some(now - Duration::from_millis(SETTLED_MS)),
+                Some(released),
+                now,
+                true
+            ),
+            None
+        );
+    }
+
+    /// Replay of a measured session, not a constructed case: every Escape edge
+    /// from `event_log.txt`, in order, with the session's own timestamps.
+    struct Session {
+        name: &'static str,
+        first_frame_ms: f64,
+        /// (session ms, is_press, focus_gain before this edge in ms)
+        edges: &'static [(f64, bool, Option<f64>)],
+        /// Index into `edges` of every press edge. All of them were injected:
+        /// the field log shows no human Escape in these sessions, so every
+        /// press must be refused.
+        presses: &'static [usize],
+    }
+
+    const FIELD_SESSIONS: &[Session] = &[
+        // Installed v0.2.4, %APPDATA% log 2026-11-10 17:23. One toolbar click at
+        // 1178 ms: Monitoring opened, was hidden by the 1375.01 press, and the
+        // app quit on the 1380.44 press.
+        Session {
+            name: "installed-0.2.4",
+            first_frame_ms: 76.0,
+            edges: &[
+                (77.23, true, Some(77.39)),
+                (1374.92, false, None),
+                (1375.01, true, None),
+                (1380.30, false, None),
+                (1380.44, true, None),
+            ],
+            presses: &[0, 2, 4],
+        },
+        // target/release log 2026-11-10 17:33, the same session shape.
+        Session {
+            name: "release-0.2.4",
+            first_frame_ms: 89.0,
+            edges: &[
+                (101.38, true, None),
+                (101.52, false, None),
+                (101.66, true, None),
+                (2184.24, false, None),
+                (2184.75, true, None),
+            ],
+            presses: &[0, 2, 4],
+        },
+    ];
+
+    /// The guard must refuse the presses that actually destroyed the window in
+    /// the field, at the timings the field recorded — that is the only claim
+    /// worth making: the measured sequence, replayed.
+    #[test]
+    fn measured_field_sessions_are_all_refused() {
+        for session in FIELD_SESSIONS {
+            let span = session.edges.last().map(|edge| edge.0).unwrap_or(0.0);
+            let session_zero = Instant::now() - Duration::from_secs_f64((span + 1000.0) / 1000.0);
+            let at = |ms: f64| session_zero + Duration::from_secs_f64(ms / 1000.0);
+            let first_frame = at(session.first_frame_ms);
+            let mut released: Option<Instant> = None;
+            let mut focused: Option<Instant> = None;
+            let mut presses = 0usize;
+            for (ms, is_press, focus_gain_ms) in session.edges {
+                if let Some(gain) = focus_gain_ms {
+                    focused = Some(at(*gain));
+                }
+                let t = at(*ms);
+                if *is_press {
+                    let verdict_at =
+                        escape_ghost_verdict(Some(first_frame), focused, released, t, true);
+                    assert!(
+                        verdict_at.is_some(),
+                        "{}: press at {ms} ms was NOT refused - it closed a window in the field",
+                        session.name
+                    );
+                    presses += 1;
+                } else {
+                    released = Some(t);
+                }
+            }
+            assert_eq!(
+                presses,
+                session.presses.len(),
+                "{}: every press in these sessions was injected",
+                session.name
+            );
+        }
+    }
+
+    /// The guard must not eat a real one-shot Escape: a settled window, no
+    /// recent focus change, no recent release.
+    #[test]
+    fn a_settled_real_escape_still_closes() {
+        let now = Instant::now();
+        assert_eq!(
+            escape_ghost_verdict(
+                Some(now - Duration::from_secs(5)),
+                Some(now - Duration::from_secs(3)),
+                Some(now - Duration::from_secs(2)),
+                now,
+                true
+            ),
+            None
+        );
     }
 }
