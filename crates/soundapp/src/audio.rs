@@ -342,6 +342,17 @@ struct Shared {
     engine_stopped: Arc<AtomicBool>,
     /// Callback-published quiescence: steady gain-off, nothing being pulled.
     callback_idle: Arc<AtomicBool>,
+    /// Set by `Audio::load_file` (UI thread) before the load reaches the
+    /// decoder; cleared by `post_load` once the new track is armed and
+    /// `playing` is true. Between those points every `engine_wants_stop`
+    /// input reads exactly like the post-track-end state (`playing=false`,
+    /// flush settled, callback idle), so a monitor waking on the load's
+    /// `wake_all` could deep-park inside the pre-open window — stranding the
+    /// device stream in `Stream::pause()` with nobody left to restart it: the
+    /// load's flush handshake then timed out (no callback to ack it) and the
+    /// next track never made a sound (stuck auto-advance, frozen at 0:00
+    /// until some transport action woke the monitor again).
+    load_in_flight: Arc<AtomicBool>,
     /// Idle-park condvar: transport-visible flips (play/pause/seek/load/
     /// params) notify it so the decoder, stretcher and monitor threads sleep
     /// deeply instead of polling. Payload is a notify generation.
@@ -432,6 +443,7 @@ pub struct Audio {
     tracker_channels: Arc<AtomicU64>,
     tracker_vu: Arc<Mutex<Vec<crate::tracker::ChannelVu>>>,
     engine_stopped: Arc<AtomicBool>,
+    load_in_flight: Arc<AtomicBool>,
     wake: Arc<(Mutex<u64>, Condvar)>,
 }
 
@@ -508,6 +520,9 @@ impl Audio {
     /// metadata and updates `current` on the caller thread so the very next UI
     /// frame never latches the previous track's cover art.
     pub fn load_file(&self, path: PathBuf) {
+        // Latched before the decoder is woken: the monitor must never park
+        // inside the load's pre-open window (see `Shared::load_in_flight`).
+        self.load_in_flight.store(true, Ordering::Release);
         self.transport_gen.fetch_add(1, Ordering::SeqCst);
         *self.meta.lock().unwrap() = None;
         self.meta_gen.fetch_add(1, Ordering::Release);
@@ -691,6 +706,7 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         tracker_vu: Arc::new(Mutex::new(Vec::new())),
         engine_stopped: Arc::new(AtomicBool::new(false)),
         callback_idle: Arc::new(AtomicBool::new(false)),
+        load_in_flight: Arc::new(AtomicBool::new(false)),
         wake: Arc::new((Mutex::new(0u64), Condvar::new())),
     };
     shared.dsp
@@ -917,6 +933,7 @@ pub fn start_with(src: Source, device_name: Option<&str>) -> Result<Audio, Strin
         tracker_channels: shared.tracker_channels.clone(),
         tracker_vu: shared.tracker_vu.clone(),
         engine_stopped: shared.engine_stopped.clone(),
+        load_in_flight: shared.load_in_flight.clone(),
         wake: shared.wake.clone(),
     })
 }
@@ -995,8 +1012,14 @@ fn engine_power_thread(stream: Arc<cpal::Stream>, sh: Shared) {
         // seek-while-stopped needs the stream running for its flush
         // handshake) fires `wake_all`. While running — or waiting for the
         // post-pause fade to reach quiescence, an edge with no wake — the
-        // 50 ms poll above stays.
-        if sh.engine_stopped.load(Ordering::Acquire) && engine_wants_stop(&sh) {
+        // 50 ms poll above stays. A load in flight suppresses the park: until
+        // `post_load` arms the new track the inputs read "stopped", and a
+        // park taken in that window would leave the stream paused with the
+        // load's flush handshake timing out against a dead callback.
+        if sh.engine_stopped.load(Ordering::Acquire)
+            && engine_wants_stop(&sh)
+            && !sh.load_in_flight.load(Ordering::Acquire)
+        {
             park(&sh);
         }
     }
@@ -1555,6 +1578,12 @@ fn post_load(sh: &Shared, total_frames: u64, flush_target: u64) {
     sh.flushing.store(false, Ordering::SeqCst);
     sh.playing.store(true, Ordering::SeqCst);
     sh.transport_gen.fetch_add(1, Ordering::SeqCst);
+    // Clear the load latch only after `playing=true`, then wake: a monitor
+    // that slipped into the pre-open window anyway re-checks with the new
+    // track armed (`playing=true` → `engine_wants_stop` false) and restarts
+    // the device stream; the wake also shortens the monitor's 50 ms poll.
+    sh.load_in_flight.store(false, Ordering::Release);
+    wake_all(&sh.wake);
 }
 
 /// Trim trailing near-zero encoder padding frames from `in_buf` above `min_frames`
@@ -3176,6 +3205,7 @@ mod tests {
             tracker_vu: Arc::new(Mutex::new(Vec::new())),
             engine_stopped: Arc::new(AtomicBool::new(false)),
             callback_idle: Arc::new(AtomicBool::new(false)),
+            load_in_flight: Arc::new(AtomicBool::new(false)),
             wake: Arc::new((Mutex::new(0u64), Condvar::new())),
         };
         let (mut src_prod, src_cons) = RingBuffer::<f32>::new(48_000 * 2);
@@ -3236,6 +3266,7 @@ mod tests {
             tracker_vu: Arc::new(Mutex::new(Vec::new())),
             engine_stopped: Arc::new(AtomicBool::new(false)),
             callback_idle: Arc::new(AtomicBool::new(false)),
+            load_in_flight: Arc::new(AtomicBool::new(false)),
             wake: Arc::new((Mutex::new(0u64), Condvar::new())),
             meta_gen: Arc::new(AtomicU64::new(next_meta_epoch())),
             load_failed: Arc::new(AtomicBool::new(false)),
@@ -3272,6 +3303,71 @@ mod tests {
         tap.set_engine_flag(flag);
         tap.snapshot_into(&mut out);
         assert!(out.is_empty(), "stopped engine must not publish stale audio");
+    }
+
+    /// Stuck auto-advance regression, end to end through the real engine.
+    /// Play a short file to its true end (the engine-power monitor pauses the
+    /// device stream and parks), then issue the NEXT load from that stopped
+    /// state — the exact shape of an auto-advance. The load must re-arm the
+    /// new track and leave the device stream running: the monitor must never
+    /// park inside the load's pre-open window (every `engine_wants_stop`
+    /// input reads "stopped" there) and `post_load` must wake parked threads.
+    #[test]
+    fn load_from_stopped_engine_flows_audio() {
+        let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/audiotest");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let rate = 48_000u32;
+        let wav = |hz: f32, path: &Path| {
+            let n = rate as usize;
+            let mut pcm = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let v =
+                    (i as f32 * hz / rate as f32 * 2.0 * std::f32::consts::PI).sin() * 0.3;
+                pcm.push(v);
+                pcm.push(v);
+            }
+            write_wav_f32(path, rate, 2, &pcm).unwrap();
+        };
+        let a1 = out_dir.join("end_race_a.wav");
+        let a2 = out_dir.join("end_race_b.wav");
+        wav(440.0, &a1);
+        wav(880.0, &a2);
+
+        let a = start(Source::Silence).expect("audio device");
+        a.load_file(a1);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !a.take_track_ended() {
+            assert!(Instant::now() < deadline, "track never played to its end");
+            thread::sleep(Duration::from_millis(25));
+        }
+        // The monitor stops the stream within its 50 ms poll once the
+        // callback publishes quiescence.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !a.engine_stopped.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "engine monitor never stopped the stream after track end"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // The auto-advance: next track, issued from the stopped engine.
+        a.load_file(a2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let playing = a.is_playing();
+            let stopped = a.engine_stopped.load(Ordering::Acquire);
+            let pos = a.position_secs();
+            assert!(
+                Instant::now() < deadline,
+                "load from stopped engine never flowed audio: \
+                 playing={playing} engine_stopped={stopped} pos={pos:.3}s"
+            );
+            if playing && !stopped && pos > 0.25 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// Estimate dominant frequency of `win` (mono f32) via upward zero
