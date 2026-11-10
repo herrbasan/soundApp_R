@@ -294,6 +294,10 @@ fn slider_one_unit(
 struct App {
     start: Instant,
     reported: bool,
+    /// Instant of the main window's first presented frame. Anchors the
+    /// launch-window Escape guard: an Escape arriving within 250 ms of it is
+    /// injected remote-desktop input (Parsec), not a human reaction.
+    first_frame_at: Option<Instant>,
     animate: bool,
     quit_at: Option<Instant>,
     /// Backend requested on the command line. By default the player and static
@@ -937,6 +941,9 @@ fn physical_mods() -> (bool, bool, bool, bool) {
     (false, false, false, false)
 }
 
+/// Virtual-key code for Escape (the ghost-key guard in the window handlers).
+const VK_ESCAPE: i32 = 0x1B;
+
 /// Is `vk` physically down right now (OS truth, not tracked state)?
 #[cfg(windows)]
 fn physical_key_down(vk: i32) -> bool {
@@ -951,6 +958,12 @@ fn physical_key_down(vk: i32) -> bool {
 fn physical_key_down(_vk: i32) -> bool {
     false
 }
+
+/// Window of time after the first presented frame in which an Escape cannot
+/// be a human reaction (visual reaction + keypress takes well over 300 ms),
+/// so it is injected input — Parsec delivers one ~1 ms after a new window
+/// appears, which closed freshly launched instances deterministically.
+const LAUNCH_ESCAPE_GUARD_MS: u64 = 250;
 
 /// Virtual-key code for a printable character the global pass cares about
 /// (letters map to their uppercase ASCII value on Win32).
@@ -3369,6 +3382,7 @@ impl App {
         Self {
             start: Instant::now(),
             reported: false,
+            first_frame_at: None,
             animate,
             quit_at,
             prefer_backend,
@@ -4494,6 +4508,25 @@ impl App {
         }
     }
 
+    /// Why an Escape event must be ignored, if it must (`None` = real input).
+    /// (1) The first frame has not been presented yet — the window is not on
+    /// screen, so no user can be addressing it. (2) Message-level ghost: the OS
+    /// re-delivers key-down to the window that gains focus and the key is not
+    /// physically down (REPEAT-ECHO class). (3) Launch window: a real Escape
+    /// within 250 ms of the first frame is injected remote-desktop input.
+    fn escape_ghost_reason(&self) -> Option<&'static str> {
+        let Some(shown) = self.first_frame_at else {
+            return Some("first frame not presented yet");
+        };
+        if !physical_key_down(VK_ESCAPE) {
+            return Some("key not physically down");
+        }
+        if shown.elapsed() < Duration::from_millis(LAUNCH_ESCAPE_GUARD_MS) {
+            return Some("within 250 ms of the first frame (remote-desktop input)");
+        }
+        None
+    }
+
     /// Poll background directory-scan completions and end-of-track transitions.
     fn poll_transport_and_scans(&mut self) {
         let mut redraw = false;
@@ -5461,6 +5494,7 @@ impl App {
 
         if !self.reported {
             self.reported = true;
+            self.first_frame_at = Some(now);
             let bname = match self.renderer.as_ref().map(|r| r.active) {
                 Some(BackendKind::Gpu) => "gpu-gl33",
                 Some(BackendKind::Cpu) => "cpu-softbuffer",
@@ -6033,6 +6067,12 @@ impl App {
                         }
                     }
                     if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                        if let Some(reason) = self.escape_ghost_reason() {
+                            eventlog::note(&format!(
+                                "Escape refused on {key} ({reason}) - hide suppressed"
+                            ));
+                            return;
+                        }
                         let popup_open = self
                             .secondary_windows
                             .find_by_key_mut(key)
@@ -8227,6 +8267,12 @@ impl ApplicationHandler for App {
 
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
+                            if let Some(reason) = self.escape_ghost_reason() {
+                                eventlog::note(&format!(
+                                    "Escape refused ({reason}) - close suppressed"
+                                ));
+                                return;
+                            }
                             if self.ui_state.open_popup_id.is_some() {
                                 self.ui_state.open_popup_id = None;
                                 self.ui_state.popup_rect = None;
