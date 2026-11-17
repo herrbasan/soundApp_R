@@ -1552,7 +1552,20 @@ fn pre_load(sh: &Shared) -> u64 {
         thread::sleep(Duration::from_millis(13));
     }
     sh.flushing.store(true, Ordering::SeqCst);
-    sh.flush_gen.fetch_add(1, Ordering::SeqCst) + 1
+    let target = sh.flush_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    // The end-of-track flags describe the source that is being replaced. They
+    // MUST be cleared here, before the blocking `avformat_open_input`, not in
+    // `post_load`: the opener can stall for seconds over SMB, and the stretcher
+    // re-sets `stage_eof` from a still-true `decoder_eof` while the ring is
+    // empty. post_load then armed `playing` against that stale `stage_eof`, so
+    // the callback latched "track ended" on the first dry buffer and parked the
+    // decoder before it decoded a single sample — silence at 0:00 on
+    // auto-advance / next-track whenever FFmpeg was slow enough to lose the
+    // first-chunk race.
+    sh.decoder_eof.store(false, Ordering::SeqCst);
+    sh.stage_eof.store(false, Ordering::SeqCst);
+    sh.track_ended.store(false, Ordering::SeqCst);
+    target
 }
 
 fn wait_flush_ack(sh: &Shared, target: u64) {
@@ -1573,6 +1586,7 @@ fn post_load(sh: &Shared, total_frames: u64, flush_target: u64) {
     sh.total_frames.store(total_frames, Ordering::SeqCst);
     sh.frames_played.store(0, Ordering::SeqCst);
     sh.decoder_eof.store(false, Ordering::SeqCst);
+    sh.stage_eof.store(false, Ordering::SeqCst);
     sh.track_ended.store(false, Ordering::SeqCst);
     sh.fade_out.store(false, Ordering::SeqCst);
     sh.flushing.store(false, Ordering::SeqCst);
@@ -3290,6 +3304,25 @@ mod tests {
         // An in-flight flush blocks the stop outright (seek while paused).
         sh.flushing.store(true, Ordering::SeqCst);
         assert!(!engine_wants_stop(&sh));
+    }
+
+    #[test]
+    fn pre_load_clears_end_of_track_flags() {
+        // Regression: after a track ended, `decoder_eof`/`stage_eof` stayed set
+        // through the next load's blocking open. post_load then armed `playing`
+        // against a stale `stage_eof`, the callback latched end-of-track on the
+        // first dry output buffer, and the decoder parked before decoding a
+        // sample — silence at 0:00 on auto-advance whenever FFmpeg was slow.
+        let sh = test_shared(48_000);
+        sh.decoder_eof.store(true, Ordering::SeqCst);
+        sh.stage_eof.store(true, Ordering::SeqCst);
+        sh.track_ended.store(true, Ordering::SeqCst);
+        let target = pre_load(&sh);
+        assert!(!sh.decoder_eof.load(Ordering::SeqCst));
+        assert!(!sh.stage_eof.load(Ordering::SeqCst));
+        assert!(!sh.track_ended.load(Ordering::SeqCst));
+        assert!(sh.flushing.load(Ordering::SeqCst));
+        assert_eq!(sh.flush_gen.load(Ordering::SeqCst), target);
     }
 
     #[test]
